@@ -2,6 +2,9 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
+use config::Config;
+
+mod config;
 
 #[derive(Debug, Parser)]
 #[command(name = "sequencer-sync")]
@@ -62,25 +65,40 @@ fn run_command(args: CommandArgs) -> ExitCode {
 }
 
 fn setup_nanopore(_config_path: &Path) -> ExitCode {
+    let _config = load_config(_config_path);
     todo!()
 }
 
 fn setup_next_seq(_config_path: &Path) -> ExitCode {
+    let _config = load_config(_config_path);
     todo!()
 }
 
 fn test_nanopore(_config_path: &Path) -> ExitCode {
+    let _config = load_config(_config_path);
     todo!()
 }
 
 fn test_next_seq(_config_path: &Path) -> ExitCode {
+    let _config = load_config(_config_path);
     todo!()
 }
 
 fn run_nanopore(_config_path: &Path) -> ExitCode {
+    let _config = load_config(_config_path);
     todo!()
 }
 
 fn run_next_seq(_config_path: &Path) -> ExitCode {
+    let _config = load_config(_config_path);
     todo!()
+}
+
+fn load_config(config_path: &Path) -> Config {
+    Config::from_path(config_path).unwrap_or_else(|error| {
+        panic!(
+            "failed to load config from {}: {error}",
+            config_path.display()
+        )
+    })
 }
