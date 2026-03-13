@@ -8,8 +8,10 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use config::{Config, ConfigError};
 use fs2::FileExt;
 use thiserror::Error;
+use transfer_log::TransferLog;
 
 mod config;
+mod transfer_log;
 
 #[derive(Debug, Parser)]
 #[command(name = "sequencer-sync")]
@@ -92,10 +94,11 @@ fn run_command(args: CommandArgs) -> Result<(), AppError> {
             return Ok(());
         }
     };
+    let mut transfer_log = TransferLog::load(&config.flockdir).map_err(AppError::TransferLog)?;
 
     match args.platform {
-        Platform::Nanopore => run_nanopore(&config),
-        Platform::NextSeq => run_nextseq(&config),
+        Platform::Nanopore => run_nanopore(&config, &mut transfer_log),
+        Platform::NextSeq => run_nextseq(&config, &mut transfer_log),
     }
 }
 
@@ -109,11 +112,11 @@ fn test_nextseq(config_path: &Path) -> Result<(), AppError> {
     todo!()
 }
 
-fn run_nanopore(_config: &Config) -> Result<(), AppError> {
+fn run_nanopore(_config: &Config, _transfer_log: &mut TransferLog) -> Result<(), AppError> {
     todo!()
 }
 
-fn run_nextseq(_config: &Config) -> Result<(), AppError> {
+fn run_nextseq(_config: &Config, _transfer_log: &mut TransferLog) -> Result<(), AppError> {
     todo!()
 }
 
@@ -361,6 +364,8 @@ enum AppError {
         #[source]
         source: std::io::Error,
     },
+    #[error(transparent)]
+    TransferLog(#[from] transfer_log::TransferLogError),
     #[error("failed to open run lock file {}: {source}", path.display())]
     OpenRunLockFile {
         path: PathBuf,

@@ -21,9 +21,10 @@ The program has several subcommands:
     - Verify the data is transfered first to landing zone
 * `sequencer-sync run`:
     - Invoked by cron job
-    - Checks for new files in data dir to transfer
-    - Transfers to landing zone using rsync
-    - Logs that the directory has been transfered so it is not attempted to be re-transfered
+    - Loads the machine transfer log with previous transfers
+    - Checks for directories in data dir not in transfer log
+    - Transfers those to landing zone using rsync
+    - Add those to log
 
 ## Coding guidelines
 * Do not put yourself as co-author
