@@ -58,7 +58,7 @@ fn try_main() -> Result<(), AppError> {
 }
 
 fn setup(args: CommandArgs) -> Result<(), AppError> {
-    let _platform = args.platform;
+    let config_path = canonicalize_config_path(&args.config_path)?;
     let config = load_config(&args.config_path)?;
 
     check_ssh_access(&config)?;
@@ -66,6 +66,11 @@ fn setup(args: CommandArgs) -> Result<(), AppError> {
     check_readable_directory(&config.source, "source")?;
     check_writable_directory(&config.landing_zone, "landing_zone")?;
     check_writable_directory(&config.flockdir, "flockdir")?;
+    let cron_path = write_cron_file(&config.flockdir, &config_path, args.platform)?;
+    eprintln!(
+        "Install the generated cron job with your system cron configuration: {}",
+        cron_path.display()
+    );
 
     Ok(())
 }
@@ -221,6 +226,55 @@ fn temp_probe_path(directory: &Path, field: &str) -> PathBuf {
     directory.join(filename)
 }
 
+fn canonicalize_config_path(path: &Path) -> Result<PathBuf, AppError> {
+    fs::canonicalize(path).map_err(|source| AppError::CanonicalizeConfigPath {
+        path: path.to_path_buf(),
+        source,
+    })
+}
+
+fn write_cron_file(
+    flockdir: &Path,
+    config_path: &Path,
+    platform: Platform,
+) -> Result<PathBuf, AppError> {
+    let cron_path = cron_file_path(flockdir);
+    let contents = render_cron_file(config_path, platform);
+    fs::write(&cron_path, contents).map_err(|source| AppError::WriteCronFile {
+        path: cron_path.clone(),
+        source,
+    })?;
+    Ok(cron_path)
+}
+
+fn cron_file_path(flockdir: &Path) -> PathBuf {
+    flockdir.join("sequencer-sync.cron")
+}
+
+fn render_cron_file(config_path: &Path, platform: Platform) -> String {
+    let command = format!(
+        "sequencer-sync run --config-path {} --platform {}",
+        shell_quote(config_path.to_string_lossy().as_ref()),
+        platform.as_cli_value()
+    );
+
+    format!("# Install this file into cron manually.\n*/15 * * * * {command}\n")
+}
+
+fn shell_quote(value: &str) -> String {
+    let escaped = value.replace('\'', r#"'\''"#);
+    format!("'{escaped}'")
+}
+
+impl Platform {
+    fn as_cli_value(&self) -> &'static str {
+        match self {
+            Self::Nanopore => "nanopore",
+            Self::NextSeq => "next-seq",
+        }
+    }
+}
+
 #[derive(Debug, Error)]
 enum AppError {
     #[error("failed to load config from {}: {source}", path.display())]
@@ -276,4 +330,44 @@ enum AppError {
         #[source]
         source: std::io::Error,
     },
+    #[error("failed to resolve config path {}: {source}", path.display())]
+    CanonicalizeConfigPath {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("failed to write cron file {}: {source}", path.display())]
+    WriteCronFile {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use super::{Platform, cron_file_path, render_cron_file};
+
+    #[test]
+    fn renders_cron_file() {
+        let block = render_cron_file(
+            Path::new("/etc/sequencer-sync/config.toml"),
+            Platform::Nanopore,
+        );
+
+        assert!(block.contains("# Install this file into cron manually."));
+        assert!(block.contains("*/15 * * * * sequencer-sync run --config-path '/etc/sequencer-sync/config.toml' --platform nanopore"));
+    }
+
+    #[test]
+    fn computes_cron_file_path_in_flockdir() {
+        let path = cron_file_path(Path::new("/var/lib/sequencer/flock"));
+
+        assert_eq!(
+            path,
+            Path::new("/var/lib/sequencer/flock/sequencer-sync.cron")
+        );
+    }
 }
