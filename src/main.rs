@@ -123,20 +123,114 @@ fn test_nextseq(_config: &Config, _ns: &NextSeqConfig) -> Result<(), AppError> {
     todo!()
 }
 
+fn new_directories(
+    source: &Path,
+    field: &'static str,
+    transfer_log: &TransferLog,
+) -> Result<Vec<fs::DirEntry>, AppError> {
+    let entries = fs::read_dir(source).map_err(|e| AppError::ReadDirectory {
+        field,
+        path: source.to_path_buf(),
+        source: e,
+    })?;
+
+    let mut result = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|e| AppError::ReadDirectory {
+            field,
+            path: source.to_path_buf(),
+            source: e,
+        })?;
+
+        let file_type = entry.file_type().map_err(|e| AppError::ReadMetadata {
+            field,
+            path: entry.path(),
+            source: e,
+        })?;
+        if !file_type.is_dir() {
+            continue;
+        }
+
+        let key = transfer_log::relative_directory_key(source, &entry.path())
+            .map_err(AppError::TransferLog)?;
+        if transfer_log.contains(&key) {
+            continue;
+        }
+
+        result.push(entry);
+    }
+
+    Ok(result)
+}
+
 fn run_nanopore(
     _config: &Config,
-    _nano: &NanoporeConfig,
-    _transfer_log: &mut TransferLog,
+    nano: &NanoporeConfig,
+    transfer_log: &mut TransferLog,
 ) -> Result<(), AppError> {
-    todo!()
+    for entry in new_directories(&nano.source, "nanopore.source", transfer_log)? {
+        let dir_name = entry.file_name();
+        let dir_name = dir_name.to_string_lossy();
+
+        let category = match nano.classify(&dir_name) {
+            Some(cat) => cat,
+            None => continue,
+        };
+
+        rsync_directory(&entry.path(), &category.landing_zone)?;
+
+        let key = transfer_log::relative_directory_key(&nano.source, &entry.path())
+            .map_err(AppError::TransferLog)?;
+        transfer_log
+            .record_transfer(&key)
+            .map_err(AppError::TransferLog)?;
+    }
+
+    Ok(())
+}
+
+fn rsync_directory(source: &Path, destination: &Path) -> Result<(), AppError> {
+    let status = Command::new("rsync")
+        .arg("-a")
+        .arg(source)
+        .arg(destination)
+        .status()
+        .map_err(|source| AppError::SpawnRsync { source })?;
+
+    if status.success() {
+        Ok(())
+    } else {
+        Err(AppError::RsyncFailed {
+            source_path: source.to_path_buf(),
+            destination: destination.to_path_buf(),
+            exit_code: status.code(),
+        })
+    }
 }
 
 fn run_nextseq(
     _config: &Config,
-    _ns: &NextSeqConfig,
-    _transfer_log: &mut TransferLog,
+    ns: &NextSeqConfig,
+    transfer_log: &mut TransferLog,
 ) -> Result<(), AppError> {
-    todo!()
+    for entry in new_directories(&ns.source, "nextseq.source", transfer_log)? {
+        let dir_name = entry.file_name();
+        let dir_name = dir_name.to_string_lossy();
+
+        if !ns.regex.is_match(&dir_name) {
+            continue;
+        }
+
+        rsync_directory(&entry.path(), &ns.landing_zone)?;
+
+        let key = transfer_log::relative_directory_key(&ns.source, &entry.path())
+            .map_err(AppError::TransferLog)?;
+        transfer_log
+            .record_transfer(&key)
+            .map_err(AppError::TransferLog)?;
+    }
+
+    Ok(())
 }
 
 fn load_config(config_path: &Path, expected_platform: &Platform) -> Result<Config, AppError> {
@@ -422,6 +516,17 @@ enum AppError {
     RunLockHeld { path: PathBuf },
     #[error("--platform flag `{got}` does not match config platform `{expected}`")]
     PlatformMismatch { expected: String, got: String },
+    #[error("failed to execute rsync: {source}")]
+    SpawnRsync {
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("rsync failed copying {} to {}: exit code {}", source_path.display(), destination.display(), exit_code.map_or("unknown".to_string(), |c| c.to_string()))]
+    RsyncFailed {
+        source_path: PathBuf,
+        destination: PathBuf,
+        exit_code: Option<i32>,
+    },
 }
 
 #[cfg(test)]

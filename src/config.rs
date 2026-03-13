@@ -40,7 +40,7 @@ pub struct NanoporeCategory {
 #[derive(Debug)]
 pub struct NextSeqConfig {
     pub source: PathBuf,
-    pub prefix: Regex,
+    pub regex: Regex,
     pub landing_zone: PathBuf,
 }
 
@@ -80,7 +80,7 @@ struct UnvalidatedNanoporeCategory {
 #[derive(Debug, Deserialize)]
 struct UnvalidatedNextSeqConfig {
     source: PathBuf,
-    prefix: String,
+    regex: String,
     landing_zone: PathBuf,
 }
 
@@ -222,10 +222,10 @@ impl UnvalidatedNextSeqConfig {
     fn validate(self, flockdir: &Path) -> Result<NextSeqConfig, ConfigError> {
         validate_absolute_path("nextseq.source", &self.source)?;
         validate_absolute_path("nextseq.landing_zone", &self.landing_zone)?;
-        validate_non_empty("nextseq.prefix", &self.prefix)?;
+        validate_non_empty("nextseq.regex", &self.regex)?;
 
-        let prefix = Regex::new(&self.prefix).map_err(|source| ConfigError::InvalidRegex {
-            field: "nextseq.prefix",
+        let regex = Regex::new(&self.regex).map_err(|source| ConfigError::InvalidRegex {
+            field: "nextseq.regex",
             source,
         })?;
 
@@ -238,7 +238,7 @@ impl UnvalidatedNextSeqConfig {
 
         Ok(NextSeqConfig {
             source: self.source,
-            prefix,
+            regex,
             landing_zone: self.landing_zone,
         })
     }
@@ -322,7 +322,7 @@ mod tests {
             panic!("expected NextSeq platform");
         };
         assert_eq!(ns.source, PathBuf::from("/data/nextseq"));
-        assert!(ns.prefix.is_match("240101_"));
+        assert!(ns.regex.is_match("240101_"));
         assert_eq!(
             ns.landing_zone,
             PathBuf::from("/var/lib/sequencer/landing-zone")
@@ -366,7 +366,7 @@ landing_zone = "/var/lib/sequencer/landing-zone-other"
 
 [nextseq]
 source = "/data/nextseq"
-prefix = "^\\d{6}_"
+regex = "^\\d{6}_"
 landing_zone = "/var/lib/sequencer/landing-zone"
 "#,
         )
@@ -445,7 +445,7 @@ server_host = "sequencer.example.org"
 
 [nextseq]
 source = "relative/data"
-prefix = "^\\d{6}_"
+regex = "^\\d{6}_"
 landing_zone = "/var/lib/sequencer/landing-zone"
 "#,
         )
@@ -471,7 +471,7 @@ server_host = "sequencer.example.org"
 
 [nextseq]
 source = "/data/nextseq"
-prefix = "^\\d{6}_"
+regex = "^\\d{6}_"
 landing_zone = "/var/lib/sequencer/landing-zone"
 "#,
         )
@@ -496,7 +496,7 @@ server_host = "sequencer.example.org"
 
 [nextseq]
 source = "/data/nextseq"
-prefix = "^\\d{6}_"
+regex = "^\\d{6}_"
 landing_zone = "/var/lib/sequencer/flock"
 "#,
         )

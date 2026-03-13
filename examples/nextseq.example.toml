@@ -5,5 +5,5 @@ server_host = "sequencer.example.org"
 
 [nextseq]
 source = "/data/nextseq"
-prefix = "^\\d{6}_"
+regex = "^\\d{6}_"
 landing_zone = "/var/lib/sequencer/landing-zone"
