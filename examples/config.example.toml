@@ -1,5 +1,7 @@
 source = "/var/lib/sequencer/data"
 landing_zone = "/var/lib/sequencer/landing-zone"
+flockdir = "/var/lib/sequencer/flock"
 server_user = "sequencer-sync"
 server_port = 22
 server_host = "sequencer.example.org"
+server_dest = "/srv/sequencer/incoming"

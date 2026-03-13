@@ -7,11 +7,22 @@ use serde::Deserialize;
 
 #[derive(Debug, Deserialize, PartialEq, Eq)]
 pub struct Config {
+    // Directory to copy data from and to landing zone
     pub source: PathBuf,
+
+    // Directory to copy from source
     pub landing_zone: PathBuf,
+
+    // Directory with log files and file lock
+    pub flockdir: PathBuf,
+
+    // You must have ssh access to this server with this port, user name.
     pub server_user: String,
     pub server_port: u16,
     pub server_host: String,
+
+    // Copy from landing zone to this path on the server
+    pub server_dest: PathBuf,
 }
 
 #[derive(Debug)]
@@ -75,8 +86,10 @@ mod tests {
             config.landing_zone,
             PathBuf::from("/var/lib/sequencer/landing-zone")
         );
+        assert_eq!(config.flockdir, PathBuf::from("/var/lib/sequencer/flock"));
         assert_eq!(config.server_user, "sequencer-sync");
         assert_eq!(config.server_port, 22);
         assert_eq!(config.server_host, "sequencer.example.org");
+        assert_eq!(config.server_dest, PathBuf::from("/srv/sequencer/incoming"));
     }
 }
