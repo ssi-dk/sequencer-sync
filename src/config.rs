@@ -6,12 +6,6 @@ use thiserror::Error;
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct Config {
-    // Directory to copy data from.
-    pub source: PathBuf,
-
-    // Directory to copy selected files into.
-    pub landing_zone: PathBuf,
-
     // Directory with log files and file lock
     pub flockdir: PathBuf,
 
@@ -19,16 +13,72 @@ pub struct Config {
     pub server_user: String,
     pub server_port: u16,
     pub server_host: String,
+
+    pub platform: PlatformConfig,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum PlatformConfig {
+    Nanopore(NanoporeConfig),
+    NextSeq(NextSeqConfig),
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct NanoporeConfig {
+    pub source: PathBuf,
+    /// Sorted longest-prefix-first for correct matching.
+    pub categories: [NanoporeCategory; 2],
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct NanoporeCategory {
+    pub prefix: String,
+    pub landing_zone: PathBuf,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct NextSeqConfig {
+    pub source: PathBuf,
+    pub landing_zone: PathBuf,
+}
+
+impl NanoporeConfig {
+    /// Returns the category matching this directory name, or None.
+    /// Categories are sorted longest-prefix-first, so ONT_WGS_ matches before ONT_.
+    pub fn classify(&self, dir_name: &str) -> Option<&NanoporeCategory> {
+        self.categories
+            .iter()
+            .find(|c| dir_name.starts_with(&c.prefix))
+    }
 }
 
 #[derive(Debug, Deserialize)]
 struct UnvalidatedConfig {
-    source: PathBuf,
-    landing_zone: PathBuf,
     flockdir: PathBuf,
     server_user: String,
     server_port: u16,
     server_host: String,
+    nanopore: Option<UnvalidatedNanoporeConfig>,
+    nextseq: Option<UnvalidatedNextSeqConfig>,
+}
+
+#[derive(Debug, Deserialize)]
+struct UnvalidatedNanoporeConfig {
+    source: PathBuf,
+    basecalled: UnvalidatedNanoporeCategory,
+    alldata: UnvalidatedNanoporeCategory,
+}
+
+#[derive(Debug, Deserialize)]
+struct UnvalidatedNanoporeCategory {
+    prefix: String,
+    landing_zone: PathBuf,
+}
+
+#[derive(Debug, Deserialize)]
+struct UnvalidatedNextSeqConfig {
+    source: PathBuf,
+    landing_zone: PathBuf,
 }
 
 #[derive(Debug, Error)]
@@ -56,6 +106,12 @@ pub enum ConfigError {
         second: &'static str,
         path: PathBuf,
     },
+    #[error("config must contain exactly one of [nanopore] or [nextseq] sections, found neither")]
+    NoPlatformSection,
+    #[error("config must contain exactly one of [nanopore] or [nextseq] sections, found both")]
+    MultiplePlatformSections,
+    #[error("nanopore basecalled and alldata prefixes must differ: `{prefix}`")]
+    DuplicatePrefix { prefix: String },
 }
 
 impl Config {
@@ -76,8 +132,6 @@ impl Config {
 
 impl UnvalidatedConfig {
     fn validate(self) -> Result<Config, ConfigError> {
-        validate_absolute_path("source", &self.source)?;
-        validate_absolute_path("landing_zone", &self.landing_zone)?;
         validate_absolute_path("flockdir", &self.flockdir)?;
         validate_non_empty("server_user", &self.server_user)?;
         validate_non_empty("server_host", &self.server_host)?;
@@ -88,22 +142,88 @@ impl UnvalidatedConfig {
             });
         }
 
-        validate_distinct_paths("source", &self.source, "landing_zone", &self.landing_zone)?;
-        validate_distinct_paths("source", &self.source, "flockdir", &self.flockdir)?;
-        validate_distinct_paths(
-            "landing_zone",
-            &self.landing_zone,
-            "flockdir",
-            &self.flockdir,
-        )?;
+        let platform = match (self.nanopore, self.nextseq) {
+            (Some(nanopore), None) => PlatformConfig::Nanopore(nanopore.validate(&self.flockdir)?),
+            (None, Some(nextseq)) => PlatformConfig::NextSeq(nextseq.validate(&self.flockdir)?),
+            (Some(_), Some(_)) => return Err(ConfigError::MultiplePlatformSections),
+            (None, None) => return Err(ConfigError::NoPlatformSection),
+        };
 
         Ok(Config {
-            source: self.source,
-            landing_zone: self.landing_zone,
             flockdir: self.flockdir,
             server_user: self.server_user,
             server_port: self.server_port,
             server_host: self.server_host,
+            platform,
+        })
+    }
+}
+
+impl UnvalidatedNanoporeConfig {
+    fn validate(self, flockdir: &Path) -> Result<NanoporeConfig, ConfigError> {
+        validate_absolute_path("nanopore.source", &self.source)?;
+        validate_absolute_path(
+            "nanopore.basecalled.landing_zone",
+            &self.basecalled.landing_zone,
+        )?;
+        validate_absolute_path("nanopore.alldata.landing_zone", &self.alldata.landing_zone)?;
+
+        validate_non_empty("nanopore.basecalled.prefix", &self.basecalled.prefix)?;
+        validate_non_empty("nanopore.alldata.prefix", &self.alldata.prefix)?;
+
+        if self.basecalled.prefix == self.alldata.prefix {
+            return Err(ConfigError::DuplicatePrefix {
+                prefix: self.basecalled.prefix,
+            });
+        }
+
+        // Check all paths are distinct
+        let paths: [(&'static str, &Path); 4] = [
+            ("nanopore.source", &self.source),
+            (
+                "nanopore.basecalled.landing_zone",
+                &self.basecalled.landing_zone,
+            ),
+            ("nanopore.alldata.landing_zone", &self.alldata.landing_zone),
+            ("flockdir", flockdir),
+        ];
+        validate_all_paths_distinct(&paths)?;
+
+        // Sort longest prefix first
+        let mut categories = [
+            NanoporeCategory {
+                prefix: self.basecalled.prefix,
+                landing_zone: self.basecalled.landing_zone,
+            },
+            NanoporeCategory {
+                prefix: self.alldata.prefix,
+                landing_zone: self.alldata.landing_zone,
+            },
+        ];
+        categories.sort_by(|a, b| b.prefix.len().cmp(&a.prefix.len()));
+
+        Ok(NanoporeConfig {
+            source: self.source,
+            categories,
+        })
+    }
+}
+
+impl UnvalidatedNextSeqConfig {
+    fn validate(self, flockdir: &Path) -> Result<NextSeqConfig, ConfigError> {
+        validate_absolute_path("nextseq.source", &self.source)?;
+        validate_absolute_path("nextseq.landing_zone", &self.landing_zone)?;
+
+        let paths: [(&'static str, &Path); 3] = [
+            ("nextseq.source", &self.source),
+            ("nextseq.landing_zone", &self.landing_zone),
+            ("flockdir", flockdir),
+        ];
+        validate_all_paths_distinct(&paths)?;
+
+        Ok(NextSeqConfig {
+            source: self.source,
+            landing_zone: self.landing_zone,
         })
     }
 }
@@ -127,56 +247,187 @@ fn validate_non_empty(field: &'static str, value: &str) -> Result<(), ConfigErro
     }
 }
 
-fn validate_distinct_paths(
-    first: &'static str,
-    first_path: &Path,
-    second: &'static str,
-    second_path: &Path,
-) -> Result<(), ConfigError> {
-    if first_path == second_path {
-        Err(ConfigError::DuplicatePath {
-            first,
-            second,
-            path: first_path.to_path_buf(),
-        })
-    } else {
-        Ok(())
+fn validate_all_paths_distinct(paths: &[(&'static str, &Path)]) -> Result<(), ConfigError> {
+    for i in 0..paths.len() {
+        for j in (i + 1)..paths.len() {
+            if paths[i].1 == paths[j].1 {
+                return Err(ConfigError::DuplicatePath {
+                    first: paths[i].0,
+                    second: paths[j].0,
+                    path: paths[i].1.to_path_buf(),
+                });
+            }
+        }
     }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
 
-    use super::{Config, ConfigError};
+    use super::{Config, ConfigError, NanoporeConfig, PlatformConfig};
 
-    const EXAMPLE_CONFIG: &str = include_str!("../examples/config.example.toml");
+    const NANOPORE_EXAMPLE: &str = include_str!("../examples/nanopore.example.toml");
+    const NEXTSEQ_EXAMPLE: &str = include_str!("../examples/nextseq.example.toml");
 
     #[test]
-    fn parses_example_config() {
-        let config = Config::from_toml_str(EXAMPLE_CONFIG).expect("example config should parse");
+    fn parses_nanopore_example_config() {
+        let config = Config::from_toml_str(NANOPORE_EXAMPLE).expect("nanopore config should parse");
 
-        assert_eq!(config.source, PathBuf::from("/var/lib/sequencer/data"));
-        assert_eq!(
-            config.landing_zone,
-            PathBuf::from("/var/lib/sequencer/landing-zone")
-        );
         assert_eq!(config.flockdir, PathBuf::from("/var/lib/sequencer/flock"));
         assert_eq!(config.server_user, "sequencer-sync");
         assert_eq!(config.server_port, 22);
         assert_eq!(config.server_host, "sequencer.example.org");
+
+        let PlatformConfig::Nanopore(ref nano) = config.platform else {
+            panic!("expected Nanopore platform");
+        };
+        assert_eq!(nano.source, PathBuf::from("/data/nanopore"));
+        // Longest prefix first
+        assert_eq!(nano.categories[0].prefix, "ONT_WGS_");
+        assert_eq!(
+            nano.categories[0].landing_zone,
+            PathBuf::from("/var/lib/sequencer/landing-zone-core")
+        );
+        assert_eq!(nano.categories[1].prefix, "ONT_");
+        assert_eq!(
+            nano.categories[1].landing_zone,
+            PathBuf::from("/var/lib/sequencer/landing-zone-other")
+        );
+    }
+
+    #[test]
+    fn parses_nextseq_example_config() {
+        let config = Config::from_toml_str(NEXTSEQ_EXAMPLE).expect("nextseq config should parse");
+
+        assert_eq!(config.flockdir, PathBuf::from("/var/lib/sequencer/flock"));
+        let PlatformConfig::NextSeq(ref ns) = config.platform else {
+            panic!("expected NextSeq platform");
+        };
+        assert_eq!(ns.source, PathBuf::from("/data/nextseq"));
+        assert_eq!(
+            ns.landing_zone,
+            PathBuf::from("/var/lib/sequencer/landing-zone")
+        );
+    }
+
+    #[test]
+    fn rejects_config_with_no_platform() {
+        let error = Config::from_toml_str(
+            r#"
+flockdir = "/var/lib/sequencer/flock"
+server_user = "sequencer-sync"
+server_port = 22
+server_host = "sequencer.example.org"
+"#,
+        )
+        .expect_err("config with no platform should fail");
+
+        assert!(matches!(error, ConfigError::NoPlatformSection));
+    }
+
+    #[test]
+    fn rejects_config_with_both_platforms() {
+        let error = Config::from_toml_str(
+            r#"
+flockdir = "/var/lib/sequencer/flock"
+server_user = "sequencer-sync"
+server_port = 22
+server_host = "sequencer.example.org"
+
+[nanopore]
+source = "/data/nanopore"
+
+[nanopore.basecalled]
+prefix = "ONT_WGS_"
+landing_zone = "/var/lib/sequencer/landing-zone-core"
+
+[nanopore.alldata]
+prefix = "ONT_"
+landing_zone = "/var/lib/sequencer/landing-zone-other"
+
+[nextseq]
+source = "/data/nextseq"
+landing_zone = "/var/lib/sequencer/landing-zone"
+"#,
+        )
+        .expect_err("config with both platforms should fail");
+
+        assert!(matches!(error, ConfigError::MultiplePlatformSections));
+    }
+
+    #[test]
+    fn rejects_duplicate_nanopore_prefixes() {
+        let error = Config::from_toml_str(
+            r#"
+flockdir = "/var/lib/sequencer/flock"
+server_user = "sequencer-sync"
+server_port = 22
+server_host = "sequencer.example.org"
+
+[nanopore]
+source = "/data/nanopore"
+
+[nanopore.basecalled]
+prefix = "ONT_"
+landing_zone = "/var/lib/sequencer/landing-zone-core"
+
+[nanopore.alldata]
+prefix = "ONT_"
+landing_zone = "/var/lib/sequencer/landing-zone-other"
+"#,
+        )
+        .expect_err("duplicate prefixes should fail");
+
+        assert!(matches!(error, ConfigError::DuplicatePrefix { .. }));
+    }
+
+    #[test]
+    fn rejects_duplicate_nanopore_landing_zones() {
+        let error = Config::from_toml_str(
+            r#"
+flockdir = "/var/lib/sequencer/flock"
+server_user = "sequencer-sync"
+server_port = 22
+server_host = "sequencer.example.org"
+
+[nanopore]
+source = "/data/nanopore"
+
+[nanopore.basecalled]
+prefix = "ONT_WGS_"
+landing_zone = "/var/lib/sequencer/landing-zone"
+
+[nanopore.alldata]
+prefix = "ONT_"
+landing_zone = "/var/lib/sequencer/landing-zone"
+"#,
+        )
+        .expect_err("duplicate landing zones should fail");
+
+        assert!(matches!(
+            error,
+            ConfigError::DuplicatePath {
+                first: "nanopore.basecalled.landing_zone",
+                second: "nanopore.alldata.landing_zone",
+                ..
+            }
+        ));
     }
 
     #[test]
     fn rejects_relative_source_path() {
         let error = Config::from_toml_str(
             r#"
-source = "relative/data"
-landing_zone = "/var/lib/sequencer/landing-zone"
 flockdir = "/var/lib/sequencer/flock"
 server_user = "sequencer-sync"
 server_port = 22
 server_host = "sequencer.example.org"
+
+[nextseq]
+source = "relative/data"
+landing_zone = "/var/lib/sequencer/landing-zone"
 "#,
         )
         .expect_err("relative source path should fail validation");
@@ -184,7 +435,7 @@ server_host = "sequencer.example.org"
         assert!(matches!(
             error,
             ConfigError::PathNotAbsolute {
-                field: "source",
+                field: "nextseq.source",
                 ..
             }
         ));
@@ -194,12 +445,14 @@ server_host = "sequencer.example.org"
     fn rejects_empty_server_user() {
         let error = Config::from_toml_str(
             r#"
-source = "/var/lib/sequencer/data"
-landing_zone = "/var/lib/sequencer/landing-zone"
 flockdir = "/var/lib/sequencer/flock"
 server_user = "   "
 server_port = 22
 server_host = "sequencer.example.org"
+
+[nextseq]
+source = "/data/nextseq"
+landing_zone = "/var/lib/sequencer/landing-zone"
 "#,
         )
         .expect_err("empty server_user should fail validation");
@@ -216,12 +469,14 @@ server_host = "sequencer.example.org"
     fn rejects_duplicate_local_paths() {
         let error = Config::from_toml_str(
             r#"
-source = "/var/lib/sequencer/data"
-landing_zone = "/var/lib/sequencer/data"
 flockdir = "/var/lib/sequencer/flock"
 server_user = "sequencer-sync"
 server_port = 22
 server_host = "sequencer.example.org"
+
+[nextseq]
+source = "/data/nextseq"
+landing_zone = "/var/lib/sequencer/flock"
 "#,
         )
         .expect_err("duplicate local paths should fail validation");
@@ -229,10 +484,82 @@ server_host = "sequencer.example.org"
         assert!(matches!(
             error,
             ConfigError::DuplicatePath {
-                first: "source",
-                second: "landing_zone",
+                first: "nextseq.landing_zone",
+                second: "flockdir",
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn classify_matches_longest_prefix_first() {
+        let config = NanoporeConfig {
+            source: PathBuf::from("/data/nanopore"),
+            categories: [
+                super::NanoporeCategory {
+                    prefix: "ONT_WGS_".to_string(),
+                    landing_zone: PathBuf::from("/landing/core"),
+                },
+                super::NanoporeCategory {
+                    prefix: "ONT_".to_string(),
+                    landing_zone: PathBuf::from("/landing/other"),
+                },
+            ],
+        };
+
+        let cat = config
+            .classify("ONT_WGS_run1")
+            .expect("should match basecalled");
+        assert_eq!(cat.prefix, "ONT_WGS_");
+
+        let cat = config
+            .classify("ONT_raw_run2")
+            .expect("should match alldata");
+        assert_eq!(cat.prefix, "ONT_");
+    }
+
+    #[test]
+    fn classify_returns_none_for_unmatched() {
+        let config = NanoporeConfig {
+            source: PathBuf::from("/data/nanopore"),
+            categories: [
+                super::NanoporeCategory {
+                    prefix: "ONT_WGS_".to_string(),
+                    landing_zone: PathBuf::from("/landing/core"),
+                },
+                super::NanoporeCategory {
+                    prefix: "ONT_".to_string(),
+                    landing_zone: PathBuf::from("/landing/other"),
+                },
+            ],
+        };
+
+        assert!(config.classify("ILLUMINA_run1").is_none());
+    }
+
+    #[test]
+    fn rejects_empty_nanopore_prefix() {
+        let error = Config::from_toml_str(
+            r#"
+flockdir = "/var/lib/sequencer/flock"
+server_user = "sequencer-sync"
+server_port = 22
+server_host = "sequencer.example.org"
+
+[nanopore]
+source = "/data/nanopore"
+
+[nanopore.basecalled]
+prefix = ""
+landing_zone = "/var/lib/sequencer/landing-zone-core"
+
+[nanopore.alldata]
+prefix = "ONT_"
+landing_zone = "/var/lib/sequencer/landing-zone-other"
+"#,
+        )
+        .expect_err("empty prefix should fail");
+
+        assert!(matches!(error, ConfigError::EmptyField { .. }));
     }
 }

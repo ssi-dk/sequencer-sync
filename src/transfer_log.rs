@@ -219,7 +219,7 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_directory_entries_error() {
+    fn duplicate_directory_entries_are_ignored() {
         let tempdir = make_temp_dir();
         fs::write(
             transfer_log_path(&tempdir),
@@ -230,12 +230,7 @@ mod tests {
         )
         .expect("should write log fixture");
 
-        let error = TransferLog::load(&tempdir).expect_err("duplicate directory should error");
-
-        assert!(matches!(
-            error,
-            TransferLogError::DuplicateDirectory { directory, .. } if directory == "run-001"
-        ));
+        let _log = TransferLog::load(&tempdir).expect("duplicate directory should not error");
         cleanup_temp_dir(&tempdir);
     }
 

@@ -5,7 +5,7 @@ use std::process::ExitCode;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use config::{Config, ConfigError};
+use config::{Config, ConfigError, NanoporeConfig, NextSeqConfig, PlatformConfig};
 use fs2::FileExt;
 use thiserror::Error;
 use transfer_log::TransferLog;
@@ -62,11 +62,21 @@ fn try_main() -> Result<(), AppError> {
 
 fn setup(args: CommandArgs) -> Result<(), AppError> {
     let config_path = canonicalize_config_path(&args.config_path)?;
-    let config = load_config(&args.config_path)?;
+    let config = load_config(&args.config_path, &args.platform)?;
 
     check_ssh_access(&config)?;
-    check_readable_directory(&config.source, "source")?;
-    check_writable_directory(&config.landing_zone, "landing_zone")?;
+    match &config.platform {
+        PlatformConfig::Nanopore(nano) => {
+            check_readable_directory(&nano.source, "nanopore.source")?;
+            for cat in &nano.categories {
+                check_writable_directory(&cat.landing_zone, "nanopore landing_zone")?;
+            }
+        }
+        PlatformConfig::NextSeq(ns) => {
+            check_readable_directory(&ns.source, "nextseq.source")?;
+            check_writable_directory(&ns.landing_zone, "nextseq.landing_zone")?;
+        }
+    }
     check_writable_directory(&config.flockdir, "flockdir")?;
     check_lock_is_available(&config.flockdir)?;
     let cron_path = write_cron_file(&config.flockdir, &config_path, args.platform)?;
@@ -79,14 +89,17 @@ fn setup(args: CommandArgs) -> Result<(), AppError> {
 }
 
 fn test(args: CommandArgs) -> Result<(), AppError> {
-    match args.platform {
-        Platform::Nanopore => test_nanopore(&args.config_path),
-        Platform::NextSeq => test_nextseq(&args.config_path),
+    let config = load_config(&args.config_path, &args.platform)?;
+
+    match &config.platform {
+        PlatformConfig::Nanopore(nano) => test_nanopore(&config, nano),
+        PlatformConfig::NextSeq(ns) => test_nextseq(&config, ns),
     }
 }
 
 fn run_command(args: CommandArgs) -> Result<(), AppError> {
-    let config = load_config(&args.config_path)?;
+    let config = load_config(&args.config_path, &args.platform)?;
+
     let _lock = match acquire_run_lock(&config.flockdir)? {
         Some(lock) => lock,
         None => {
@@ -96,35 +109,62 @@ fn run_command(args: CommandArgs) -> Result<(), AppError> {
     };
     let mut transfer_log = TransferLog::load(&config.flockdir).map_err(AppError::TransferLog)?;
 
-    match args.platform {
-        Platform::Nanopore => run_nanopore(&config, &mut transfer_log),
-        Platform::NextSeq => run_nextseq(&config, &mut transfer_log),
+    match &config.platform {
+        PlatformConfig::Nanopore(nano) => run_nanopore(&config, nano, &mut transfer_log),
+        PlatformConfig::NextSeq(ns) => run_nextseq(&config, ns, &mut transfer_log),
     }
 }
 
-fn test_nanopore(config_path: &Path) -> Result<(), AppError> {
-    let _config = load_config(config_path)?;
+fn test_nanopore(_config: &Config, _nano: &NanoporeConfig) -> Result<(), AppError> {
     todo!()
 }
 
-fn test_nextseq(config_path: &Path) -> Result<(), AppError> {
-    let _config = load_config(config_path)?;
+fn test_nextseq(_config: &Config, _ns: &NextSeqConfig) -> Result<(), AppError> {
     todo!()
 }
 
-fn run_nanopore(_config: &Config, _transfer_log: &mut TransferLog) -> Result<(), AppError> {
+fn run_nanopore(
+    _config: &Config,
+    _nano: &NanoporeConfig,
+    _transfer_log: &mut TransferLog,
+) -> Result<(), AppError> {
     todo!()
 }
 
-fn run_nextseq(_config: &Config, _transfer_log: &mut TransferLog) -> Result<(), AppError> {
+fn run_nextseq(
+    _config: &Config,
+    _ns: &NextSeqConfig,
+    _transfer_log: &mut TransferLog,
+) -> Result<(), AppError> {
     todo!()
 }
 
-fn load_config(config_path: &Path) -> Result<Config, AppError> {
-    Config::from_path(config_path).map_err(|source| AppError::LoadConfig {
+fn load_config(config_path: &Path, expected_platform: &Platform) -> Result<Config, AppError> {
+    let config = Config::from_path(config_path).map_err(|source| AppError::LoadConfig {
         path: config_path.to_path_buf(),
         source,
-    })
+    })?;
+
+    if !matches!(
+        (expected_platform, &config.platform),
+        (Platform::Nanopore, PlatformConfig::Nanopore(_))
+            | (Platform::NextSeq, PlatformConfig::NextSeq(_))
+    ) {
+        let expected = match &config.platform {
+            PlatformConfig::Nanopore(_) => "nanopore",
+            PlatformConfig::NextSeq(_) => "nextseq",
+        };
+        let got = match expected_platform {
+            Platform::Nanopore => "nanopore",
+            Platform::NextSeq => "nextseq",
+        };
+        return Err(AppError::PlatformMismatch {
+            expected: expected.to_string(),
+            got: got.to_string(),
+        });
+    }
+
+    Ok(config)
 }
 
 fn check_ssh_access(config: &Config) -> Result<(), AppError> {
@@ -287,7 +327,7 @@ impl Platform {
     fn as_cli_value(&self) -> &'static str {
         match self {
             Self::Nanopore => "nanopore",
-            Self::NextSeq => "next-seq",
+            Self::NextSeq => "nextseq",
         }
     }
 }
@@ -380,6 +420,8 @@ enum AppError {
     },
     #[error("run lock is currently held: {}", path.display())]
     RunLockHeld { path: PathBuf },
+    #[error("--platform flag `{got}` does not match config platform `{expected}`")]
+    PlatformMismatch { expected: String, got: String },
 }
 
 #[cfg(test)]

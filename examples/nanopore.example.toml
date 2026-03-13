@@ -1,0 +1,15 @@
+flockdir = "/var/lib/sequencer/flock"
+server_user = "sequencer-sync"
+server_port = 22
+server_host = "sequencer.example.org"
+
+[nanopore]
+source = "/data/nanopore"
+
+[nanopore.basecalled]
+prefix = "ONT_WGS_"
+landing_zone = "/var/lib/sequencer/landing-zone-core"
+
+[nanopore.alldata]
+prefix = "ONT_"
+landing_zone = "/var/lib/sequencer/landing-zone-other"
