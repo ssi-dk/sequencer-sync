@@ -1,10 +1,11 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use regex::Regex;
 use serde::Deserialize;
 use thiserror::Error;
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug)]
 pub struct Config {
     // Directory with log files and file lock
     pub flockdir: PathBuf,
@@ -17,7 +18,7 @@ pub struct Config {
     pub platform: PlatformConfig,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug)]
 pub enum PlatformConfig {
     Nanopore(NanoporeConfig),
     NextSeq(NextSeqConfig),
@@ -36,9 +37,10 @@ pub struct NanoporeCategory {
     pub landing_zone: PathBuf,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug)]
 pub struct NextSeqConfig {
     pub source: PathBuf,
+    pub prefix: Regex,
     pub landing_zone: PathBuf,
 }
 
@@ -78,6 +80,7 @@ struct UnvalidatedNanoporeCategory {
 #[derive(Debug, Deserialize)]
 struct UnvalidatedNextSeqConfig {
     source: PathBuf,
+    prefix: String,
     landing_zone: PathBuf,
 }
 
@@ -112,6 +115,12 @@ pub enum ConfigError {
     MultiplePlatformSections,
     #[error("nanopore basecalled and alldata prefixes must differ: `{prefix}`")]
     DuplicatePrefix { prefix: String },
+    #[error("config field `{field}` is not a valid regex: {source}")]
+    InvalidRegex {
+        field: &'static str,
+        #[source]
+        source: regex::Error,
+    },
 }
 
 impl Config {
@@ -213,6 +222,12 @@ impl UnvalidatedNextSeqConfig {
     fn validate(self, flockdir: &Path) -> Result<NextSeqConfig, ConfigError> {
         validate_absolute_path("nextseq.source", &self.source)?;
         validate_absolute_path("nextseq.landing_zone", &self.landing_zone)?;
+        validate_non_empty("nextseq.prefix", &self.prefix)?;
+
+        let prefix = Regex::new(&self.prefix).map_err(|source| ConfigError::InvalidRegex {
+            field: "nextseq.prefix",
+            source,
+        })?;
 
         let paths: [(&'static str, &Path); 3] = [
             ("nextseq.source", &self.source),
@@ -223,6 +238,7 @@ impl UnvalidatedNextSeqConfig {
 
         Ok(NextSeqConfig {
             source: self.source,
+            prefix,
             landing_zone: self.landing_zone,
         })
     }
@@ -306,6 +322,7 @@ mod tests {
             panic!("expected NextSeq platform");
         };
         assert_eq!(ns.source, PathBuf::from("/data/nextseq"));
+        assert!(ns.prefix.is_match("240101_"));
         assert_eq!(
             ns.landing_zone,
             PathBuf::from("/var/lib/sequencer/landing-zone")
@@ -349,6 +366,7 @@ landing_zone = "/var/lib/sequencer/landing-zone-other"
 
 [nextseq]
 source = "/data/nextseq"
+prefix = "^\\d{6}_"
 landing_zone = "/var/lib/sequencer/landing-zone"
 "#,
         )
@@ -427,6 +445,7 @@ server_host = "sequencer.example.org"
 
 [nextseq]
 source = "relative/data"
+prefix = "^\\d{6}_"
 landing_zone = "/var/lib/sequencer/landing-zone"
 "#,
         )
@@ -452,6 +471,7 @@ server_host = "sequencer.example.org"
 
 [nextseq]
 source = "/data/nextseq"
+prefix = "^\\d{6}_"
 landing_zone = "/var/lib/sequencer/landing-zone"
 "#,
         )
@@ -476,6 +496,7 @@ server_host = "sequencer.example.org"
 
 [nextseq]
 source = "/data/nextseq"
+prefix = "^\\d{6}_"
 landing_zone = "/var/lib/sequencer/flock"
 "#,
         )
