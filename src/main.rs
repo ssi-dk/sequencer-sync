@@ -63,7 +63,6 @@ fn setup(args: CommandArgs) -> Result<(), AppError> {
     let config = load_config(&args.config_path)?;
 
     check_ssh_access(&config)?;
-    check_remote_write_access(&config)?;
     check_readable_directory(&config.source, "source")?;
     check_writable_directory(&config.landing_zone, "landing_zone")?;
     check_writable_directory(&config.flockdir, "flockdir")?;
@@ -141,31 +140,6 @@ fn check_ssh_access(config: &Config) -> Result<(), AppError> {
         Ok(())
     } else {
         Err(AppError::SshAccessDenied {
-            user: config.server_user.clone(),
-            host: config.server_host.clone(),
-            port: config.server_port,
-        })
-    }
-}
-
-fn check_remote_write_access(config: &Config) -> Result<(), AppError> {
-    let status = Command::new("ssh")
-        .arg("-o")
-        .arg("BatchMode=yes")
-        .arg("-p")
-        .arg(config.server_port.to_string())
-        .arg(format!("{}@{}", config.server_user, config.server_host))
-        .arg("test")
-        .arg("-w")
-        .arg(&config.server_dest)
-        .status()
-        .map_err(|source| AppError::SpawnSsh { source })?;
-
-    if status.success() {
-        Ok(())
-    } else {
-        Err(AppError::RemoteWriteAccessDenied {
-            path: config.server_dest.clone(),
             user: config.server_user.clone(),
             host: config.server_host.clone(),
             port: config.server_port,
@@ -342,13 +316,6 @@ enum AppError {
     },
     #[error("ssh access check failed for {user}@{host}:{port}")]
     SshAccessDenied {
-        user: String,
-        host: String,
-        port: u16,
-    },
-    #[error("remote write-access check failed for {} on {user}@{host}:{port}", path.display())]
-    RemoteWriteAccessDenied {
-        path: PathBuf,
         user: String,
         host: String,
         port: u16,

@@ -6,10 +6,10 @@ use thiserror::Error;
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct Config {
-    // Directory to copy data from and to landing zone
+    // Directory to copy data from.
     pub source: PathBuf,
 
-    // Directory to copy from source
+    // Directory to copy selected files into.
     pub landing_zone: PathBuf,
 
     // Directory with log files and file lock
@@ -19,9 +19,6 @@ pub struct Config {
     pub server_user: String,
     pub server_port: u16,
     pub server_host: String,
-
-    // Copy from landing zone to this path on the server
-    pub server_dest: PathBuf,
 }
 
 #[derive(Debug, Deserialize)]
@@ -32,7 +29,6 @@ struct UnvalidatedConfig {
     server_user: String,
     server_port: u16,
     server_host: String,
-    server_dest: PathBuf,
 }
 
 #[derive(Debug, Error)]
@@ -83,7 +79,6 @@ impl UnvalidatedConfig {
         validate_absolute_path("source", &self.source)?;
         validate_absolute_path("landing_zone", &self.landing_zone)?;
         validate_absolute_path("flockdir", &self.flockdir)?;
-        validate_absolute_path("server_dest", &self.server_dest)?;
         validate_non_empty("server_user", &self.server_user)?;
         validate_non_empty("server_host", &self.server_host)?;
 
@@ -109,7 +104,6 @@ impl UnvalidatedConfig {
             server_user: self.server_user,
             server_port: self.server_port,
             server_host: self.server_host,
-            server_dest: self.server_dest,
         })
     }
 }
@@ -171,7 +165,6 @@ mod tests {
         assert_eq!(config.server_user, "sequencer-sync");
         assert_eq!(config.server_port, 22);
         assert_eq!(config.server_host, "sequencer.example.org");
-        assert_eq!(config.server_dest, PathBuf::from("/srv/sequencer/incoming"));
     }
 
     #[test]
@@ -184,7 +177,6 @@ flockdir = "/var/lib/sequencer/flock"
 server_user = "sequencer-sync"
 server_port = 22
 server_host = "sequencer.example.org"
-server_dest = "/srv/sequencer/incoming"
 "#,
         )
         .expect_err("relative source path should fail validation");
@@ -208,7 +200,6 @@ flockdir = "/var/lib/sequencer/flock"
 server_user = "   "
 server_port = 22
 server_host = "sequencer.example.org"
-server_dest = "/srv/sequencer/incoming"
 "#,
         )
         .expect_err("empty server_user should fail validation");
@@ -231,7 +222,6 @@ flockdir = "/var/lib/sequencer/flock"
 server_user = "sequencer-sync"
 server_port = 22
 server_host = "sequencer.example.org"
-server_dest = "/srv/sequencer/incoming"
 "#,
         )
         .expect_err("duplicate local paths should fail validation");
