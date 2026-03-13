@@ -1,4 +1,4 @@
-use std::fs::{self, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::process::ExitCode;
@@ -6,6 +6,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use config::{Config, ConfigError};
+use fs2::FileExt;
 use thiserror::Error;
 
 mod config;
@@ -66,6 +67,7 @@ fn setup(args: CommandArgs) -> Result<(), AppError> {
     check_readable_directory(&config.source, "source")?;
     check_writable_directory(&config.landing_zone, "landing_zone")?;
     check_writable_directory(&config.flockdir, "flockdir")?;
+    check_lock_is_available(&config.flockdir)?;
     let cron_path = write_cron_file(&config.flockdir, &config_path, args.platform)?;
     eprintln!(
         "Install the generated cron job with your system cron configuration: {}",
@@ -83,9 +85,18 @@ fn test(args: CommandArgs) -> Result<(), AppError> {
 }
 
 fn run_command(args: CommandArgs) -> Result<(), AppError> {
+    let config = load_config(&args.config_path)?;
+    let _lock = match acquire_run_lock(&config.flockdir)? {
+        Some(lock) => lock,
+        None => {
+            eprintln!("Another sequencer-sync run is already in progress; exiting.");
+            return Ok(());
+        }
+    };
+
     match args.platform {
-        Platform::Nanopore => run_nanopore(&args.config_path),
-        Platform::NextSeq => run_nextseq(&args.config_path),
+        Platform::Nanopore => run_nanopore(&config),
+        Platform::NextSeq => run_nextseq(&config),
     }
 }
 
@@ -99,13 +110,11 @@ fn test_nextseq(config_path: &Path) -> Result<(), AppError> {
     todo!()
 }
 
-fn run_nanopore(config_path: &Path) -> Result<(), AppError> {
-    let _config = load_config(config_path)?;
+fn run_nanopore(_config: &Config) -> Result<(), AppError> {
     todo!()
 }
 
-fn run_nextseq(config_path: &Path) -> Result<(), AppError> {
-    let _config = load_config(config_path)?;
+fn run_nextseq(_config: &Config) -> Result<(), AppError> {
     todo!()
 }
 
@@ -251,6 +260,10 @@ fn cron_file_path(flockdir: &Path) -> PathBuf {
     flockdir.join("sequencer-sync.cron")
 }
 
+fn lock_file_path(flockdir: &Path) -> PathBuf {
+    flockdir.join(LOCK_FILE_NAME)
+}
+
 fn render_cron_file(config_path: &Path, platform: Platform) -> String {
     let command = format!(
         "sequencer-sync run --config-path {} --platform {}",
@@ -259,6 +272,33 @@ fn render_cron_file(config_path: &Path, platform: Platform) -> String {
     );
 
     format!("# Install this file into cron manually.\n*/15 * * * * {command}\n")
+}
+
+fn check_lock_is_available(flockdir: &Path) -> Result<(), AppError> {
+    let _lock = acquire_run_lock(flockdir)?.ok_or_else(|| AppError::RunLockHeld {
+        path: lock_file_path(flockdir),
+    })?;
+    Ok(())
+}
+
+fn acquire_run_lock(flockdir: &Path) -> Result<Option<RunLock>, AppError> {
+    let path = lock_file_path(flockdir);
+    let file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&path)
+        .map_err(|source| AppError::OpenRunLockFile {
+            path: path.clone(),
+            source,
+        })?;
+
+    match file.try_lock_exclusive() {
+        Ok(()) => Ok(Some(RunLock { file })),
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
+        Err(source) => Err(AppError::AcquireRunLock { path, source }),
+    }
 }
 
 fn shell_quote(value: &str) -> String {
@@ -272,6 +312,18 @@ impl Platform {
             Self::Nanopore => "nanopore",
             Self::NextSeq => "next-seq",
         }
+    }
+}
+
+const LOCK_FILE_NAME: &str = "sequencer-sync.lock";
+
+struct RunLock {
+    file: File,
+}
+
+impl Drop for RunLock {
+    fn drop(&mut self) {
+        let _ = self.file.unlock();
     }
 }
 
@@ -342,13 +394,27 @@ enum AppError {
         #[source]
         source: std::io::Error,
     },
+    #[error("failed to open run lock file {}: {source}", path.display())]
+    OpenRunLockFile {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("failed to acquire run lock {}: {source}", path.display())]
+    AcquireRunLock {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("run lock is currently held: {}", path.display())]
+    RunLockHeld { path: PathBuf },
 }
 
 #[cfg(test)]
 mod tests {
     use std::path::Path;
 
-    use super::{Platform, cron_file_path, render_cron_file};
+    use super::{LOCK_FILE_NAME, Platform, cron_file_path, lock_file_path, render_cron_file};
 
     #[test]
     fn renders_cron_file() {
@@ -368,6 +434,16 @@ mod tests {
         assert_eq!(
             path,
             Path::new("/var/lib/sequencer/flock/sequencer-sync.cron")
+        );
+    }
+
+    #[test]
+    fn computes_lock_file_path_in_flockdir() {
+        let path = lock_file_path(Path::new("/var/lib/sequencer/flock"));
+
+        assert_eq!(
+            path,
+            Path::new("/var/lib/sequencer/flock").join(LOCK_FILE_NAME)
         );
     }
 }
