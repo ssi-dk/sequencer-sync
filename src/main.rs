@@ -1,6 +1,8 @@
+use std::fs::{self, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::process::ExitCode;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use config::{Config, ConfigError};
@@ -61,10 +63,9 @@ fn setup(args: CommandArgs) -> Result<(), AppError> {
 
     check_ssh_access(&config)?;
     check_remote_write_access(&config)?;
-
-    // TODO later: Check that landing zone exists, and you have write permissions
-    // TODO later: Check that source exists, and you have read permissions
-    // TODO later: Check the flock dir exists, and you have write permissions
+    check_readable_directory(&config.source, "source")?;
+    check_writable_directory(&config.landing_zone, "landing_zone")?;
+    check_writable_directory(&config.flockdir, "flockdir")?;
 
     Ok(())
 }
@@ -158,6 +159,68 @@ fn check_remote_write_access(config: &Config) -> Result<(), AppError> {
     }
 }
 
+fn check_readable_directory(path: &Path, field: &'static str) -> Result<(), AppError> {
+    ensure_directory_exists(path, field)?;
+    fs::read_dir(path).map_err(|source| AppError::ReadDirectory {
+        field,
+        path: path.to_path_buf(),
+        source,
+    })?;
+    Ok(())
+}
+
+fn check_writable_directory(path: &Path, field: &'static str) -> Result<(), AppError> {
+    ensure_directory_exists(path, field)?;
+
+    let temp_path = temp_probe_path(path, field);
+    OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temp_path)
+        .map_err(|source| AppError::WriteDirectory {
+            field,
+            path: path.to_path_buf(),
+            source,
+        })?;
+
+    fs::remove_file(&temp_path).map_err(|source| AppError::CleanupProbeFile {
+        path: temp_path,
+        source,
+    })?;
+
+    Ok(())
+}
+
+fn ensure_directory_exists(path: &Path, field: &'static str) -> Result<(), AppError> {
+    let metadata = fs::metadata(path).map_err(|source| AppError::ReadMetadata {
+        field,
+        path: path.to_path_buf(),
+        source,
+    })?;
+
+    if metadata.is_dir() {
+        Ok(())
+    } else {
+        Err(AppError::NotADirectory {
+            field,
+            path: path.to_path_buf(),
+        })
+    }
+}
+
+fn temp_probe_path(directory: &Path, field: &str) -> PathBuf {
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after unix epoch")
+        .as_nanos();
+    let filename = format!(
+        ".sequencer-sync-{field}-write-probe-{}-{timestamp}",
+        std::process::id()
+    );
+
+    directory.join(filename)
+}
+
 #[derive(Debug, Error)]
 enum AppError {
     #[error("failed to load config from {}: {source}", path.display())]
@@ -183,5 +246,34 @@ enum AppError {
         user: String,
         host: String,
         port: u16,
+    },
+    #[error("failed to access metadata for `{field}` directory {}: {source}", path.display())]
+    ReadMetadata {
+        field: &'static str,
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("config field `{field}` must point to a directory: {}", path.display())]
+    NotADirectory { field: &'static str, path: PathBuf },
+    #[error("failed to read `{field}` directory {}: {source}", path.display())]
+    ReadDirectory {
+        field: &'static str,
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("failed to write to `{field}` directory {}: {source}", path.display())]
+    WriteDirectory {
+        field: &'static str,
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("failed to remove temporary probe file {}: {source}", path.display())]
+    CleanupProbeFile {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
     },
 }
