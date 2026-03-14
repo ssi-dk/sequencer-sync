@@ -566,3 +566,50 @@ fn dry_run_respects_completion_check() {
     // Incomplete run should not
     assert!(!stdout.contains("240202_NB002"));
 }
+
+#[test]
+fn test_command_succeeds() {
+    let fixture = TestFixture::new("test-ok");
+    let config_path = fixture.setup_nanopore();
+
+    cmd()
+        .args(["test", "--config-path"])
+        .arg(&config_path)
+        .args(["--platform", "nanopore", "--skip-ssh-check"])
+        .assert()
+        .success();
+}
+
+#[test]
+fn test_command_fails_missing_source() {
+    let fixture = TestFixture::new("test-no-source");
+    fixture.mkdir("flockdir");
+    // Do NOT create nanopore-source
+    fixture.mkdir("nanopore-landing-core");
+    fixture.mkdir("nanopore-landing-other");
+    let config_path = fixture.write_nanopore_config();
+
+    cmd()
+        .args(["test", "--config-path"])
+        .arg(&config_path)
+        .args(["--platform", "nanopore", "--skip-ssh-check"])
+        .assert()
+        .failure();
+}
+
+#[test]
+fn test_command_fails_missing_landing_zone() {
+    let fixture = TestFixture::new("test-no-landing");
+    fixture.mkdir("flockdir");
+    fixture.mkdir("nanopore-source");
+    fixture.mkdir("nanopore-landing-core");
+    // Do NOT create nanopore-landing-other
+    let config_path = fixture.write_nanopore_config();
+
+    cmd()
+        .args(["test", "--config-path"])
+        .arg(&config_path)
+        .args(["--platform", "nanopore", "--skip-ssh-check"])
+        .assert()
+        .failure();
+}

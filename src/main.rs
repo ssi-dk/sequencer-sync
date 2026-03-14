@@ -78,22 +78,7 @@ fn setup(args: CommandArgs) -> Result<(), AppError> {
     let config_path = canonicalize_config_path(&args.config_path)?;
     let config = load_config(&args.config_path, &args.platform)?;
 
-    if !args.skip_ssh_check {
-        check_ssh_access(&config)?;
-    }
-    match &config.platform {
-        PlatformConfig::Nanopore(nano) => {
-            check_readable_directory(&nano.source, "nanopore.source")?;
-            for cat in &nano.categories {
-                check_writable_directory(&cat.landing_zone, "nanopore landing_zone")?;
-            }
-        }
-        PlatformConfig::NextSeq(ns) => {
-            check_readable_directory(&ns.source, "nextseq.source")?;
-            check_writable_directory(&ns.landing_zone, "nextseq.landing_zone")?;
-        }
-    }
-    check_writable_directory(&config.flockdir, "flockdir")?;
+    validate_environment(&config, args.skip_ssh_check)?;
     check_lock_is_available(&config.flockdir)?;
     let cron_path = write_cron_file(&config.flockdir, &config_path, args.platform)?;
     eprintln!(
@@ -106,11 +91,7 @@ fn setup(args: CommandArgs) -> Result<(), AppError> {
 
 fn test(args: CommandArgs) -> Result<(), AppError> {
     let config = load_config(&args.config_path, &args.platform)?;
-
-    match &config.platform {
-        PlatformConfig::Nanopore(nano) => test_nanopore(&config, nano),
-        PlatformConfig::NextSeq(ns) => test_nextseq(&config, ns),
-    }
+    validate_environment(&config, args.skip_ssh_check)
 }
 
 fn run_command(args: CommandArgs) -> Result<(), AppError> {
@@ -148,12 +129,24 @@ fn run_command(args: CommandArgs) -> Result<(), AppError> {
     }
 }
 
-fn test_nanopore(_config: &Config, _nano: &NanoporeConfig) -> Result<(), AppError> {
-    todo!()
-}
-
-fn test_nextseq(_config: &Config, _ns: &NextSeqConfig) -> Result<(), AppError> {
-    todo!()
+fn validate_environment(config: &Config, skip_ssh_check: bool) -> Result<(), AppError> {
+    if !skip_ssh_check {
+        check_ssh_access(config)?;
+    }
+    match &config.platform {
+        PlatformConfig::Nanopore(nano) => {
+            check_readable_directory(&nano.source, "nanopore.source")?;
+            for cat in &nano.categories {
+                check_writable_directory(&cat.landing_zone, "nanopore landing_zone")?;
+            }
+        }
+        PlatformConfig::NextSeq(ns) => {
+            check_readable_directory(&ns.source, "nextseq.source")?;
+            check_writable_directory(&ns.landing_zone, "nextseq.landing_zone")?;
+        }
+    }
+    check_writable_directory(&config.flockdir, "flockdir")?;
+    Ok(())
 }
 
 enum TransferReason {
