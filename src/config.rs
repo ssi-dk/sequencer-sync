@@ -71,7 +71,7 @@ impl NextSeqConfig {
     pub fn destination_for(&self, dir_name: &str) -> Option<PathBuf> {
         if self.year_subdirectory {
             let bytes = dir_name.as_bytes();
-            if bytes.len() < 2 || bytes.iter().any(|c| !c.is_ascii_digit()) {
+            if bytes.len() < 2 || bytes[..2].iter().any(|c| !c.is_ascii_digit()) {
                 return None;
             }
             Some(self.landing_zone.join(format!("20{}", &dir_name[..2])))

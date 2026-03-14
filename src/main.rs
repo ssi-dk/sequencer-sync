@@ -274,7 +274,13 @@ fn run_nanopore(
 
         if succeeded {
             run_log.log(&format!("Transferred {dir_name} -> {destination_display}"));
-            let _ = touch_transfer_marker(&category.landing_zone.join(entry.file_name()));
+            if let Err(error) =
+                touch_transfer_marker(&category.landing_zone.join(entry.file_name()))
+            {
+                eprintln!("Warning: {error}");
+                run_log.log(&format!("Warning: {error}"));
+                run_log.record_error();
+            }
         } else {
             run_log.log(&format!(
                 "FAILED transfer {dir_name} -> {destination_display}"
@@ -377,7 +383,11 @@ fn run_nextseq(
 
         if succeeded {
             run_log.log(&format!("Transferred {dir_name} -> {destination_display}"));
-            let _ = touch_transfer_marker(&destination.join(entry.file_name()));
+            if let Err(error) = touch_transfer_marker(&destination.join(entry.file_name())) {
+                eprintln!("Warning: {error}");
+                run_log.log(&format!("Warning: {error}"));
+                run_log.record_error();
+            }
         } else {
             run_log.log(&format!(
                 "FAILED transfer {dir_name} -> {destination_display}"

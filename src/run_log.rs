@@ -27,9 +27,15 @@ impl RunLog {
         }
     }
 
-    /// Returns true if any previous call to `log_or_warn` failed.
+    /// Returns true if a non-fatal error was recorded during this run.
     pub fn had_error(&self) -> bool {
         self.had_error
+    }
+
+    /// Record that a non-fatal error occurred. This will cause the
+    /// process to exit with a non-zero status code.
+    pub fn record_error(&mut self) {
+        self.had_error = true;
     }
 
     /// Log a message. If writing fails, print a warning to stderr and
