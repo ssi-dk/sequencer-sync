@@ -41,6 +41,9 @@ struct CommandArgs {
     /// Transfer directories even if the completion file is not present.
     #[arg(long, default_value_t = false)]
     ignore_incomplete: bool,
+    /// Skip the SSH access check during setup (useful before SSH keys are deployed).
+    #[arg(long, default_value_t = false)]
+    skip_ssh_check: bool,
 }
 
 #[derive(Clone, Debug, ValueEnum)]
@@ -72,7 +75,9 @@ fn setup(args: CommandArgs) -> Result<(), AppError> {
     let config_path = canonicalize_config_path(&args.config_path)?;
     let config = load_config(&args.config_path, &args.platform)?;
 
-    check_ssh_access(&config)?;
+    if !args.skip_ssh_check {
+        check_ssh_access(&config)?;
+    }
     match &config.platform {
         PlatformConfig::Nanopore(nano) => {
             check_readable_directory(&nano.source, "nanopore.source")?;

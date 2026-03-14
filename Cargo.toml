@@ -13,3 +13,6 @@ thiserror = "2.0"
 regex = "1"
 toml = "0.8"
 glob = "0.3.3"
+
+[dev-dependencies]
+assert_cmd = "2"
