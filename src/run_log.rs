@@ -57,6 +57,7 @@ impl RunLog {
             .append(true)
             .open(&self.full_log_path)?;
         full.write_all(line.as_bytes())?;
+        full.sync_all()?;
 
         // Write to latest log (truncate on first write, append after)
         if self.latest_started {
@@ -64,6 +65,7 @@ impl RunLog {
                 .append(true)
                 .open(&self.latest_log_path)?;
             latest.write_all(line.as_bytes())?;
+            latest.sync_all()?;
         } else {
             std::fs::write(&self.latest_log_path, &line)?;
             self.latest_started = true;

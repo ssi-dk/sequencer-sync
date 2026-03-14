@@ -28,7 +28,7 @@ enum Commands {
     /// Validate config file, check directories have correct permissions, and print cron tab
     Setup(SetupArgs),
 
-    /// Syncronize files to the landing zone
+    /// Synchronize files to the landing zone
     Run(RunArgs),
 }
 
@@ -115,7 +115,6 @@ fn run_command(args: RunArgs) -> Result<(), AppError> {
 
     match &config.platform {
         PlatformConfig::Nanopore(nano) => run_nanopore(
-            &config,
             nano,
             &mut transfer_log,
             &mut run_log,
@@ -124,7 +123,6 @@ fn run_command(args: RunArgs) -> Result<(), AppError> {
             args.dry_run,
         ),
         PlatformConfig::NextSeq(ns) => run_nextseq(
-            &config,
             ns,
             &mut transfer_log,
             &mut run_log,
@@ -199,10 +197,7 @@ fn new_directories(
 
         let key = transfer_log::relative_directory_key(source, &entry.path())
             .map_err(AppError::TransferLog)?;
-        if transfer_log
-            .should_skip(&key, retry_failed)
-            .unwrap_or(false)
-        {
+        if transfer_log.should_skip(&key, retry_failed) {
             continue;
         }
 
@@ -227,7 +222,6 @@ fn run_is_complete(run_dir: &Path, completion_file_glob: &glob::Pattern) -> bool
 }
 
 fn run_nanopore(
-    _config: &Config,
     nano: &NanoporeConfig,
     transfer_log: &mut TransferLog,
     run_log: &mut RunLog,
@@ -333,7 +327,6 @@ fn rsync_directory(source: &Path, destination: &Path, exclude: &[String]) -> Res
 }
 
 fn run_nextseq(
-    _config: &Config,
     ns: &NextSeqConfig,
     transfer_log: &mut TransferLog,
     run_log: &mut RunLog,
@@ -409,17 +402,17 @@ fn load_config(config_path: &Path, expected_platform: &Platform) -> Result<Confi
         (Platform::Nanopore, PlatformConfig::Nanopore(_))
             | (Platform::NextSeq, PlatformConfig::NextSeq(_))
     ) {
-        let expected = match &config.platform {
+        let config_platform = match &config.platform {
             PlatformConfig::Nanopore(_) => "nanopore",
             PlatformConfig::NextSeq(_) => "nextseq",
         };
-        let got = match expected_platform {
+        let cli_platform = match expected_platform {
             Platform::Nanopore => "nanopore",
             Platform::NextSeq => "nextseq",
         };
         return Err(AppError::PlatformMismatch {
-            expected: expected.to_string(),
-            got: got.to_string(),
+            config: config_platform.to_string(),
+            cli: cli_platform.to_string(),
         });
     }
 
@@ -679,8 +672,8 @@ enum AppError {
     },
     #[error("run lock is currently held: {}", path.display())]
     RunLockHeld { path: PathBuf },
-    #[error("--platform flag `{got}` does not match config platform `{expected}`")]
-    PlatformMismatch { expected: String, got: String },
+    #[error("--platform flag `{cli}` does not match config platform `{config}`")]
+    PlatformMismatch { cli: String, config: String },
     #[error("failed to execute rsync: {source}")]
     SpawnRsync {
         #[source]
