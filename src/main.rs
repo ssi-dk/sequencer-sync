@@ -44,6 +44,9 @@ struct CommandArgs {
     /// Skip the SSH access check during setup (useful before SSH keys are deployed).
     #[arg(long, default_value_t = false)]
     skip_ssh_check: bool,
+    /// Print what would be copied instead of actually copying.
+    #[arg(long, default_value_t = false)]
+    dry_run: bool,
 }
 
 #[derive(Clone, Debug, ValueEnum)]
@@ -131,6 +134,7 @@ fn run_command(args: CommandArgs) -> Result<(), AppError> {
             &mut run_log,
             args.retry_failed,
             args.ignore_incomplete,
+            args.dry_run,
         ),
         PlatformConfig::NextSeq(ns) => run_nextseq(
             &config,
@@ -139,6 +143,7 @@ fn run_command(args: CommandArgs) -> Result<(), AppError> {
             &mut run_log,
             args.retry_failed,
             args.ignore_incomplete,
+            args.dry_run,
         ),
     }
 }
@@ -224,6 +229,7 @@ fn run_nanopore(
     run_log: &mut RunLog,
     retry_failed: bool,
     ignore_incomplete: bool,
+    dry_run: bool,
 ) -> Result<(), AppError> {
     for (entry, reason) in
         new_directories(&nano.source, "nanopore.source", transfer_log, retry_failed)?
@@ -237,6 +243,11 @@ fn run_nanopore(
         };
 
         if !ignore_incomplete && !run_is_complete(&entry.path(), &category.completion_file_glob) {
+            continue;
+        }
+
+        if dry_run {
+            print_dry_run(&entry.path(), &category.landing_zone, &category.exclude);
             continue;
         }
 
@@ -271,6 +282,13 @@ fn run_nanopore(
     Ok(())
 }
 
+fn print_dry_run(source: &Path, destination: &Path, exclude: &[String]) {
+    println!("{} -> {}", source.display(), destination.display());
+    for pattern in exclude {
+        println!("  exclude: {pattern}");
+    }
+}
+
 fn rsync_directory(source: &Path, destination: &Path, exclude: &[String]) -> Result<(), AppError> {
     let mut cmd = Command::new("rsync");
     cmd.arg("-a");
@@ -301,6 +319,7 @@ fn run_nextseq(
     run_log: &mut RunLog,
     retry_failed: bool,
     ignore_incomplete: bool,
+    dry_run: bool,
 ) -> Result<(), AppError> {
     for (entry, reason) in
         new_directories(&ns.source, "nextseq.source", transfer_log, retry_failed)?
@@ -316,13 +335,19 @@ fn run_nextseq(
             continue;
         }
 
+        let Some(destination) = ns.destination_for(&dir_name) else {
+            continue;
+        };
+
+        if dry_run {
+            print_dry_run(&entry.path(), &destination, &ns.exclude);
+            continue;
+        }
+
         if matches!(reason, TransferReason::Retry) {
             let _ = run_log.log(&format!("Retrying previously failed transfer: {dir_name}"));
         }
 
-        let Some(destination) = ns.destination_for(&dir_name) else {
-            continue;
-        };
         let destination_display = destination.display();
         let succeeded = match rsync_directory(&entry.path(), &destination, &ns.exclude) {
             Ok(()) => {

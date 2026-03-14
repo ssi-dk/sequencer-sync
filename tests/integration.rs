@@ -445,3 +445,113 @@ fn setup_with_skip_ssh_check() {
     // Cron file should be created
     assert!(fixture.path("flockdir/sequencer-sync.cron").exists());
 }
+
+#[test]
+fn dry_run_prints_plan_without_copying() {
+    let fixture = TestFixture::new("dry-run");
+    let config_path = fixture.setup_nanopore();
+
+    let output = cmd()
+        .args(["run", "--config-path"])
+        .arg(&config_path)
+        .args(["--platform", "nanopore", "--dry-run"])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    // Should print both directories with their destinations
+    assert!(stdout.contains("ONT_WGS_run1"));
+    assert!(stdout.contains("nanopore-landing-core"));
+    assert!(stdout.contains("ONT_raw_run2"));
+    assert!(stdout.contains("nanopore-landing-other"));
+
+    // Nothing should actually be copied
+    assert!(
+        !fixture
+            .path("nanopore-landing-core/ONT_WGS_run1")
+            .exists()
+    );
+    assert!(
+        !fixture
+            .path("nanopore-landing-other/ONT_raw_run2")
+            .exists()
+    );
+
+    // Transfer log should be empty (no transfers recorded)
+    assert_eq!(transfer_log_line_count(&fixture), 0);
+}
+
+#[test]
+fn dry_run_shows_exclude_patterns() {
+    let fixture = TestFixture::new("dry-run-exclude");
+    fixture.mkdir("flockdir");
+    fixture.mkdir("nanopore-source");
+    fixture.mkdir("nanopore-landing-core");
+    fixture.mkdir("nanopore-landing-other");
+
+    fixture.mkdir("nanopore-source/ONT_WGS_run1");
+    fixture.write_file("nanopore-source/ONT_WGS_run1/report_final.html", "report");
+
+    // Config with exclude patterns
+    let config = format!(
+        r#"flockdir = "{flockdir}"
+server_user = "test"
+server_port = 22
+server_host = "localhost"
+
+[nanopore]
+source = "{source}"
+
+[nanopore.basecalled]
+prefix = "ONT_WGS_"
+landing_zone = "{landing_core}"
+exclude = ["*_skip", "pod5*"]
+completion_file_glob = "report*.html"
+
+[nanopore.alldata]
+prefix = "ONT_"
+landing_zone = "{landing_other}"
+exclude = []
+completion_file_glob = "report*.html"
+"#,
+        flockdir = fixture.path("flockdir").display(),
+        source = fixture.path("nanopore-source").display(),
+        landing_core = fixture.path("nanopore-landing-core").display(),
+        landing_other = fixture.path("nanopore-landing-other").display(),
+    );
+    let config_path = fixture.path("nanopore.toml");
+    fs::write(&config_path, config).unwrap();
+
+    let output = cmd()
+        .args(["run", "--config-path"])
+        .arg(&config_path)
+        .args(["--platform", "nanopore", "--dry-run"])
+        .output()
+        .unwrap();
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("exclude: *_skip"));
+    assert!(stdout.contains("exclude: pod5*"));
+}
+
+#[test]
+fn dry_run_respects_completion_check() {
+    let fixture = TestFixture::new("dry-run-incomplete");
+    let config_path = fixture.setup_nextseq();
+
+    let output = cmd()
+        .args(["run", "--config-path"])
+        .arg(&config_path)
+        .args(["--platform", "next-seq", "--dry-run"])
+        .output()
+        .unwrap();
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    // Complete run should appear
+    assert!(stdout.contains("240101_NB001"));
+    // Incomplete run should not
+    assert!(!stdout.contains("240202_NB002"));
+}
