@@ -65,15 +65,15 @@ impl NextSeqConfig {
     /// Returns the destination directory for a given run. When
     /// `year_subdirectory` is enabled, appends a year derived from the first
     /// two characters of the directory name (e.g. "24" → "2024").
-    /// Returns `None` if `year_subdirectory` is enabled but the name is too
-    /// short to extract a year prefix.
+    /// Returns `None` if `year_subdirectory` is enabled but the dir_name
+    /// does not start with two decimal digits.
     pub fn destination_for(&self, dir_name: &str) -> Option<PathBuf> {
         if self.year_subdirectory {
-            if dir_name.chars().count() < 2 {
+            let bytes = dir_name.as_bytes();
+            if bytes.len() < 2 || bytes.iter().any(|c| !c.is_ascii_digit()) {
                 return None;
             }
-            let year = format!("20{}", &dir_name[..2]);
-            Some(self.landing_zone.join(year))
+            Some(self.landing_zone.join(format!("20{}", &dir_name[..2])))
         } else {
             Some(self.landing_zone.clone())
         }
