@@ -28,3 +28,4 @@ The program has several subcommands:
 
 ## Coding guidelines
 * Do not put yourself as co-author
+* Run `cargo clippy` after each round of changes and address lints, then run `cargo fmt`

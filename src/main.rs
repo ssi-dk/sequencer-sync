@@ -33,6 +33,9 @@ struct CommandArgs {
     config_path: PathBuf,
     #[arg(long)]
     platform: Platform,
+    /// Retry directories whose previous transfer failed.
+    #[arg(long, default_value_t = false)]
+    retry_failed: bool,
 }
 
 #[derive(Clone, Debug, ValueEnum)]
@@ -110,8 +113,12 @@ fn run_command(args: CommandArgs) -> Result<(), AppError> {
     let mut transfer_log = TransferLog::load(&config.flockdir).map_err(AppError::TransferLog)?;
 
     match &config.platform {
-        PlatformConfig::Nanopore(nano) => run_nanopore(&config, nano, &mut transfer_log),
-        PlatformConfig::NextSeq(ns) => run_nextseq(&config, ns, &mut transfer_log),
+        PlatformConfig::Nanopore(nano) => {
+            run_nanopore(&config, nano, &mut transfer_log, args.retry_failed)
+        }
+        PlatformConfig::NextSeq(ns) => {
+            run_nextseq(&config, ns, &mut transfer_log, args.retry_failed)
+        }
     }
 }
 
@@ -127,6 +134,7 @@ fn new_directories(
     source: &Path,
     field: &'static str,
     transfer_log: &TransferLog,
+    retry_failed: bool,
 ) -> Result<Vec<fs::DirEntry>, AppError> {
     let entries = fs::read_dir(source).map_err(|e| AppError::ReadDirectory {
         field,
@@ -153,7 +161,10 @@ fn new_directories(
 
         let key = transfer_log::relative_directory_key(source, &entry.path())
             .map_err(AppError::TransferLog)?;
-        if transfer_log.contains(&key) {
+        if transfer_log
+            .should_skip(&key, retry_failed)
+            .unwrap_or(false)
+        {
             continue;
         }
 
@@ -176,8 +187,9 @@ fn run_nanopore(
     _config: &Config,
     nano: &NanoporeConfig,
     transfer_log: &mut TransferLog,
+    retry_failed: bool,
 ) -> Result<(), AppError> {
-    for entry in new_directories(&nano.source, "nanopore.source", transfer_log)? {
+    for entry in new_directories(&nano.source, "nanopore.source", transfer_log, retry_failed)? {
         let dir_name = entry.file_name();
         let dir_name = dir_name.to_string_lossy();
 
@@ -190,12 +202,19 @@ fn run_nanopore(
             continue;
         }
 
-        rsync_directory(&entry.path(), &category.landing_zone, &category.exclude)?;
+        let succeeded =
+            match rsync_directory(&entry.path(), &category.landing_zone, &category.exclude) {
+                Ok(()) => true,
+                Err(error) => {
+                    eprintln!("{error}");
+                    false
+                }
+            };
 
         let key = transfer_log::relative_directory_key(&nano.source, &entry.path())
             .map_err(AppError::TransferLog)?;
         transfer_log
-            .record_transfer(&key)
+            .record_transfer(&key, succeeded)
             .map_err(AppError::TransferLog)?;
     }
 
@@ -229,8 +248,9 @@ fn run_nextseq(
     _config: &Config,
     ns: &NextSeqConfig,
     transfer_log: &mut TransferLog,
+    retry_failed: bool,
 ) -> Result<(), AppError> {
-    for entry in new_directories(&ns.source, "nextseq.source", transfer_log)? {
+    for entry in new_directories(&ns.source, "nextseq.source", transfer_log, retry_failed)? {
         let dir_name = entry.file_name();
         let dir_name = dir_name.to_string_lossy();
 
@@ -242,12 +262,18 @@ fn run_nextseq(
             continue;
         }
 
-        rsync_directory(&entry.path(), &ns.landing_zone, &ns.exclude)?;
+        let succeeded = match rsync_directory(&entry.path(), &ns.landing_zone, &ns.exclude) {
+            Ok(()) => true,
+            Err(error) => {
+                eprintln!("{error}");
+                false
+            }
+        };
 
         let key = transfer_log::relative_directory_key(&ns.source, &entry.path())
             .map_err(AppError::TransferLog)?;
         transfer_log
-            .record_transfer(&key)
+            .record_transfer(&key, succeeded)
             .map_err(AppError::TransferLog)?;
     }
 

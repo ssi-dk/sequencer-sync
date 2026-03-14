@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -12,7 +12,8 @@ const TRANSFER_LOG_FILE_NAME: &str = "transferred-directories.jsonl";
 #[derive(Debug)]
 pub struct TransferLog {
     path: PathBuf,
-    transferred_directories: HashSet<PathBuf>,
+    /// Maps directory key to whether the transfer succeeded.
+    transferred_directories: HashMap<PathBuf, bool>,
 }
 
 #[derive(Debug, Error)]
@@ -30,8 +31,6 @@ pub enum TransferLogError {
         #[source]
         source: serde_json::Error,
     },
-    #[error("duplicate transferred directory `{directory}` found in {}", path.display())]
-    DuplicateDirectory { path: PathBuf, directory: String },
     #[error("failed to append to transfer log {}: {source}", path.display())]
     Append {
         path: PathBuf,
@@ -61,6 +60,12 @@ pub enum TransferLogError {
 struct TransferRecord {
     directory: PathBuf,
     transferred_at: String, // UTC time, but in String format for serialization
+    #[serde(default = "default_succeeded")]
+    succeeded: bool,
+}
+
+fn default_succeeded() -> bool {
+    true
 }
 
 impl TransferLog {
@@ -71,14 +76,14 @@ impl TransferLog {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 return Ok(Self {
                     path,
-                    transferred_directories: HashSet::new(),
+                    transferred_directories: HashMap::new(),
                 });
             }
             Err(source) => return Err(TransferLogError::Read { path, source }),
         };
 
         let reader = BufReader::new(file);
-        let mut transferred_directories = HashSet::new();
+        let mut transferred_directories = HashMap::new();
 
         for (index, line_result) in reader.lines().enumerate() {
             let line = line_result.map_err(|source| TransferLogError::Read {
@@ -98,9 +103,8 @@ impl TransferLog {
                     source,
                 })?;
 
-            // We ignore duplicates when loaded, which may occur due to
-            // manual editing
-            transferred_directories.insert(record.directory.clone());
+            // Later entries override earlier ones (e.g. a retry after failure)
+            transferred_directories.insert(record.directory.clone(), record.succeeded);
         }
 
         Ok(Self {
@@ -109,22 +113,27 @@ impl TransferLog {
         })
     }
 
-    pub fn contains(&self, directory: &Path) -> bool {
-        self.transferred_directories.contains(directory)
+    /// Returns whether this directory should be skipped, or `None` if the
+    /// directory is not in the log at all.
+    /// A directory is skipped if it was previously transferred successfully,
+    /// or if it failed and `retry_failed` is false.
+    pub fn should_skip(&self, directory: &Path, retry_failed: bool) -> Option<bool> {
+        self.transferred_directories
+            .get(directory)
+            .map(|&succeeded| succeeded || !retry_failed)
     }
 
-    pub fn record_transfer(&mut self, directory: &Path) -> Result<(), TransferLogError> {
+    pub fn record_transfer(
+        &mut self,
+        directory: &Path,
+        succeeded: bool,
+    ) -> Result<(), TransferLogError> {
         let directory = directory.to_path_buf();
-        if self.transferred_directories.contains(&directory) {
-            return Err(TransferLogError::DuplicateDirectory {
-                path: self.path.clone(),
-                directory: directory.display().to_string(),
-            });
-        }
 
         let record = TransferRecord {
             directory: directory.to_owned(),
             transferred_at: Utc::now().to_rfc3339(),
+            succeeded,
         };
 
         let line =
@@ -154,7 +163,7 @@ impl TransferLog {
             source,
         })?;
 
-        self.transferred_directories.insert(directory);
+        self.transferred_directories.insert(directory, succeeded);
         Ok(())
     }
 
@@ -195,7 +204,7 @@ mod tests {
 
         let log = TransferLog::load(&tempdir).expect("missing log should load");
 
-        assert!(!log.contains(Path::new("run-001")));
+        assert_eq!(log.should_skip(Path::new("run-001"), false), None);
         assert_eq!(log.path(), transfer_log_path(&tempdir));
         cleanup_temp_dir(&tempdir);
     }
@@ -214,8 +223,8 @@ mod tests {
 
         let log = TransferLog::load(&tempdir).expect("log should parse");
 
-        assert!(log.contains(Path::new("run-001")));
-        assert!(log.contains(Path::new("run-002")));
+        assert_eq!(log.should_skip(Path::new("run-001"), false), Some(true));
+        assert_eq!(log.should_skip(Path::new("run-002"), false), Some(true));
         cleanup_temp_dir(&tempdir);
     }
 
@@ -258,13 +267,16 @@ mod tests {
         let tempdir = make_temp_dir();
         let mut log = TransferLog::load(&tempdir).expect("missing log should load");
 
-        log.record_transfer(Path::new("run-001"))
+        log.record_transfer(Path::new("run-001"), true)
             .expect("append should succeed");
 
-        assert!(log.contains(Path::new("run-001")));
+        assert_eq!(log.should_skip(Path::new("run-001"), false), Some(true));
 
         let reloaded = TransferLog::load(&tempdir).expect("reloaded log should parse");
-        assert!(reloaded.contains(Path::new("run-001")));
+        assert_eq!(
+            reloaded.should_skip(Path::new("run-001"), false),
+            Some(true)
+        );
 
         let contents =
             fs::read_to_string(transfer_log_path(&tempdir)).expect("should read transfer log");
