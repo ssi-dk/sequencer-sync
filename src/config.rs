@@ -1,6 +1,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use glob::Pattern;
 use regex::Regex;
 use serde::Deserialize;
 use thiserror::Error;
@@ -42,7 +43,7 @@ pub struct NanoporeCategory {
     /// Canonicalized absolute path.
     pub landing_zone: PathBuf,
     pub exclude: Vec<String>,
-    pub completion_file_glob: String,
+    pub completion_file_glob: Pattern,
 }
 
 #[derive(Debug)]
@@ -53,7 +54,7 @@ pub struct NextSeqConfig {
     /// Canonicalized absolute path.
     pub landing_zone: PathBuf,
     pub exclude: Vec<String>,
-    pub completion_file_glob: String,
+    pub completion_file_glob: Pattern,
     /// When true, place runs into a year-based subdirectory under the landing
     /// zone. The year is derived from the directory name by prepending "20" to
     /// its first two characters (e.g. "240101_NB123" → "2024/").
@@ -164,6 +165,12 @@ pub enum ConfigError {
         field: &'static str,
         #[source]
         source: regex::Error,
+    },
+    #[error("config field `{field}` is not a valid glob pattern: {source}")]
+    InvalidGlob {
+        field: &'static str,
+        #[source]
+        source: glob::PatternError,
     },
     #[error("failed to canonicalize `{field}` path {}: {source}", path.display())]
     CanonicalizePath {
@@ -289,11 +296,11 @@ impl UnvalidatedNanoporeConfig {
 
         validate_non_empty("nanopore.basecalled.prefix", &self.basecalled.prefix)?;
         validate_non_empty("nanopore.alldata.prefix", &self.alldata.prefix)?;
-        validate_non_empty(
+        let basecalled_glob = validate_glob(
             "nanopore.basecalled.completion_file_glob",
             &self.basecalled.completion_file_glob,
         )?;
-        validate_non_empty(
+        let alldata_glob = validate_glob(
             "nanopore.alldata.completion_file_glob",
             &self.alldata.completion_file_glob,
         )?;
@@ -321,13 +328,13 @@ impl UnvalidatedNanoporeConfig {
                 prefix: self.basecalled.prefix,
                 landing_zone: self.basecalled.landing_zone,
                 exclude: self.basecalled.exclude,
-                completion_file_glob: self.basecalled.completion_file_glob,
+                completion_file_glob: basecalled_glob,
             },
             NanoporeCategory {
                 prefix: self.alldata.prefix,
                 landing_zone: self.alldata.landing_zone,
                 exclude: self.alldata.exclude,
-                completion_file_glob: self.alldata.completion_file_glob,
+                completion_file_glob: alldata_glob,
             },
         ];
         categories.sort_by(|a, b| b.prefix.len().cmp(&a.prefix.len()));
@@ -344,7 +351,8 @@ impl UnvalidatedNextSeqConfig {
         validate_absolute_path("nextseq.source", &self.source)?;
         validate_absolute_path("nextseq.landing_zone", &self.landing_zone)?;
         validate_non_empty("nextseq.regex", &self.regex)?;
-        validate_non_empty("nextseq.completion_file_glob", &self.completion_file_glob)?;
+        let completion_file_glob =
+            validate_glob("nextseq.completion_file_glob", &self.completion_file_glob)?;
 
         let regex = Regex::new(&self.regex).map_err(|source| ConfigError::InvalidRegex {
             field: "nextseq.regex",
@@ -363,7 +371,7 @@ impl UnvalidatedNextSeqConfig {
             regex,
             landing_zone: self.landing_zone,
             exclude: self.exclude,
-            completion_file_glob: self.completion_file_glob,
+            completion_file_glob,
             year_subdirectory: self.year_subdirectory,
         })
     }
@@ -388,6 +396,10 @@ fn validate_non_empty(field: &'static str, value: &str) -> Result<(), ConfigErro
     }
 }
 
+fn validate_glob(field: &'static str, pattern: &str) -> Result<Pattern, ConfigError> {
+    Pattern::new(pattern).map_err(|source| ConfigError::InvalidGlob { field, source })
+}
+
 fn validate_all_paths_distinct(paths: &[(&'static str, &Path)]) -> Result<(), ConfigError> {
     for i in 0..paths.len() {
         for j in (i + 1)..paths.len() {
@@ -406,6 +418,8 @@ fn validate_all_paths_distinct(paths: &[(&'static str, &Path)]) -> Result<(), Co
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
+
+    use glob::Pattern;
 
     use super::{Config, ConfigError, NanoporeConfig, PlatformConfig};
 
@@ -656,13 +670,13 @@ completion_file_glob = "PrimaryAnalysisMetrics/PrimaryAnalysisMetrics.csv"
                     prefix: "ONT_WGS_".to_string(),
                     landing_zone: PathBuf::from("/landing/core"),
                     exclude: vec![],
-                    completion_file_glob: "report*.html".to_string(),
+                    completion_file_glob: Pattern::new("report*.html").unwrap(),
                 },
                 super::NanoporeCategory {
                     prefix: "ONT_".to_string(),
                     landing_zone: PathBuf::from("/landing/other"),
                     exclude: vec![],
-                    completion_file_glob: "report*.html".to_string(),
+                    completion_file_glob: Pattern::new("report*.html").unwrap(),
                 },
             ],
         };
@@ -687,13 +701,13 @@ completion_file_glob = "PrimaryAnalysisMetrics/PrimaryAnalysisMetrics.csv"
                     prefix: "ONT_WGS_".to_string(),
                     landing_zone: PathBuf::from("/landing/core"),
                     exclude: vec![],
-                    completion_file_glob: "report*.html".to_string(),
+                    completion_file_glob: Pattern::new("report*.html").unwrap(),
                 },
                 super::NanoporeCategory {
                     prefix: "ONT_".to_string(),
                     landing_zone: PathBuf::from("/landing/other"),
                     exclude: vec![],
-                    completion_file_glob: "report*.html".to_string(),
+                    completion_file_glob: Pattern::new("report*.html").unwrap(),
                 },
             ],
         };

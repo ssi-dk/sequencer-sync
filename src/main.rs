@@ -218,13 +218,12 @@ fn new_directories(
     Ok(result)
 }
 
-fn run_is_complete(run_dir: &Path, completion_file_glob: &str) -> bool {
-    let pattern = run_dir.join(completion_file_glob);
+fn run_is_complete(run_dir: &Path, completion_file_glob: &glob::Pattern) -> bool {
+    let pattern = run_dir.join(completion_file_glob.as_str());
     let pattern = pattern.to_string_lossy();
-    match glob::glob(&pattern) {
-        Ok(mut paths) => paths.next().is_some(),
-        Err(_) => false,
-    }
+    glob::glob(&pattern)
+        .map(|mut paths| paths.next().is_some())
+        .unwrap_or(false)
 }
 
 fn run_nanopore(
