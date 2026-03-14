@@ -255,28 +255,26 @@ fn run_nanopore(
         }
 
         let destination_display = category.landing_zone.display();
-        let succeeded =
-            match rsync_directory(&entry.path(), &category.landing_zone, &category.exclude) {
-                Ok(()) => {
-                    touch_transfer_marker(&category.landing_zone.join(entry.file_name()))?;
-                    let _ =
-                        run_log.log(&format!("Transferred {dir_name} -> {destination_display}"));
-                    true
-                }
-                Err(error) => {
-                    let _ = run_log.log(&format!(
-                        "FAILED transfer {dir_name} -> {destination_display}: {error}"
-                    ));
-                    eprintln!("{error}");
-                    false
-                }
-            };
+        let succeeded = rsync_directory(&entry.path(), &category.landing_zone, &category.exclude);
+        if let Err(ref error) = succeeded {
+            eprintln!("{error}");
+        }
+        let succeeded = succeeded.is_ok();
 
         let key = transfer_log::relative_directory_key(&nano.source, &entry.path())
             .map_err(AppError::TransferLog)?;
         transfer_log
             .record_transfer(&key, succeeded)
             .map_err(AppError::TransferLog)?;
+
+        if succeeded {
+            let _ = run_log.log(&format!("Transferred {dir_name} -> {destination_display}"));
+            let _ = touch_transfer_marker(&category.landing_zone.join(entry.file_name()));
+        } else {
+            let _ = run_log.log(&format!(
+                "FAILED transfer {dir_name} -> {destination_display}"
+            ));
+        }
     }
 
     Ok(())
@@ -360,26 +358,26 @@ fn run_nextseq(
         }
 
         let destination_display = destination.display();
-        let succeeded = match rsync_directory(&entry.path(), &destination, &ns.exclude) {
-            Ok(()) => {
-                touch_transfer_marker(&destination.join(entry.file_name()))?;
-                let _ = run_log.log(&format!("Transferred {dir_name} -> {destination_display}"));
-                true
-            }
-            Err(error) => {
-                let _ = run_log.log(&format!(
-                    "FAILED transfer {dir_name} -> {destination_display}: {error}"
-                ));
-                eprintln!("{error}");
-                false
-            }
-        };
+        let succeeded = rsync_directory(&entry.path(), &destination, &ns.exclude);
+        if let Err(ref error) = succeeded {
+            eprintln!("{error}");
+        }
+        let succeeded = succeeded.is_ok();
 
         let key = transfer_log::relative_directory_key(&ns.source, &entry.path())
             .map_err(AppError::TransferLog)?;
         transfer_log
             .record_transfer(&key, succeeded)
             .map_err(AppError::TransferLog)?;
+
+        if succeeded {
+            let _ = run_log.log(&format!("Transferred {dir_name} -> {destination_display}"));
+            let _ = touch_transfer_marker(&destination.join(entry.file_name()));
+        } else {
+            let _ = run_log.log(&format!(
+                "FAILED transfer {dir_name} -> {destination_display}"
+            ));
+        }
     }
 
     Ok(())
