@@ -163,6 +163,15 @@ fn new_directories(
     Ok(result)
 }
 
+fn run_is_complete(run_dir: &Path, completion_file_glob: &str) -> bool {
+    let pattern = run_dir.join(completion_file_glob);
+    let pattern = pattern.to_string_lossy();
+    match glob::glob(&pattern) {
+        Ok(mut paths) => paths.next().is_some(),
+        Err(_) => false,
+    }
+}
+
 fn run_nanopore(
     _config: &Config,
     nano: &NanoporeConfig,
@@ -176,6 +185,10 @@ fn run_nanopore(
             Some(cat) => cat,
             None => continue,
         };
+
+        if !run_is_complete(&entry.path(), &category.completion_file_glob) {
+            continue;
+        }
 
         rsync_directory(&entry.path(), &category.landing_zone, &category.exclude)?;
 
@@ -222,6 +235,10 @@ fn run_nextseq(
         let dir_name = dir_name.to_string_lossy();
 
         if !ns.regex.is_match(&dir_name) {
+            continue;
+        }
+
+        if !run_is_complete(&entry.path(), &ns.completion_file_glob) {
             continue;
         }
 

@@ -36,6 +36,7 @@ pub struct NanoporeCategory {
     pub prefix: String,
     pub landing_zone: PathBuf,
     pub exclude: Vec<String>,
+    pub completion_file_glob: String,
 }
 
 #[derive(Debug)]
@@ -44,6 +45,7 @@ pub struct NextSeqConfig {
     pub regex: Regex,
     pub landing_zone: PathBuf,
     pub exclude: Vec<String>,
+    pub completion_file_glob: String,
 }
 
 impl NanoporeConfig {
@@ -79,6 +81,7 @@ struct UnvalidatedNanoporeCategory {
     landing_zone: PathBuf,
     #[serde(default)]
     exclude: Vec<String>,
+    completion_file_glob: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -88,6 +91,7 @@ struct UnvalidatedNextSeqConfig {
     landing_zone: PathBuf,
     #[serde(default)]
     exclude: Vec<String>,
+    completion_file_glob: String,
 }
 
 #[derive(Debug, Error)]
@@ -185,6 +189,14 @@ impl UnvalidatedNanoporeConfig {
 
         validate_non_empty("nanopore.basecalled.prefix", &self.basecalled.prefix)?;
         validate_non_empty("nanopore.alldata.prefix", &self.alldata.prefix)?;
+        validate_non_empty(
+            "nanopore.basecalled.completion_file_glob",
+            &self.basecalled.completion_file_glob,
+        )?;
+        validate_non_empty(
+            "nanopore.alldata.completion_file_glob",
+            &self.alldata.completion_file_glob,
+        )?;
 
         if self.basecalled.prefix == self.alldata.prefix {
             return Err(ConfigError::DuplicatePrefix {
@@ -210,11 +222,13 @@ impl UnvalidatedNanoporeConfig {
                 prefix: self.basecalled.prefix,
                 landing_zone: self.basecalled.landing_zone,
                 exclude: self.basecalled.exclude,
+                completion_file_glob: self.basecalled.completion_file_glob,
             },
             NanoporeCategory {
                 prefix: self.alldata.prefix,
                 landing_zone: self.alldata.landing_zone,
                 exclude: self.alldata.exclude,
+                completion_file_glob: self.alldata.completion_file_glob,
             },
         ];
         categories.sort_by(|a, b| b.prefix.len().cmp(&a.prefix.len()));
@@ -231,6 +245,7 @@ impl UnvalidatedNextSeqConfig {
         validate_absolute_path("nextseq.source", &self.source)?;
         validate_absolute_path("nextseq.landing_zone", &self.landing_zone)?;
         validate_non_empty("nextseq.regex", &self.regex)?;
+        validate_non_empty("nextseq.completion_file_glob", &self.completion_file_glob)?;
 
         let regex = Regex::new(&self.regex).map_err(|source| ConfigError::InvalidRegex {
             field: "nextseq.regex",
@@ -249,6 +264,7 @@ impl UnvalidatedNextSeqConfig {
             regex,
             landing_zone: self.landing_zone,
             exclude: self.exclude,
+            completion_file_glob: self.completion_file_glob,
         })
     }
 }
@@ -368,15 +384,18 @@ source = "/data/nanopore"
 [nanopore.basecalled]
 prefix = "ONT_WGS_"
 landing_zone = "/var/lib/sequencer/landing-zone-core"
+completion_file_glob = "report*.html"
 
 [nanopore.alldata]
 prefix = "ONT_"
 landing_zone = "/var/lib/sequencer/landing-zone-other"
+completion_file_glob = "report*.html"
 
 [nextseq]
 source = "/data/nextseq"
 regex = "^\\d{6}_"
 landing_zone = "/var/lib/sequencer/landing-zone"
+completion_file_glob = "PrimaryAnalysisMetrics/PrimaryAnalysisMetrics.csv"
 "#,
         )
         .expect_err("config with both platforms should fail");
@@ -399,10 +418,12 @@ source = "/data/nanopore"
 [nanopore.basecalled]
 prefix = "ONT_"
 landing_zone = "/var/lib/sequencer/landing-zone-core"
+completion_file_glob = "report*.html"
 
 [nanopore.alldata]
 prefix = "ONT_"
 landing_zone = "/var/lib/sequencer/landing-zone-other"
+completion_file_glob = "report*.html"
 "#,
         )
         .expect_err("duplicate prefixes should fail");
@@ -425,10 +446,12 @@ source = "/data/nanopore"
 [nanopore.basecalled]
 prefix = "ONT_WGS_"
 landing_zone = "/var/lib/sequencer/landing-zone"
+completion_file_glob = "report*.html"
 
 [nanopore.alldata]
 prefix = "ONT_"
 landing_zone = "/var/lib/sequencer/landing-zone"
+completion_file_glob = "report*.html"
 "#,
         )
         .expect_err("duplicate landing zones should fail");
@@ -456,6 +479,7 @@ server_host = "sequencer.example.org"
 source = "relative/data"
 regex = "^\\d{6}_"
 landing_zone = "/var/lib/sequencer/landing-zone"
+completion_file_glob = "PrimaryAnalysisMetrics/PrimaryAnalysisMetrics.csv"
 "#,
         )
         .expect_err("relative source path should fail validation");
@@ -482,6 +506,7 @@ server_host = "sequencer.example.org"
 source = "/data/nextseq"
 regex = "^\\d{6}_"
 landing_zone = "/var/lib/sequencer/landing-zone"
+completion_file_glob = "PrimaryAnalysisMetrics/PrimaryAnalysisMetrics.csv"
 "#,
         )
         .expect_err("empty server_user should fail validation");
@@ -507,6 +532,7 @@ server_host = "sequencer.example.org"
 source = "/data/nextseq"
 regex = "^\\d{6}_"
 landing_zone = "/var/lib/sequencer/flock"
+completion_file_glob = "PrimaryAnalysisMetrics/PrimaryAnalysisMetrics.csv"
 "#,
         )
         .expect_err("duplicate local paths should fail validation");
@@ -530,11 +556,13 @@ landing_zone = "/var/lib/sequencer/flock"
                     prefix: "ONT_WGS_".to_string(),
                     landing_zone: PathBuf::from("/landing/core"),
                     exclude: vec![],
+                    completion_file_glob: "report*.html".to_string(),
                 },
                 super::NanoporeCategory {
                     prefix: "ONT_".to_string(),
                     landing_zone: PathBuf::from("/landing/other"),
                     exclude: vec![],
+                    completion_file_glob: "report*.html".to_string(),
                 },
             ],
         };
@@ -559,11 +587,13 @@ landing_zone = "/var/lib/sequencer/flock"
                     prefix: "ONT_WGS_".to_string(),
                     landing_zone: PathBuf::from("/landing/core"),
                     exclude: vec![],
+                    completion_file_glob: "report*.html".to_string(),
                 },
                 super::NanoporeCategory {
                     prefix: "ONT_".to_string(),
                     landing_zone: PathBuf::from("/landing/other"),
                     exclude: vec![],
+                    completion_file_glob: "report*.html".to_string(),
                 },
             ],
         };
@@ -586,10 +616,12 @@ source = "/data/nanopore"
 [nanopore.basecalled]
 prefix = ""
 landing_zone = "/var/lib/sequencer/landing-zone-core"
+completion_file_glob = "report*.html"
 
 [nanopore.alldata]
 prefix = "ONT_"
 landing_zone = "/var/lib/sequencer/landing-zone-other"
+completion_file_glob = "report*.html"
 "#,
         )
         .expect_err("empty prefix should fail");

@@ -10,8 +10,10 @@ source = "/data/nanopore"
 prefix = "ONT_WGS_"
 landing_zone = "/var/lib/sequencer/landing-zone-core"
 exclude = ["*_skip", "pod5*"]
+completion_file_glob = "report*.html"
 
 [nanopore.alldata]
 prefix = "ONT_"
 landing_zone = "/var/lib/sequencer/landing-zone-other"
 exclude = ["*_skip", "pod5*"]
+completion_file_glob = "report*.html"
