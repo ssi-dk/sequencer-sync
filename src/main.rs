@@ -259,6 +259,7 @@ fn run_nanopore(
         let succeeded =
             match rsync_directory(&entry.path(), &category.landing_zone, &category.exclude) {
                 Ok(()) => {
+                    touch_transfer_marker(&category.landing_zone.join(entry.file_name()))?;
                     let _ =
                         run_log.log(&format!("Transferred {dir_name} -> {destination_display}"));
                     true
@@ -279,6 +280,17 @@ fn run_nanopore(
             .map_err(AppError::TransferLog)?;
     }
 
+    Ok(())
+}
+
+const TRANSFER_MARKER_FILE_NAME: &str = "transfer_successful.txt";
+
+fn touch_transfer_marker(transferred_dir: &Path) -> Result<(), AppError> {
+    let marker = transferred_dir.join(TRANSFER_MARKER_FILE_NAME);
+    File::create(&marker).map_err(|source| AppError::WriteTransferMarker {
+        path: marker,
+        source,
+    })?;
     Ok(())
 }
 
@@ -351,6 +363,7 @@ fn run_nextseq(
         let destination_display = destination.display();
         let succeeded = match rsync_directory(&entry.path(), &destination, &ns.exclude) {
             Ok(()) => {
+                touch_transfer_marker(&destination.join(entry.file_name()))?;
                 let _ = run_log.log(&format!("Transferred {dir_name} -> {destination_display}"));
                 true
             }
@@ -666,6 +679,12 @@ enum AppError {
         source_path: PathBuf,
         destination: PathBuf,
         exit_code: Option<i32>,
+    },
+    #[error("failed to write transfer marker {}: {source}", path.display())]
+    WriteTransferMarker {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
     },
 }
 

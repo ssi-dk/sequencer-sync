@@ -288,6 +288,18 @@ fn nanopore_transfers_complete_runs() {
     let run_log = read_run_log(&fixture);
     let transferred_count = run_log.matches("Transferred").count();
     assert_eq!(transferred_count, 2);
+
+    // Transfer marker files should exist in the transferred directories
+    assert!(
+        fixture
+            .path("nanopore-landing-core/ONT_WGS_run1/transfer_successful.txt")
+            .exists()
+    );
+    assert!(
+        fixture
+            .path("nanopore-landing-other/ONT_raw_run2/transfer_successful.txt")
+            .exists()
+    );
 }
 
 #[test]
@@ -311,6 +323,13 @@ fn nextseq_skips_incomplete_runs() {
 
     // Incomplete run NOT transferred
     assert!(!fixture.path("nextseq-landing/240202_NB002").exists());
+
+    // Transfer marker present for complete run
+    assert!(
+        fixture
+            .path("nextseq-landing/240101_NB001/transfer_successful.txt")
+            .exists()
+    );
 
     // Transfer log has 1 entry
     assert_eq!(transfer_log_line_count(&fixture), 1);
@@ -468,16 +487,8 @@ fn dry_run_prints_plan_without_copying() {
     assert!(stdout.contains("nanopore-landing-other"));
 
     // Nothing should actually be copied
-    assert!(
-        !fixture
-            .path("nanopore-landing-core/ONT_WGS_run1")
-            .exists()
-    );
-    assert!(
-        !fixture
-            .path("nanopore-landing-other/ONT_raw_run2")
-            .exists()
-    );
+    assert!(!fixture.path("nanopore-landing-core/ONT_WGS_run1").exists());
+    assert!(!fixture.path("nanopore-landing-other/ONT_raw_run2").exists());
 
     // Transfer log should be empty (no transfers recorded)
     assert_eq!(transfer_log_line_count(&fixture), 0);
