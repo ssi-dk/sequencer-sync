@@ -13,6 +13,8 @@ pub struct RunLog {
     /// program run, not per directory — the first call to `log()` truncates,
     /// subsequent calls append.
     latest_started: bool,
+    /// Set to true if any call to `log()` failed during this run.
+    had_error: bool,
 }
 
 impl RunLog {
@@ -21,10 +23,25 @@ impl RunLog {
             full_log_path: flockdir.join("sequencer-sync.log"),
             latest_log_path: flockdir.join("sequencer-sync-latest.log"),
             latest_started: false,
+            had_error: false,
         }
     }
 
-    pub fn log(&mut self, message: &str) -> std::io::Result<()> {
+    /// Returns true if any previous call to `log_or_warn` failed.
+    pub fn had_error(&self) -> bool {
+        self.had_error
+    }
+
+    /// Log a message. If writing fails, print a warning to stderr and
+    /// mark this RunLog as having encountered an error.
+    pub fn log(&mut self, message: &str) {
+        if let Err(error) = self.try_write(message) {
+            eprintln!("Warning: failed to write to run log: {error}");
+            self.had_error = true;
+        }
+    }
+
+    fn try_write(&mut self, message: &str) -> std::io::Result<()> {
         let timestamp = Local::now().format("%Y-%m-%d %H:%M:%S");
         let line = format!("{timestamp}: {message}\n");
 
@@ -80,7 +97,7 @@ mod tests {
         let tempdir = make_temp_dir();
         let mut log = RunLog::new(&tempdir);
 
-        log.log("test message").expect("should write log");
+        log.log("test message");
 
         let full = fs::read_to_string(tempdir.join("sequencer-sync.log")).unwrap();
         assert!(full.contains("test message"));
@@ -96,13 +113,13 @@ mod tests {
         // First run
         {
             let mut log = RunLog::new(&tempdir);
-            log.log("first run message").unwrap();
+            log.log("first run message");
         }
 
         // Second run
         {
             let mut log = RunLog::new(&tempdir);
-            log.log("second run message").unwrap();
+            log.log("second run message");
         }
 
         let full = fs::read_to_string(tempdir.join("sequencer-sync.log")).unwrap();
@@ -123,8 +140,8 @@ mod tests {
         let tempdir = make_temp_dir();
         let mut log = RunLog::new(&tempdir);
 
-        log.log("message one").unwrap();
-        log.log("message two").unwrap();
+        log.log("message one");
+        log.log("message two");
 
         let latest = fs::read_to_string(tempdir.join("sequencer-sync-latest.log")).unwrap();
         assert!(latest.contains("message one"));

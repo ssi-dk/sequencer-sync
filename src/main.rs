@@ -132,7 +132,13 @@ fn run_command(args: RunArgs) -> Result<(), AppError> {
             args.ignore_incomplete,
             args.dry_run,
         ),
+    }?;
+
+    if run_log.had_error() {
+        return Err(AppError::RunLogWriteFailed);
     }
+
+    Ok(())
 }
 
 fn validate_environment(config: &Config, skip_ssh_check: bool) -> Result<(), AppError> {
@@ -251,7 +257,7 @@ fn run_nanopore(
         }
 
         if matches!(reason, TransferReason::Retry) {
-            let _ = run_log.log(&format!("Retrying previously failed transfer: {dir_name}"));
+            run_log.log(&format!("Retrying previously failed transfer: {dir_name}"));
         }
 
         let destination_display = category.landing_zone.display();
@@ -268,10 +274,10 @@ fn run_nanopore(
             .map_err(AppError::TransferLog)?;
 
         if succeeded {
-            let _ = run_log.log(&format!("Transferred {dir_name} -> {destination_display}"));
+            run_log.log(&format!("Transferred {dir_name} -> {destination_display}"));
             let _ = touch_transfer_marker(&category.landing_zone.join(entry.file_name()));
         } else {
-            let _ = run_log.log(&format!(
+            run_log.log(&format!(
                 "FAILED transfer {dir_name} -> {destination_display}"
             ));
         }
@@ -354,7 +360,7 @@ fn run_nextseq(
         }
 
         if matches!(reason, TransferReason::Retry) {
-            let _ = run_log.log(&format!("Retrying previously failed transfer: {dir_name}"));
+            run_log.log(&format!("Retrying previously failed transfer: {dir_name}"));
         }
 
         let destination_display = destination.display();
@@ -371,10 +377,10 @@ fn run_nextseq(
             .map_err(AppError::TransferLog)?;
 
         if succeeded {
-            let _ = run_log.log(&format!("Transferred {dir_name} -> {destination_display}"));
+            run_log.log(&format!("Transferred {dir_name} -> {destination_display}"));
             let _ = touch_transfer_marker(&destination.join(entry.file_name()));
         } else {
-            let _ = run_log.log(&format!(
+            run_log.log(&format!(
                 "FAILED transfer {dir_name} -> {destination_display}"
             ));
         }
@@ -683,6 +689,8 @@ enum AppError {
         #[source]
         source: std::io::Error,
     },
+    #[error("one or more run log writes failed (see warnings above)")]
+    RunLogWriteFailed,
 }
 
 #[cfg(test)]
