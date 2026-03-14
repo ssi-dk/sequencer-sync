@@ -46,6 +46,30 @@ pub struct NextSeqConfig {
     pub landing_zone: PathBuf,
     pub exclude: Vec<String>,
     pub completion_file_glob: String,
+    /// When true, place runs into a year-based subdirectory under the landing
+    /// zone. The year is derived from the directory name by prepending "20" to
+    /// its first two characters (e.g. "240101_NB123" → "2024/").
+    /// This matches the legacy bash script behavior.
+    pub year_subdirectory: bool,
+}
+
+impl NextSeqConfig {
+    /// Returns the destination directory for a given run. When
+    /// `year_subdirectory` is enabled, appends a year derived from the first
+    /// two characters of the directory name (e.g. "24" → "2024").
+    /// Returns `None` if `year_subdirectory` is enabled but the name is too
+    /// short to extract a year prefix.
+    pub fn destination_for(&self, dir_name: &str) -> Option<PathBuf> {
+        if self.year_subdirectory {
+            if dir_name.len() < 2 {
+                return None;
+            }
+            let year = format!("20{}", &dir_name[..2]);
+            Some(self.landing_zone.join(year))
+        } else {
+            Some(self.landing_zone.clone())
+        }
+    }
 }
 
 impl NanoporeConfig {
@@ -92,6 +116,8 @@ struct UnvalidatedNextSeqConfig {
     #[serde(default)]
     exclude: Vec<String>,
     completion_file_glob: String,
+    #[serde(default)]
+    year_subdirectory: bool,
 }
 
 #[derive(Debug, Error)]
@@ -265,6 +291,7 @@ impl UnvalidatedNextSeqConfig {
             landing_zone: self.landing_zone,
             exclude: self.exclude,
             completion_file_glob: self.completion_file_glob,
+            year_subdirectory: self.year_subdirectory,
         })
     }
 }

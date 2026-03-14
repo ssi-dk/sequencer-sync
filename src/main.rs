@@ -233,17 +233,17 @@ fn run_nanopore(
             let _ = run_log.log(&format!("Retrying previously failed transfer: {dir_name}"));
         }
 
-        let landing_zone_display = category.landing_zone.display();
+        let destination_display = category.landing_zone.display();
         let succeeded =
             match rsync_directory(&entry.path(), &category.landing_zone, &category.exclude) {
                 Ok(()) => {
                     let _ =
-                        run_log.log(&format!("Transferred {dir_name} -> {landing_zone_display}"));
+                        run_log.log(&format!("Transferred {dir_name} -> {destination_display}"));
                     true
                 }
                 Err(error) => {
                     let _ = run_log.log(&format!(
-                        "FAILED transfer {dir_name} -> {landing_zone_display}: {error}"
+                        "FAILED transfer {dir_name} -> {destination_display}: {error}"
                     ));
                     eprintln!("{error}");
                     false
@@ -308,15 +308,18 @@ fn run_nextseq(
             let _ = run_log.log(&format!("Retrying previously failed transfer: {dir_name}"));
         }
 
-        let landing_zone_display = ns.landing_zone.display();
-        let succeeded = match rsync_directory(&entry.path(), &ns.landing_zone, &ns.exclude) {
+        let Some(destination) = ns.destination_for(&dir_name) else {
+            continue;
+        };
+        let destination_display = destination.display();
+        let succeeded = match rsync_directory(&entry.path(), &destination, &ns.exclude) {
             Ok(()) => {
-                let _ = run_log.log(&format!("Transferred {dir_name} -> {landing_zone_display}"));
+                let _ = run_log.log(&format!("Transferred {dir_name} -> {destination_display}"));
                 true
             }
             Err(error) => {
                 let _ = run_log.log(&format!(
-                    "FAILED transfer {dir_name} -> {landing_zone_display}: {error}"
+                    "FAILED transfer {dir_name} -> {destination_display}: {error}"
                 ));
                 eprintln!("{error}");
                 false
