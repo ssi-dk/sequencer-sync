@@ -310,7 +310,7 @@ fn nextseq_skips_incomplete_runs() {
     cmd()
         .args(["run", "--config-path"])
         .arg(&config_path)
-        .args(["--platform", "next-seq"])
+        .args(["--platform", "nextseq"])
         .assert()
         .success();
 
@@ -343,7 +343,7 @@ fn nextseq_ignore_incomplete_transfers_all() {
     cmd()
         .args(["run", "--config-path"])
         .arg(&config_path)
-        .args(["--platform", "next-seq", "--ignore-incomplete"])
+        .args(["--platform", "nextseq", "--ignore-incomplete"])
         .assert()
         .success();
 
@@ -413,7 +413,7 @@ fn retry_failed() {
     cmd()
         .args(["run", "--config-path"])
         .arg(&config_path)
-        .args(["--platform", "next-seq"])
+        .args(["--platform", "nextseq"])
         .assert()
         .success();
 
@@ -429,7 +429,7 @@ fn retry_failed() {
     cmd()
         .args(["run", "--config-path"])
         .arg(&config_path)
-        .args(["--platform", "next-seq", "--retry-failed"])
+        .args(["--platform", "nextseq", "--retry-failed"])
         .assert()
         .success();
 
@@ -555,7 +555,7 @@ fn dry_run_respects_completion_check() {
     let output = cmd()
         .args(["run", "--config-path"])
         .arg(&config_path)
-        .args(["--platform", "next-seq", "--dry-run"])
+        .args(["--platform", "nextseq", "--dry-run"])
         .output()
         .unwrap();
 

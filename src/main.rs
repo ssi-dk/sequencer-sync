@@ -17,6 +17,7 @@ mod transfer_log;
 
 #[derive(Debug, Parser)]
 #[command(name = "sequencer-sync")]
+#[command(about = "Copy files from sequencing run directory to a target directory")]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -24,12 +25,26 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Commands {
-    Setup(CommandArgs),
-    Run(CommandArgs),
+    /// Validate config file, check directories have correct permissions, and print cron tab
+    Setup(SetupArgs),
+
+    /// Syncronize files to the landing zone
+    Run(RunArgs),
 }
 
 #[derive(Args, Debug)]
-struct CommandArgs {
+struct SetupArgs {
+    #[arg(long)]
+    config_path: PathBuf,
+    #[arg(long)]
+    platform: Platform,
+    /// Skip the SSH access check (useful before SSH keys are deployed).
+    #[arg(long, default_value_t = false)]
+    skip_ssh_check: bool,
+}
+
+#[derive(Args, Debug)]
+struct RunArgs {
     #[arg(long)]
     config_path: PathBuf,
     #[arg(long)]
@@ -40,9 +55,6 @@ struct CommandArgs {
     /// Transfer directories even if the completion file is not present.
     #[arg(long, default_value_t = false)]
     ignore_incomplete: bool,
-    /// Skip the SSH access check during setup (useful before SSH keys are deployed).
-    #[arg(long, default_value_t = false)]
-    skip_ssh_check: bool,
     /// Print what would be copied instead of actually copying.
     #[arg(long, default_value_t = false)]
     dry_run: bool,
@@ -51,6 +63,7 @@ struct CommandArgs {
 #[derive(Clone, Debug, ValueEnum)]
 enum Platform {
     Nanopore,
+    #[value(name = "nextseq")]
     NextSeq,
 }
 
@@ -72,7 +85,7 @@ fn try_main() -> Result<(), AppError> {
     }
 }
 
-fn setup(args: CommandArgs) -> Result<(), AppError> {
+fn setup(args: SetupArgs) -> Result<(), AppError> {
     let config_path = canonicalize_config_path(&args.config_path)?;
     let config = load_config(&args.config_path, &args.platform)?;
 
@@ -87,7 +100,7 @@ fn setup(args: CommandArgs) -> Result<(), AppError> {
     Ok(())
 }
 
-fn run_command(args: CommandArgs) -> Result<(), AppError> {
+fn run_command(args: RunArgs) -> Result<(), AppError> {
     let config = load_config(&args.config_path, &args.platform)?;
 
     let _lock = match acquire_run_lock(&config.flockdir)? {
