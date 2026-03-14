@@ -177,7 +177,7 @@ fn run_nanopore(
             None => continue,
         };
 
-        rsync_directory(&entry.path(), &category.landing_zone)?;
+        rsync_directory(&entry.path(), &category.landing_zone, &category.exclude)?;
 
         let key = transfer_log::relative_directory_key(&nano.source, &entry.path())
             .map_err(AppError::TransferLog)?;
@@ -189,9 +189,13 @@ fn run_nanopore(
     Ok(())
 }
 
-fn rsync_directory(source: &Path, destination: &Path) -> Result<(), AppError> {
-    let status = Command::new("rsync")
-        .arg("-a")
+fn rsync_directory(source: &Path, destination: &Path, exclude: &[String]) -> Result<(), AppError> {
+    let mut cmd = Command::new("rsync");
+    cmd.arg("-a");
+    for pattern in exclude {
+        cmd.arg("--exclude").arg(pattern);
+    }
+    let status = cmd
         .arg(source)
         .arg(destination)
         .status()
@@ -221,7 +225,7 @@ fn run_nextseq(
             continue;
         }
 
-        rsync_directory(&entry.path(), &ns.landing_zone)?;
+        rsync_directory(&entry.path(), &ns.landing_zone, &ns.exclude)?;
 
         let key = transfer_log::relative_directory_key(&ns.source, &entry.path())
             .map_err(AppError::TransferLog)?;

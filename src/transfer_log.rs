@@ -158,6 +158,7 @@ impl TransferLog {
         Ok(())
     }
 
+    #[allow(unused)]
     pub fn path(&self) -> &Path {
         &self.path
     }

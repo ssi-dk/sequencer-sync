@@ -35,6 +35,7 @@ pub struct NanoporeConfig {
 pub struct NanoporeCategory {
     pub prefix: String,
     pub landing_zone: PathBuf,
+    pub exclude: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -42,6 +43,7 @@ pub struct NextSeqConfig {
     pub source: PathBuf,
     pub regex: Regex,
     pub landing_zone: PathBuf,
+    pub exclude: Vec<String>,
 }
 
 impl NanoporeConfig {
@@ -75,6 +77,8 @@ struct UnvalidatedNanoporeConfig {
 struct UnvalidatedNanoporeCategory {
     prefix: String,
     landing_zone: PathBuf,
+    #[serde(default)]
+    exclude: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -82,6 +86,8 @@ struct UnvalidatedNextSeqConfig {
     source: PathBuf,
     regex: String,
     landing_zone: PathBuf,
+    #[serde(default)]
+    exclude: Vec<String>,
 }
 
 #[derive(Debug, Error)]
@@ -203,10 +209,12 @@ impl UnvalidatedNanoporeConfig {
             NanoporeCategory {
                 prefix: self.basecalled.prefix,
                 landing_zone: self.basecalled.landing_zone,
+                exclude: self.basecalled.exclude,
             },
             NanoporeCategory {
                 prefix: self.alldata.prefix,
                 landing_zone: self.alldata.landing_zone,
+                exclude: self.alldata.exclude,
             },
         ];
         categories.sort_by(|a, b| b.prefix.len().cmp(&a.prefix.len()));
@@ -240,6 +248,7 @@ impl UnvalidatedNextSeqConfig {
             source: self.source,
             regex,
             landing_zone: self.landing_zone,
+            exclude: self.exclude,
         })
     }
 }
@@ -520,10 +529,12 @@ landing_zone = "/var/lib/sequencer/flock"
                 super::NanoporeCategory {
                     prefix: "ONT_WGS_".to_string(),
                     landing_zone: PathBuf::from("/landing/core"),
+                    exclude: vec![],
                 },
                 super::NanoporeCategory {
                     prefix: "ONT_".to_string(),
                     landing_zone: PathBuf::from("/landing/other"),
+                    exclude: vec![],
                 },
             ],
         };
@@ -547,10 +558,12 @@ landing_zone = "/var/lib/sequencer/flock"
                 super::NanoporeCategory {
                     prefix: "ONT_WGS_".to_string(),
                     landing_zone: PathBuf::from("/landing/core"),
+                    exclude: vec![],
                 },
                 super::NanoporeCategory {
                     prefix: "ONT_".to_string(),
                     landing_zone: PathBuf::from("/landing/other"),
+                    exclude: vec![],
                 },
             ],
         };
