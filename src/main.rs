@@ -25,7 +25,6 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum Commands {
     Setup(CommandArgs),
-    Test(CommandArgs),
     Run(CommandArgs),
 }
 
@@ -69,7 +68,6 @@ fn try_main() -> Result<(), AppError> {
 
     match cli.command {
         Commands::Setup(args) => setup(args),
-        Commands::Test(args) => test(args),
         Commands::Run(args) => run_command(args),
     }
 }
@@ -87,11 +85,6 @@ fn setup(args: CommandArgs) -> Result<(), AppError> {
     );
 
     Ok(())
-}
-
-fn test(args: CommandArgs) -> Result<(), AppError> {
-    let config = load_config(&args.config_path, &args.platform)?;
-    validate_environment(&config, args.skip_ssh_check)
 }
 
 fn run_command(args: CommandArgs) -> Result<(), AppError> {

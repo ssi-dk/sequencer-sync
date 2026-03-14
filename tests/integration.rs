@@ -568,21 +568,8 @@ fn dry_run_respects_completion_check() {
 }
 
 #[test]
-fn test_command_succeeds() {
-    let fixture = TestFixture::new("test-ok");
-    let config_path = fixture.setup_nanopore();
-
-    cmd()
-        .args(["test", "--config-path"])
-        .arg(&config_path)
-        .args(["--platform", "nanopore", "--skip-ssh-check"])
-        .assert()
-        .success();
-}
-
-#[test]
-fn test_command_fails_missing_source() {
-    let fixture = TestFixture::new("test-no-source");
+fn setup_fails_missing_source() {
+    let fixture = TestFixture::new("setup-no-source");
     fixture.mkdir("flockdir");
     // Do NOT create nanopore-source
     fixture.mkdir("nanopore-landing-core");
@@ -590,7 +577,7 @@ fn test_command_fails_missing_source() {
     let config_path = fixture.write_nanopore_config();
 
     cmd()
-        .args(["test", "--config-path"])
+        .args(["setup", "--config-path"])
         .arg(&config_path)
         .args(["--platform", "nanopore", "--skip-ssh-check"])
         .assert()
@@ -598,8 +585,8 @@ fn test_command_fails_missing_source() {
 }
 
 #[test]
-fn test_command_fails_missing_landing_zone() {
-    let fixture = TestFixture::new("test-no-landing");
+fn setup_fails_missing_landing_zone() {
+    let fixture = TestFixture::new("setup-no-landing");
     fixture.mkdir("flockdir");
     fixture.mkdir("nanopore-source");
     fixture.mkdir("nanopore-landing-core");
@@ -607,7 +594,7 @@ fn test_command_fails_missing_landing_zone() {
     let config_path = fixture.write_nanopore_config();
 
     cmd()
-        .args(["test", "--config-path"])
+        .args(["setup", "--config-path"])
         .arg(&config_path)
         .args(["--platform", "nanopore", "--skip-ssh-check"])
         .assert()
