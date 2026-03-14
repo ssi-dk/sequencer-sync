@@ -38,6 +38,9 @@ struct CommandArgs {
     /// Retry directories whose previous transfer failed.
     #[arg(long, default_value_t = false)]
     retry_failed: bool,
+    /// Transfer directories even if the completion file is not present.
+    #[arg(long, default_value_t = false)]
+    ignore_incomplete: bool,
 }
 
 #[derive(Clone, Debug, ValueEnum)]
@@ -122,6 +125,7 @@ fn run_command(args: CommandArgs) -> Result<(), AppError> {
             &mut transfer_log,
             &mut run_log,
             args.retry_failed,
+            args.ignore_incomplete,
         ),
         PlatformConfig::NextSeq(ns) => run_nextseq(
             &config,
@@ -129,6 +133,7 @@ fn run_command(args: CommandArgs) -> Result<(), AppError> {
             &mut transfer_log,
             &mut run_log,
             args.retry_failed,
+            args.ignore_incomplete,
         ),
     }
 }
@@ -213,6 +218,7 @@ fn run_nanopore(
     transfer_log: &mut TransferLog,
     run_log: &mut RunLog,
     retry_failed: bool,
+    ignore_incomplete: bool,
 ) -> Result<(), AppError> {
     for (entry, reason) in
         new_directories(&nano.source, "nanopore.source", transfer_log, retry_failed)?
@@ -225,7 +231,7 @@ fn run_nanopore(
             None => continue,
         };
 
-        if !run_is_complete(&entry.path(), &category.completion_file_glob) {
+        if !ignore_incomplete && !run_is_complete(&entry.path(), &category.completion_file_glob) {
             continue;
         }
 
@@ -289,6 +295,7 @@ fn run_nextseq(
     transfer_log: &mut TransferLog,
     run_log: &mut RunLog,
     retry_failed: bool,
+    ignore_incomplete: bool,
 ) -> Result<(), AppError> {
     for (entry, reason) in
         new_directories(&ns.source, "nextseq.source", transfer_log, retry_failed)?
@@ -300,7 +307,7 @@ fn run_nextseq(
             continue;
         }
 
-        if !run_is_complete(&entry.path(), &ns.completion_file_glob) {
+        if !ignore_incomplete && !run_is_complete(&entry.path(), &ns.completion_file_glob) {
             continue;
         }
 

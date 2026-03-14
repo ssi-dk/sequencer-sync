@@ -24,6 +24,10 @@ pub enum PlatformConfig {
     NextSeq(NextSeqConfig),
 }
 
+// For Nanopore, for some sequencing runs, we want to copy all files,
+// and for some, we want to skip the raw data files.
+// We distinguish these by directory prefix, and copy different file
+// subsets to different landing zones.
 #[derive(Debug, PartialEq, Eq)]
 pub struct NanoporeConfig {
     pub source: PathBuf,
