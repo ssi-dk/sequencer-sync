@@ -7,7 +7,7 @@ use thiserror::Error;
 
 #[derive(Debug)]
 pub struct Config {
-    // Directory with log files and file lock
+    /// Canonicalized absolute path. Directory with log files and file lock.
     pub flockdir: PathBuf,
 
     // You must have ssh access to this server with this port, user name.
@@ -30,6 +30,7 @@ pub enum PlatformConfig {
 // subsets to different landing zones.
 #[derive(Debug, PartialEq, Eq)]
 pub struct NanoporeConfig {
+    /// Canonicalized absolute path.
     pub source: PathBuf,
     /// Sorted longest-prefix-first for correct matching.
     pub categories: [NanoporeCategory; 2],
@@ -38,6 +39,7 @@ pub struct NanoporeConfig {
 #[derive(Debug, PartialEq, Eq)]
 pub struct NanoporeCategory {
     pub prefix: String,
+    /// Canonicalized absolute path.
     pub landing_zone: PathBuf,
     pub exclude: Vec<String>,
     pub completion_file_glob: String,
@@ -45,8 +47,10 @@ pub struct NanoporeCategory {
 
 #[derive(Debug)]
 pub struct NextSeqConfig {
+    /// Canonicalized absolute path.
     pub source: PathBuf,
     pub regex: Regex,
+    /// Canonicalized absolute path.
     pub landing_zone: PathBuf,
     pub exclude: Vec<String>,
     pub completion_file_glob: String,
@@ -65,7 +69,7 @@ impl NextSeqConfig {
     /// short to extract a year prefix.
     pub fn destination_for(&self, dir_name: &str) -> Option<PathBuf> {
         if self.year_subdirectory {
-            if dir_name.len() < 2 {
+            if dir_name.chars().count() < 2 {
                 return None;
             }
             let year = format!("20{}", &dir_name[..2]);
@@ -161,6 +165,13 @@ pub enum ConfigError {
         #[source]
         source: regex::Error,
     },
+    #[error("failed to canonicalize `{field}` path {}: {source}", path.display())]
+    CanonicalizePath {
+        field: &'static str,
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
 }
 
 impl Config {
@@ -170,13 +181,72 @@ impl Config {
             source,
         })?;
 
-        Self::from_toml_str(&contents)
+        let mut config = Self::from_toml_str(&contents)?;
+        config.canonicalize_paths()?;
+        Ok(config)
     }
 
     pub fn from_toml_str(contents: &str) -> Result<Self, ConfigError> {
         let config: UnvalidatedConfig = toml::from_str(contents).map_err(ConfigError::Parse)?;
         config.validate()
     }
+
+    /// Canonicalize all path fields via the filesystem (resolving symlinks,
+    /// `.`, and `..`), then re-check that no two fields resolve to the same
+    /// directory.
+    fn canonicalize_paths(&mut self) -> Result<(), ConfigError> {
+        self.flockdir = canonicalize_field("flockdir", &self.flockdir)?;
+
+        match &mut self.platform {
+            PlatformConfig::Nanopore(nano) => {
+                nano.source = canonicalize_field("nanopore.source", &nano.source)?;
+                for cat in &mut nano.categories {
+                    cat.landing_zone =
+                        canonicalize_field("nanopore landing_zone", &cat.landing_zone)?;
+                }
+            }
+            PlatformConfig::NextSeq(ns) => {
+                ns.source = canonicalize_field("nextseq.source", &ns.source)?;
+                ns.landing_zone = canonicalize_field("nextseq.landing_zone", &ns.landing_zone)?;
+            }
+        }
+
+        // Re-check distinctness on canonicalized paths
+        match &self.platform {
+            PlatformConfig::Nanopore(nano) => {
+                let paths: Vec<(&'static str, &Path)> = [
+                    ("nanopore.source", nano.source.as_path()),
+                    ("flockdir", self.flockdir.as_path()),
+                ]
+                .into_iter()
+                .chain(
+                    nano.categories
+                        .iter()
+                        .map(|c| ("nanopore landing_zone", c.landing_zone.as_path())),
+                )
+                .collect();
+                validate_all_paths_distinct(&paths)?;
+            }
+            PlatformConfig::NextSeq(ns) => {
+                let paths: [(&'static str, &Path); 3] = [
+                    ("nextseq.source", &ns.source),
+                    ("nextseq.landing_zone", &ns.landing_zone),
+                    ("flockdir", &self.flockdir),
+                ];
+                validate_all_paths_distinct(&paths)?;
+            }
+        }
+
+        Ok(())
+    }
+}
+
+fn canonicalize_field(field: &'static str, path: &Path) -> Result<PathBuf, ConfigError> {
+    fs::canonicalize(path).map_err(|source| ConfigError::CanonicalizePath {
+        field,
+        path: path.to_path_buf(),
+        source,
+    })
 }
 
 impl UnvalidatedConfig {
@@ -234,7 +304,6 @@ impl UnvalidatedNanoporeConfig {
             });
         }
 
-        // Check all paths are distinct
         let paths: [(&'static str, &Path); 4] = [
             ("nanopore.source", &self.source),
             (

@@ -202,13 +202,13 @@ fn run_fails_missing_flockdir() {
 }
 
 #[test]
-fn run_fails_unreachable_landing_zone() {
-    let fixture = TestFixture::new("unreachable-landing");
+fn run_fails_nonexistent_landing_zone() {
+    let fixture = TestFixture::new("nonexistent-landing");
     fixture.mkdir("flockdir");
     fixture.mkdir("nanopore-source");
     fixture.mkdir("nanopore-landing-core");
 
-    // Make landing-other point to a path under a nonexistent parent so rsync can't create it.
+    // landing-other points to a nonexistent path — caught at config load time.
     let config = format!(
         r#"flockdir = "{flockdir}"
 server_user = "test"
@@ -238,19 +238,12 @@ completion_file_glob = "report*.html"
     let config_path = fixture.path("nanopore.toml");
     fs::write(&config_path, config).unwrap();
 
-    // Complete run that would go to the unreachable landing zone
-    fixture.mkdir("nanopore-source/ONT_raw_run1");
-    fixture.write_file("nanopore-source/ONT_raw_run1/report_final.html", "report");
-
     cmd()
         .args(["run", "--config-path"])
         .arg(&config_path)
         .args(["--platform", "nanopore"])
         .assert()
-        .success(); // rsync failure is recorded, not a hard exit
-
-    let log = read_transfer_log(&fixture);
-    assert!(log.contains("\"succeeded\":false"));
+        .failure();
 }
 
 #[test]
