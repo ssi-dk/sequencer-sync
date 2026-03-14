@@ -193,13 +193,14 @@ impl Config {
         Ok(config)
     }
 
-    pub fn from_toml_str(contents: &str) -> Result<Self, ConfigError> {
+    // Note: This doesn't canonicalize paths!
+    fn from_toml_str(contents: &str) -> Result<Self, ConfigError> {
         let config: UnvalidatedConfig = toml::from_str(contents).map_err(ConfigError::Parse)?;
         config.validate()
     }
 
     /// Canonicalize all path fields via the filesystem (resolving symlinks,
-    /// `.`, and `..`), then re-check that no two fields resolve to the same
+    /// `.`, and `..`), then check that no two fields resolve to the same
     /// directory.
     fn canonicalize_paths(&mut self) -> Result<(), ConfigError> {
         self.flockdir = canonicalize_field("flockdir", &self.flockdir)?;
@@ -269,8 +270,8 @@ impl UnvalidatedConfig {
         }
 
         let platform = match (self.nanopore, self.nextseq) {
-            (Some(nanopore), None) => PlatformConfig::Nanopore(nanopore.validate(&self.flockdir)?),
-            (None, Some(nextseq)) => PlatformConfig::NextSeq(nextseq.validate(&self.flockdir)?),
+            (Some(nanopore), None) => PlatformConfig::Nanopore(nanopore.validate()?),
+            (None, Some(nextseq)) => PlatformConfig::NextSeq(nextseq.validate()?),
             (Some(_), Some(_)) => return Err(ConfigError::MultiplePlatformSections),
             (None, None) => return Err(ConfigError::NoPlatformSection),
         };
@@ -286,7 +287,7 @@ impl UnvalidatedConfig {
 }
 
 impl UnvalidatedNanoporeConfig {
-    fn validate(self, flockdir: &Path) -> Result<NanoporeConfig, ConfigError> {
+    fn validate(self) -> Result<NanoporeConfig, ConfigError> {
         validate_absolute_path("nanopore.source", &self.source)?;
         validate_absolute_path(
             "nanopore.basecalled.landing_zone",
@@ -310,17 +311,6 @@ impl UnvalidatedNanoporeConfig {
                 prefix: self.basecalled.prefix,
             });
         }
-
-        let paths: [(&'static str, &Path); 4] = [
-            ("nanopore.source", &self.source),
-            (
-                "nanopore.basecalled.landing_zone",
-                &self.basecalled.landing_zone,
-            ),
-            ("nanopore.alldata.landing_zone", &self.alldata.landing_zone),
-            ("flockdir", flockdir),
-        ];
-        validate_all_paths_distinct(&paths)?;
 
         // Sort longest prefix first
         let mut categories = [
@@ -347,7 +337,7 @@ impl UnvalidatedNanoporeConfig {
 }
 
 impl UnvalidatedNextSeqConfig {
-    fn validate(self, flockdir: &Path) -> Result<NextSeqConfig, ConfigError> {
+    fn validate(self) -> Result<NextSeqConfig, ConfigError> {
         validate_absolute_path("nextseq.source", &self.source)?;
         validate_absolute_path("nextseq.landing_zone", &self.landing_zone)?;
         validate_non_empty("nextseq.regex", &self.regex)?;
@@ -358,13 +348,6 @@ impl UnvalidatedNextSeqConfig {
             field: "nextseq.regex",
             source,
         })?;
-
-        let paths: [(&'static str, &Path); 3] = [
-            ("nextseq.source", &self.source),
-            ("nextseq.landing_zone", &self.landing_zone),
-            ("flockdir", flockdir),
-        ];
-        validate_all_paths_distinct(&paths)?;
 
         Ok(NextSeqConfig {
             source: self.source,
@@ -546,41 +529,6 @@ completion_file_glob = "report*.html"
     }
 
     #[test]
-    fn rejects_duplicate_nanopore_landing_zones() {
-        let error = Config::from_toml_str(
-            r#"
-flockdir = "/var/lib/sequencer/flock"
-server_user = "sequencer-sync"
-server_port = 22
-server_host = "sequencer.example.org"
-
-[nanopore]
-source = "/data/nanopore"
-
-[nanopore.basecalled]
-prefix = "ONT_WGS_"
-landing_zone = "/var/lib/sequencer/landing-zone"
-completion_file_glob = "report*.html"
-
-[nanopore.alldata]
-prefix = "ONT_"
-landing_zone = "/var/lib/sequencer/landing-zone"
-completion_file_glob = "report*.html"
-"#,
-        )
-        .expect_err("duplicate landing zones should fail");
-
-        assert!(matches!(
-            error,
-            ConfigError::DuplicatePath {
-                first: "nanopore.basecalled.landing_zone",
-                second: "nanopore.alldata.landing_zone",
-                ..
-            }
-        ));
-    }
-
-    #[test]
     fn rejects_relative_source_path() {
         let error = Config::from_toml_str(
             r#"
@@ -629,34 +577,6 @@ completion_file_glob = "PrimaryAnalysisMetrics/PrimaryAnalysisMetrics.csv"
             error,
             ConfigError::EmptyField {
                 field: "server_user"
-            }
-        ));
-    }
-
-    #[test]
-    fn rejects_duplicate_local_paths() {
-        let error = Config::from_toml_str(
-            r#"
-flockdir = "/var/lib/sequencer/flock"
-server_user = "sequencer-sync"
-server_port = 22
-server_host = "sequencer.example.org"
-
-[nextseq]
-source = "/data/nextseq"
-regex = "^\\d{6}_"
-landing_zone = "/var/lib/sequencer/flock"
-completion_file_glob = "PrimaryAnalysisMetrics/PrimaryAnalysisMetrics.csv"
-"#,
-        )
-        .expect_err("duplicate local paths should fail validation");
-
-        assert!(matches!(
-            error,
-            ConfigError::DuplicatePath {
-                first: "nextseq.landing_zone",
-                second: "flockdir",
-                ..
             }
         ));
     }

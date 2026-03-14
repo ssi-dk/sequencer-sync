@@ -593,3 +593,79 @@ fn setup_fails_missing_landing_zone() {
         .assert()
         .failure();
 }
+
+#[test]
+fn setup_fails_duplicate_landing_zones() {
+    let fixture = TestFixture::new("setup-dup-landing");
+    fixture.mkdir("flockdir");
+    fixture.mkdir("nanopore-source");
+    let shared_landing = fixture.mkdir("nanopore-landing-shared");
+
+    let config = format!(
+        r#"flockdir = "{flockdir}"
+server_user = "test"
+server_port = 22
+server_host = "localhost"
+
+[nanopore]
+source = "{source}"
+
+[nanopore.basecalled]
+prefix = "ONT_WGS_"
+landing_zone = "{landing}"
+exclude = []
+completion_file_glob = "report*.html"
+
+[nanopore.alldata]
+prefix = "ONT_"
+landing_zone = "{landing}"
+exclude = []
+completion_file_glob = "report*.html"
+"#,
+        flockdir = fixture.path("flockdir").display(),
+        source = fixture.path("nanopore-source").display(),
+        landing = shared_landing.display(),
+    );
+    let config_path = fixture.path("nanopore.toml");
+    fs::write(&config_path, config).unwrap();
+
+    cmd()
+        .args(["setup", "--config-path"])
+        .arg(&config_path)
+        .args(["--platform", "nanopore", "--skip-ssh-check"])
+        .assert()
+        .failure();
+}
+
+#[test]
+fn setup_fails_landing_zone_equals_flockdir() {
+    let fixture = TestFixture::new("setup-landing-is-flock");
+    let shared = fixture.mkdir("shared");
+    fixture.mkdir("nextseq-source");
+
+    let config = format!(
+        r#"flockdir = "{shared}"
+server_user = "test"
+server_port = 22
+server_host = "localhost"
+
+[nextseq]
+source = "{source}"
+regex = "^\\d{{6}}_"
+landing_zone = "{shared}"
+exclude = []
+completion_file_glob = "PrimaryAnalysisMetrics/PrimaryAnalysisMetrics.csv"
+"#,
+        shared = shared.display(),
+        source = fixture.path("nextseq-source").display(),
+    );
+    let config_path = fixture.path("nextseq.toml");
+    fs::write(&config_path, config).unwrap();
+
+    cmd()
+        .args(["setup", "--config-path"])
+        .arg(&config_path)
+        .args(["--platform", "nextseq", "--skip-ssh-check"])
+        .assert()
+        .failure();
+}
