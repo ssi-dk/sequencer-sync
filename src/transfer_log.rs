@@ -123,6 +123,13 @@ impl TransferLog {
             .map(|&succeeded| succeeded || !retry_failed)
     }
 
+    /// Returns true if the directory is in the log with a failed transfer.
+    pub fn previously_failed(&self, directory: &Path) -> bool {
+        self.transferred_directories
+            .get(directory)
+            .is_some_and(|&succeeded| !succeeded)
+    }
+
     pub fn record_transfer(
         &mut self,
         directory: &Path,

@@ -7,10 +7,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use config::{Config, ConfigError, NanoporeConfig, NextSeqConfig, PlatformConfig};
 use fs2::FileExt;
+use run_log::RunLog;
 use thiserror::Error;
 use transfer_log::TransferLog;
 
 mod config;
+mod run_log;
 mod transfer_log;
 
 #[derive(Debug, Parser)]
@@ -111,14 +113,23 @@ fn run_command(args: CommandArgs) -> Result<(), AppError> {
         }
     };
     let mut transfer_log = TransferLog::load(&config.flockdir).map_err(AppError::TransferLog)?;
+    let mut run_log = RunLog::new(&config.flockdir);
 
     match &config.platform {
-        PlatformConfig::Nanopore(nano) => {
-            run_nanopore(&config, nano, &mut transfer_log, args.retry_failed)
-        }
-        PlatformConfig::NextSeq(ns) => {
-            run_nextseq(&config, ns, &mut transfer_log, args.retry_failed)
-        }
+        PlatformConfig::Nanopore(nano) => run_nanopore(
+            &config,
+            nano,
+            &mut transfer_log,
+            &mut run_log,
+            args.retry_failed,
+        ),
+        PlatformConfig::NextSeq(ns) => run_nextseq(
+            &config,
+            ns,
+            &mut transfer_log,
+            &mut run_log,
+            args.retry_failed,
+        ),
     }
 }
 
@@ -130,12 +141,19 @@ fn test_nextseq(_config: &Config, _ns: &NextSeqConfig) -> Result<(), AppError> {
     todo!()
 }
 
+enum TransferReason {
+    /// Directory has never been transferred before.
+    New,
+    /// Directory was previously transferred but failed; being retried via --retry-failed.
+    Retry,
+}
+
 fn new_directories(
     source: &Path,
     field: &'static str,
     transfer_log: &TransferLog,
     retry_failed: bool,
-) -> Result<Vec<fs::DirEntry>, AppError> {
+) -> Result<Vec<(fs::DirEntry, TransferReason)>, AppError> {
     let entries = fs::read_dir(source).map_err(|e| AppError::ReadDirectory {
         field,
         path: source.to_path_buf(),
@@ -168,7 +186,13 @@ fn new_directories(
             continue;
         }
 
-        result.push(entry);
+        let reason = if transfer_log.previously_failed(&key) {
+            TransferReason::Retry
+        } else {
+            TransferReason::New
+        };
+
+        result.push((entry, reason));
     }
 
     Ok(result)
@@ -187,9 +211,12 @@ fn run_nanopore(
     _config: &Config,
     nano: &NanoporeConfig,
     transfer_log: &mut TransferLog,
+    run_log: &mut RunLog,
     retry_failed: bool,
 ) -> Result<(), AppError> {
-    for entry in new_directories(&nano.source, "nanopore.source", transfer_log, retry_failed)? {
+    for (entry, reason) in
+        new_directories(&nano.source, "nanopore.source", transfer_log, retry_failed)?
+    {
         let dir_name = entry.file_name();
         let dir_name = dir_name.to_string_lossy();
 
@@ -202,10 +229,22 @@ fn run_nanopore(
             continue;
         }
 
+        if matches!(reason, TransferReason::Retry) {
+            let _ = run_log.log(&format!("Retrying previously failed transfer: {dir_name}"));
+        }
+
+        let landing_zone_display = category.landing_zone.display();
         let succeeded =
             match rsync_directory(&entry.path(), &category.landing_zone, &category.exclude) {
-                Ok(()) => true,
+                Ok(()) => {
+                    let _ =
+                        run_log.log(&format!("Transferred {dir_name} -> {landing_zone_display}"));
+                    true
+                }
                 Err(error) => {
+                    let _ = run_log.log(&format!(
+                        "FAILED transfer {dir_name} -> {landing_zone_display}: {error}"
+                    ));
                     eprintln!("{error}");
                     false
                 }
@@ -248,9 +287,12 @@ fn run_nextseq(
     _config: &Config,
     ns: &NextSeqConfig,
     transfer_log: &mut TransferLog,
+    run_log: &mut RunLog,
     retry_failed: bool,
 ) -> Result<(), AppError> {
-    for entry in new_directories(&ns.source, "nextseq.source", transfer_log, retry_failed)? {
+    for (entry, reason) in
+        new_directories(&ns.source, "nextseq.source", transfer_log, retry_failed)?
+    {
         let dir_name = entry.file_name();
         let dir_name = dir_name.to_string_lossy();
 
@@ -262,9 +304,20 @@ fn run_nextseq(
             continue;
         }
 
+        if matches!(reason, TransferReason::Retry) {
+            let _ = run_log.log(&format!("Retrying previously failed transfer: {dir_name}"));
+        }
+
+        let landing_zone_display = ns.landing_zone.display();
         let succeeded = match rsync_directory(&entry.path(), &ns.landing_zone, &ns.exclude) {
-            Ok(()) => true,
+            Ok(()) => {
+                let _ = run_log.log(&format!("Transferred {dir_name} -> {landing_zone_display}"));
+                true
+            }
             Err(error) => {
+                let _ = run_log.log(&format!(
+                    "FAILED transfer {dir_name} -> {landing_zone_display}: {error}"
+                ));
                 eprintln!("{error}");
                 false
             }
