@@ -4,8 +4,8 @@ use std::process::Command;
 use std::process::ExitCode;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use clap::{Args, Parser, Subcommand, ValueEnum};
-use config::{Config, ConfigError, NanoporeConfig, NextSeqConfig, PlatformConfig};
+use clap::{Args, Parser, Subcommand};
+use config::{Config, ConfigError};
 use fs2::FileExt;
 use run_log::RunLog;
 use thiserror::Error;
@@ -36,8 +36,6 @@ enum Commands {
 struct SetupArgs {
     #[arg(long)]
     config_path: PathBuf,
-    #[arg(long)]
-    platform: Platform,
     /// Skip the SSH access check (useful before SSH keys are deployed).
     #[arg(long, default_value_t = false)]
     skip_ssh_check: bool,
@@ -47,8 +45,6 @@ struct SetupArgs {
 struct RunArgs {
     #[arg(long)]
     config_path: PathBuf,
-    #[arg(long)]
-    platform: Platform,
     /// Retry directories whose previous transfer failed.
     #[arg(long, default_value_t = false)]
     retry_failed: bool,
@@ -58,13 +54,6 @@ struct RunArgs {
     /// Print what would be copied instead of actually copying.
     #[arg(long, default_value_t = false)]
     dry_run: bool,
-}
-
-#[derive(Clone, Debug, ValueEnum)]
-enum Platform {
-    Nanopore,
-    #[value(name = "nextseq")]
-    NextSeq,
 }
 
 fn main() -> ExitCode {
@@ -87,11 +76,11 @@ fn try_main() -> Result<(), AppError> {
 
 fn setup(args: SetupArgs) -> Result<(), AppError> {
     let config_path = canonicalize_config_path(&args.config_path)?;
-    let config = load_config(&args.config_path, &args.platform)?;
+    let config = load_config(&args.config_path)?;
 
     validate_environment(&config, args.skip_ssh_check)?;
     check_lock_is_available(&config.flockdir)?;
-    let cron_path = write_cron_file(&config.flockdir, &config_path, args.platform)?;
+    let cron_path = write_cron_file(&config.flockdir, &config_path)?;
     eprintln!(
         "Install the generated cron job with your system cron configuration: {}",
         cron_path.display()
@@ -100,8 +89,18 @@ fn setup(args: SetupArgs) -> Result<(), AppError> {
     Ok(())
 }
 
+// We might want to have distinct transfer targets e.g. from operational runs
+// versus projects. Perhaps these need different file subsets.
+// A TransferTarget stores information about source and destination once we have
+// classified a run as e.g. project/operations/something else.
+struct TransferTarget {
+    destination: PathBuf,
+    exclude: Vec<String>,
+    completion_file_glob: glob::Pattern,
+}
+
 fn run_command(args: RunArgs) -> Result<(), AppError> {
-    let config = load_config(&args.config_path, &args.platform)?;
+    let config = load_config(&args.config_path)?;
 
     let _lock = match acquire_run_lock(&config.flockdir)? {
         Some(lock) => lock,
@@ -113,24 +112,15 @@ fn run_command(args: RunArgs) -> Result<(), AppError> {
     let mut transfer_log = TransferLog::load(&config.flockdir).map_err(AppError::TransferLog)?;
     let mut run_log = RunLog::new(&config.flockdir);
 
-    match &config.platform {
-        PlatformConfig::Nanopore(nano) => run_nanopore(
-            nano,
-            &mut transfer_log,
-            &mut run_log,
-            args.retry_failed,
-            args.ignore_incomplete,
-            args.dry_run,
-        ),
-        PlatformConfig::NextSeq(ns) => run_nextseq(
-            ns,
-            &mut transfer_log,
-            &mut run_log,
-            args.retry_failed,
-            args.ignore_incomplete,
-            args.dry_run,
-        ),
-    }?;
+    transfer_new_directories(
+        &config.source,
+        &config.categories,
+        &mut transfer_log,
+        &mut run_log,
+        args.retry_failed,
+        args.ignore_incomplete,
+        args.dry_run,
+    )?;
 
     if run_log.had_error() {
         return Err(AppError::RunLogWriteFailed);
@@ -143,17 +133,9 @@ fn validate_environment(config: &Config, skip_ssh_check: bool) -> Result<(), App
     if !skip_ssh_check {
         check_ssh_access(config)?;
     }
-    match &config.platform {
-        PlatformConfig::Nanopore(nano) => {
-            check_readable_directory(&nano.source, "nanopore.source")?;
-            for cat in &nano.categories {
-                check_writable_directory(&cat.landing_zone, "nanopore landing_zone")?;
-            }
-        }
-        PlatformConfig::NextSeq(ns) => {
-            check_readable_directory(&ns.source, "nextseq.source")?;
-            check_writable_directory(&ns.landing_zone, "nextseq.landing_zone")?;
-        }
+    check_readable_directory(&config.source, "source")?;
+    for cat in &config.categories {
+        check_writable_directory(&cat.landing_zone, "category.landing_zone")?;
     }
     check_writable_directory(&config.flockdir, "flockdir")?;
     Ok(())
@@ -168,12 +150,11 @@ enum TransferReason {
 
 fn new_directories(
     source: &Path,
-    field: &'static str,
     transfer_log: &TransferLog,
     retry_failed: bool,
 ) -> Result<Vec<(fs::DirEntry, TransferReason)>, AppError> {
     let entries = fs::read_dir(source).map_err(|e| AppError::ReadDirectory {
-        field,
+        field: "source",
         path: source.to_path_buf(),
         source: e,
     })?;
@@ -181,13 +162,13 @@ fn new_directories(
     let mut result = Vec::new();
     for entry in entries {
         let entry = entry.map_err(|e| AppError::ReadDirectory {
-            field,
+            field: "source",
             path: source.to_path_buf(),
             source: e,
         })?;
 
         let file_type = entry.file_type().map_err(|e| AppError::ReadMetadata {
-            field,
+            field: "source",
             path: entry.path(),
             source: e,
         })?;
@@ -221,31 +202,59 @@ fn run_is_complete(run_dir: &Path, completion_file_glob: &glob::Pattern) -> bool
         .unwrap_or(false)
 }
 
-fn run_nanopore(
-    nano: &NanoporeConfig,
+fn classify(
+    dir_name: &str,
+    categories: &[config::Category],
+) -> Result<Option<TransferTarget>, AppError> {
+    for cat in categories {
+        if !cat.regex.is_match(dir_name) {
+            continue;
+        }
+        let destination = if cat.year_subdirectory {
+            let bytes = dir_name.as_bytes();
+            if bytes.len() < 2 || !bytes[0].is_ascii_digit() || !bytes[1].is_ascii_digit() {
+                return Err(AppError::YearSubdirectoryInvalidName {
+                    dir_name: dir_name.to_string(),
+                    category_regex: cat.regex.to_string(),
+                });
+            }
+            cat.landing_zone.join(format!("20{}", &dir_name[..2]))
+        } else {
+            cat.landing_zone.clone()
+        };
+        return Ok(Some(TransferTarget {
+            destination,
+            exclude: cat.exclude.clone(),
+            completion_file_glob: cat.completion_file_glob.clone(),
+        }));
+    }
+    Ok(None)
+}
+
+fn transfer_new_directories(
+    source: &Path,
+    categories: &[config::Category],
     transfer_log: &mut TransferLog,
     run_log: &mut RunLog,
     retry_failed: bool,
     ignore_incomplete: bool,
     dry_run: bool,
 ) -> Result<(), AppError> {
-    for (entry, reason) in
-        new_directories(&nano.source, "nanopore.source", transfer_log, retry_failed)?
-    {
+    for (entry, reason) in new_directories(source, transfer_log, retry_failed)? {
         let dir_name = entry.file_name();
         let dir_name = dir_name.to_string_lossy();
 
-        let category = match nano.classify(&dir_name) {
-            Some(cat) => cat,
+        let target = match classify(&dir_name, categories)? {
+            Some(t) => t,
             None => continue,
         };
 
-        if !ignore_incomplete && !run_is_complete(&entry.path(), &category.completion_file_glob) {
+        if !ignore_incomplete && !run_is_complete(&entry.path(), &target.completion_file_glob) {
             continue;
         }
 
         if dry_run {
-            print_dry_run(&entry.path(), &category.landing_zone, &category.exclude);
+            print_dry_run(&entry.path(), &target.destination, &target.exclude);
             continue;
         }
 
@@ -253,14 +262,14 @@ fn run_nanopore(
             run_log.log(&format!("Retrying previously failed transfer: {dir_name}"));
         }
 
-        let destination_display = category.landing_zone.display();
-        let succeeded = rsync_directory(&entry.path(), &category.landing_zone, &category.exclude);
+        let destination_display = target.destination.display();
+        let succeeded = rsync_directory(&entry.path(), &target.destination, &target.exclude);
         if let Err(ref error) = succeeded {
             eprintln!("{error}");
         }
         let succeeded = succeeded.is_ok();
 
-        let key = transfer_log::relative_directory_key(&nano.source, &entry.path())
+        let key = transfer_log::relative_directory_key(source, &entry.path())
             .map_err(AppError::TransferLog)?;
         transfer_log
             .record_transfer(&key, succeeded)
@@ -268,9 +277,7 @@ fn run_nanopore(
 
         if succeeded {
             run_log.log(&format!("Transferred {dir_name} -> {destination_display}"));
-            if let Err(error) =
-                touch_transfer_marker(&category.landing_zone.join(entry.file_name()))
-            {
+            if let Err(error) = touch_transfer_marker(&target.destination.join(entry.file_name())) {
                 eprintln!("Warning: {error}");
                 run_log.log(&format!("Warning: {error}"));
                 run_log.record_error();
@@ -285,6 +292,9 @@ fn run_nanopore(
     Ok(())
 }
 
+// This marker is useful because once the data has been transferred from the
+// landing zone to the remote server, someone on the server can check for this
+// file to see if the transfer to the landing zone was complete.
 const TRANSFER_MARKER_FILE_NAME: &str = "transfer_successful.txt";
 
 fn touch_transfer_marker(transferred_dir: &Path) -> Result<(), AppError> {
@@ -326,97 +336,11 @@ fn rsync_directory(source: &Path, destination: &Path, exclude: &[String]) -> Res
     }
 }
 
-fn run_nextseq(
-    ns: &NextSeqConfig,
-    transfer_log: &mut TransferLog,
-    run_log: &mut RunLog,
-    retry_failed: bool,
-    ignore_incomplete: bool,
-    dry_run: bool,
-) -> Result<(), AppError> {
-    for (entry, reason) in
-        new_directories(&ns.source, "nextseq.source", transfer_log, retry_failed)?
-    {
-        let dir_name = entry.file_name();
-        let dir_name = dir_name.to_string_lossy();
-
-        if !ns.regex.is_match(&dir_name) {
-            continue;
-        }
-
-        if !ignore_incomplete && !run_is_complete(&entry.path(), &ns.completion_file_glob) {
-            continue;
-        }
-
-        let Some(destination) = ns.destination_for(&dir_name) else {
-            continue;
-        };
-
-        if dry_run {
-            print_dry_run(&entry.path(), &destination, &ns.exclude);
-            continue;
-        }
-
-        if matches!(reason, TransferReason::Retry) {
-            run_log.log(&format!("Retrying previously failed transfer: {dir_name}"));
-        }
-
-        let destination_display = destination.display();
-        let succeeded = rsync_directory(&entry.path(), &destination, &ns.exclude);
-        if let Err(ref error) = succeeded {
-            eprintln!("{error}");
-        }
-        let succeeded = succeeded.is_ok();
-
-        let key = transfer_log::relative_directory_key(&ns.source, &entry.path())
-            .map_err(AppError::TransferLog)?;
-        transfer_log
-            .record_transfer(&key, succeeded)
-            .map_err(AppError::TransferLog)?;
-
-        if succeeded {
-            run_log.log(&format!("Transferred {dir_name} -> {destination_display}"));
-            if let Err(error) = touch_transfer_marker(&destination.join(entry.file_name())) {
-                eprintln!("Warning: {error}");
-                run_log.log(&format!("Warning: {error}"));
-                run_log.record_error();
-            }
-        } else {
-            run_log.log(&format!(
-                "FAILED transfer {dir_name} -> {destination_display}"
-            ));
-        }
-    }
-
-    Ok(())
-}
-
-fn load_config(config_path: &Path, expected_platform: &Platform) -> Result<Config, AppError> {
-    let config = Config::from_path(config_path).map_err(|source| AppError::LoadConfig {
+fn load_config(config_path: &Path) -> Result<Config, AppError> {
+    Config::from_path(config_path).map_err(|source| AppError::LoadConfig {
         path: config_path.to_path_buf(),
         source,
-    })?;
-
-    if !matches!(
-        (expected_platform, &config.platform),
-        (Platform::Nanopore, PlatformConfig::Nanopore(_))
-            | (Platform::NextSeq, PlatformConfig::NextSeq(_))
-    ) {
-        let config_platform = match &config.platform {
-            PlatformConfig::Nanopore(_) => "nanopore",
-            PlatformConfig::NextSeq(_) => "nextseq",
-        };
-        let cli_platform = match expected_platform {
-            Platform::Nanopore => "nanopore",
-            Platform::NextSeq => "nextseq",
-        };
-        return Err(AppError::PlatformMismatch {
-            config: config_platform.to_string(),
-            cli: cli_platform.to_string(),
-        });
-    }
-
-    Ok(config)
+    })
 }
 
 fn check_ssh_access(config: &Config) -> Result<(), AppError> {
@@ -511,13 +435,9 @@ fn canonicalize_config_path(path: &Path) -> Result<PathBuf, AppError> {
     })
 }
 
-fn write_cron_file(
-    flockdir: &Path,
-    config_path: &Path,
-    platform: Platform,
-) -> Result<PathBuf, AppError> {
+fn write_cron_file(flockdir: &Path, config_path: &Path) -> Result<PathBuf, AppError> {
     let cron_path = cron_file_path(flockdir);
-    let contents = render_cron_file(config_path, platform);
+    let contents = render_cron_file(config_path);
     fs::write(&cron_path, contents).map_err(|source| AppError::WriteCronFile {
         path: cron_path.clone(),
         source,
@@ -533,11 +453,10 @@ fn lock_file_path(flockdir: &Path) -> PathBuf {
     flockdir.join(LOCK_FILE_NAME)
 }
 
-fn render_cron_file(config_path: &Path, platform: Platform) -> String {
+fn render_cron_file(config_path: &Path) -> String {
     let command = format!(
-        "sequencer-sync run --config-path {} --platform {}",
+        "sequencer-sync run --config-path {}",
         shell_quote(config_path.to_string_lossy().as_ref()),
-        platform.as_cli_value()
     );
 
     format!("# Install this file into cron manually.\n*/15 * * * * {command}\n")
@@ -575,15 +494,7 @@ fn shell_quote(value: &str) -> String {
     format!("'{escaped}'")
 }
 
-impl Platform {
-    fn as_cli_value(&self) -> &'static str {
-        match self {
-            Self::Nanopore => "nanopore",
-            Self::NextSeq => "nextseq",
-        }
-    }
-}
-
+// Ensure only one instance of this program runs at a time
 const LOCK_FILE_NAME: &str = "sequencer-sync.lock";
 
 struct RunLock {
@@ -672,8 +583,6 @@ enum AppError {
     },
     #[error("run lock is currently held: {}", path.display())]
     RunLockHeld { path: PathBuf },
-    #[error("--platform flag `{cli}` does not match config platform `{config}`")]
-    PlatformMismatch { cli: String, config: String },
     #[error("failed to execute rsync: {source}")]
     SpawnRsync {
         #[source]
@@ -693,23 +602,30 @@ enum AppError {
     },
     #[error("one or more run log writes failed (see warnings above)")]
     RunLogWriteFailed,
+    #[error(
+        "directory `{dir_name}` matched category regex `{category_regex}` with year_subdirectory enabled, but name does not start with two ASCII digits"
+    )]
+    YearSubdirectoryInvalidName {
+        dir_name: String,
+        category_regex: String,
+    },
 }
 
 #[cfg(test)]
 mod tests {
     use std::path::Path;
 
-    use super::{LOCK_FILE_NAME, Platform, cron_file_path, lock_file_path, render_cron_file};
+    use super::{LOCK_FILE_NAME, cron_file_path, lock_file_path, render_cron_file};
 
     #[test]
     fn renders_cron_file() {
-        let block = render_cron_file(
-            Path::new("/etc/sequencer-sync/config.toml"),
-            Platform::Nanopore,
-        );
+        let block = render_cron_file(Path::new("/etc/sequencer-sync/config.toml"));
 
         assert!(block.contains("# Install this file into cron manually."));
-        assert!(block.contains("*/15 * * * * sequencer-sync run --config-path '/etc/sequencer-sync/config.toml' --platform nanopore"));
+        assert!(block.contains(
+            "*/15 * * * * sequencer-sync run --config-path '/etc/sequencer-sync/config.toml'"
+        ));
+        assert!(!block.contains("--platform"));
     }
 
     #[test]

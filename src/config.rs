@@ -16,40 +16,13 @@ pub struct Config {
     pub server_port: u16,
     pub server_host: String,
 
-    pub platform: PlatformConfig,
+    /// Canonicalized absolute path.
+    pub source: PathBuf,
+    pub categories: Vec<Category>,
 }
 
 #[derive(Debug)]
-pub enum PlatformConfig {
-    Nanopore(NanoporeConfig),
-    NextSeq(NextSeqConfig),
-}
-
-// For Nanopore, for some sequencing runs, we want to copy all files,
-// and for some, we want to skip the raw data files.
-// We distinguish these by directory prefix, and copy different file
-// subsets to different landing zones.
-#[derive(Debug, PartialEq, Eq)]
-pub struct NanoporeConfig {
-    /// Canonicalized absolute path.
-    pub source: PathBuf,
-    /// Sorted longest-prefix-first for correct matching.
-    pub categories: [NanoporeCategory; 2],
-}
-
-#[derive(Debug, PartialEq, Eq)]
-pub struct NanoporeCategory {
-    pub prefix: String,
-    /// Canonicalized absolute path.
-    pub landing_zone: PathBuf,
-    pub exclude: Vec<String>,
-    pub completion_file_glob: Pattern,
-}
-
-#[derive(Debug)]
-pub struct NextSeqConfig {
-    /// Canonicalized absolute path.
-    pub source: PathBuf,
+pub struct Category {
     pub regex: Regex,
     /// Canonicalized absolute path.
     pub landing_zone: PathBuf,
@@ -58,37 +31,7 @@ pub struct NextSeqConfig {
     /// When true, place runs into a year-based subdirectory under the landing
     /// zone. The year is derived from the directory name by prepending "20" to
     /// its first two characters (e.g. "240101_NB123" → "2024/").
-    /// This matches the legacy bash script behavior.
     pub year_subdirectory: bool,
-}
-
-impl NextSeqConfig {
-    /// Returns the destination directory for a given run. When
-    /// `year_subdirectory` is enabled, appends a year derived from the first
-    /// two characters of the directory name (e.g. "24" → "2024").
-    /// Returns `None` if `year_subdirectory` is enabled but the dir_name
-    /// does not start with two decimal digits.
-    pub fn destination_for(&self, dir_name: &str) -> Option<PathBuf> {
-        if self.year_subdirectory {
-            let bytes = dir_name.as_bytes();
-            if bytes.len() < 2 || bytes[..2].iter().any(|c| !c.is_ascii_digit()) {
-                return None;
-            }
-            Some(self.landing_zone.join(format!("20{}", &dir_name[..2])))
-        } else {
-            Some(self.landing_zone.clone())
-        }
-    }
-}
-
-impl NanoporeConfig {
-    /// Returns the category matching this directory name, or None.
-    /// Categories are sorted longest-prefix-first, so ONT_WGS_ matches before ONT_.
-    pub fn classify(&self, dir_name: &str) -> Option<&NanoporeCategory> {
-        self.categories
-            .iter()
-            .find(|c| dir_name.starts_with(&c.prefix))
-    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -97,29 +40,13 @@ struct UnvalidatedConfig {
     server_user: String,
     server_port: u16,
     server_host: String,
-    nanopore: Option<UnvalidatedNanoporeConfig>,
-    nextseq: Option<UnvalidatedNextSeqConfig>,
-}
-
-#[derive(Debug, Deserialize)]
-struct UnvalidatedNanoporeConfig {
     source: PathBuf,
-    basecalled: UnvalidatedNanoporeCategory,
-    alldata: UnvalidatedNanoporeCategory,
-}
-
-#[derive(Debug, Deserialize)]
-struct UnvalidatedNanoporeCategory {
-    prefix: String,
-    landing_zone: PathBuf,
     #[serde(default)]
-    exclude: Vec<String>,
-    completion_file_glob: String,
+    category: Vec<UnvalidatedCategory>,
 }
 
 #[derive(Debug, Deserialize)]
-struct UnvalidatedNextSeqConfig {
-    source: PathBuf,
+struct UnvalidatedCategory {
     regex: String,
     landing_zone: PathBuf,
     #[serde(default)]
@@ -154,12 +81,8 @@ pub enum ConfigError {
         second: &'static str,
         path: PathBuf,
     },
-    #[error("config must contain exactly one of [nanopore] or [nextseq] sections, found neither")]
-    NoPlatformSection,
-    #[error("config must contain exactly one of [nanopore] or [nextseq] sections, found both")]
-    MultiplePlatformSections,
-    #[error("nanopore basecalled and alldata prefixes must differ: `{prefix}`")]
-    DuplicatePrefix { prefix: String },
+    #[error("config must contain at least one [[category]]")]
+    NoCategoriesConfigured,
     #[error("config field `{field}` is not a valid regex: {source}")]
     InvalidRegex {
         field: &'static str,
@@ -204,46 +127,18 @@ impl Config {
     /// directory.
     fn canonicalize_paths(&mut self) -> Result<(), ConfigError> {
         self.flockdir = canonicalize_field("flockdir", &self.flockdir)?;
+        self.source = canonicalize_field("source", &self.source)?;
 
-        match &mut self.platform {
-            PlatformConfig::Nanopore(nano) => {
-                nano.source = canonicalize_field("nanopore.source", &nano.source)?;
-                for cat in &mut nano.categories {
-                    cat.landing_zone =
-                        canonicalize_field("nanopore landing_zone", &cat.landing_zone)?;
-                }
-            }
-            PlatformConfig::NextSeq(ns) => {
-                ns.source = canonicalize_field("nextseq.source", &ns.source)?;
-                ns.landing_zone = canonicalize_field("nextseq.landing_zone", &ns.landing_zone)?;
-            }
+        for cat in &mut self.categories {
+            cat.landing_zone = canonicalize_field("category.landing_zone", &cat.landing_zone)?;
         }
 
-        // Re-check distinctness on canonicalized paths
-        match &self.platform {
-            PlatformConfig::Nanopore(nano) => {
-                let paths: Vec<(&'static str, &Path)> = [
-                    ("nanopore.source", nano.source.as_path()),
-                    ("flockdir", self.flockdir.as_path()),
-                ]
-                .into_iter()
-                .chain(
-                    nano.categories
-                        .iter()
-                        .map(|c| ("nanopore landing_zone", c.landing_zone.as_path())),
-                )
-                .collect();
-                validate_all_paths_distinct(&paths)?;
-            }
-            PlatformConfig::NextSeq(ns) => {
-                let paths: [(&'static str, &Path); 3] = [
-                    ("nextseq.source", &ns.source),
-                    ("nextseq.landing_zone", &ns.landing_zone),
-                    ("flockdir", &self.flockdir),
-                ];
-                validate_all_paths_distinct(&paths)?;
-            }
+        let mut paths: Vec<(&'static str, &Path)> =
+            vec![("source", &self.source), ("flockdir", &self.flockdir)];
+        for cat in &self.categories {
+            paths.push(("category.landing_zone", &cat.landing_zone));
         }
+        validate_all_paths_distinct(&paths)?;
 
         Ok(())
     }
@@ -269,88 +164,41 @@ impl UnvalidatedConfig {
             });
         }
 
-        let platform = match (self.nanopore, self.nextseq) {
-            (Some(nanopore), None) => PlatformConfig::Nanopore(nanopore.validate()?),
-            (None, Some(nextseq)) => PlatformConfig::NextSeq(nextseq.validate()?),
-            (Some(_), Some(_)) => return Err(ConfigError::MultiplePlatformSections),
-            (None, None) => return Err(ConfigError::NoPlatformSection),
-        };
+        validate_absolute_path("source", &self.source)?;
+
+        if self.category.is_empty() {
+            return Err(ConfigError::NoCategoriesConfigured);
+        }
+
+        let mut categories = Vec::with_capacity(self.category.len());
+        for cat in self.category {
+            categories.push(cat.validate()?);
+        }
 
         Ok(Config {
             flockdir: self.flockdir,
             server_user: self.server_user,
             server_port: self.server_port,
             server_host: self.server_host,
-            platform,
-        })
-    }
-}
-
-impl UnvalidatedNanoporeConfig {
-    fn validate(self) -> Result<NanoporeConfig, ConfigError> {
-        validate_absolute_path("nanopore.source", &self.source)?;
-        validate_absolute_path(
-            "nanopore.basecalled.landing_zone",
-            &self.basecalled.landing_zone,
-        )?;
-        validate_absolute_path("nanopore.alldata.landing_zone", &self.alldata.landing_zone)?;
-
-        validate_non_empty("nanopore.basecalled.prefix", &self.basecalled.prefix)?;
-        validate_non_empty("nanopore.alldata.prefix", &self.alldata.prefix)?;
-        let basecalled_glob = validate_glob(
-            "nanopore.basecalled.completion_file_glob",
-            &self.basecalled.completion_file_glob,
-        )?;
-        let alldata_glob = validate_glob(
-            "nanopore.alldata.completion_file_glob",
-            &self.alldata.completion_file_glob,
-        )?;
-
-        if self.basecalled.prefix == self.alldata.prefix {
-            return Err(ConfigError::DuplicatePrefix {
-                prefix: self.basecalled.prefix,
-            });
-        }
-
-        // Sort longest prefix first
-        let mut categories = [
-            NanoporeCategory {
-                prefix: self.basecalled.prefix,
-                landing_zone: self.basecalled.landing_zone,
-                exclude: self.basecalled.exclude,
-                completion_file_glob: basecalled_glob,
-            },
-            NanoporeCategory {
-                prefix: self.alldata.prefix,
-                landing_zone: self.alldata.landing_zone,
-                exclude: self.alldata.exclude,
-                completion_file_glob: alldata_glob,
-            },
-        ];
-        categories.sort_by(|a, b| b.prefix.len().cmp(&a.prefix.len()));
-
-        Ok(NanoporeConfig {
             source: self.source,
             categories,
         })
     }
 }
 
-impl UnvalidatedNextSeqConfig {
-    fn validate(self) -> Result<NextSeqConfig, ConfigError> {
-        validate_absolute_path("nextseq.source", &self.source)?;
-        validate_absolute_path("nextseq.landing_zone", &self.landing_zone)?;
-        validate_non_empty("nextseq.regex", &self.regex)?;
-        let completion_file_glob =
-            validate_glob("nextseq.completion_file_glob", &self.completion_file_glob)?;
+impl UnvalidatedCategory {
+    fn validate(self) -> Result<Category, ConfigError> {
+        validate_absolute_path("category.landing_zone", &self.landing_zone)?;
 
         let regex = Regex::new(&self.regex).map_err(|source| ConfigError::InvalidRegex {
-            field: "nextseq.regex",
+            field: "category.regex",
             source,
         })?;
 
-        Ok(NextSeqConfig {
-            source: self.source,
+        let completion_file_glob =
+            validate_glob("category.completion_file_glob", &self.completion_file_glob)?;
+
+        Ok(Category {
             regex,
             landing_zone: self.landing_zone,
             exclude: self.exclude,
@@ -402,9 +250,7 @@ fn validate_all_paths_distinct(paths: &[(&'static str, &Path)]) -> Result<(), Co
 mod tests {
     use std::path::PathBuf;
 
-    use glob::Pattern;
-
-    use super::{Config, ConfigError, NanoporeConfig, PlatformConfig};
+    use super::{Config, ConfigError};
 
     const NANOPORE_EXAMPLE: &str = include_str!("../examples/nanopore.example.toml");
     const NEXTSEQ_EXAMPLE: &str = include_str!("../examples/nextseq.example.toml");
@@ -417,20 +263,18 @@ mod tests {
         assert_eq!(config.server_user, "sequencer-sync");
         assert_eq!(config.server_port, 22);
         assert_eq!(config.server_host, "sequencer.example.org");
+        assert_eq!(config.source, PathBuf::from("/data/nanopore"));
 
-        let PlatformConfig::Nanopore(ref nano) = config.platform else {
-            panic!("expected Nanopore platform");
-        };
-        assert_eq!(nano.source, PathBuf::from("/data/nanopore"));
-        // Longest prefix first
-        assert_eq!(nano.categories[0].prefix, "ONT_WGS_");
+        assert_eq!(config.categories.len(), 2);
+        assert!(config.categories[0].regex.is_match("ONT_WGS_run1"));
+        assert!(!config.categories[0].regex.is_match("ONT_raw_run2"));
         assert_eq!(
-            nano.categories[0].landing_zone,
+            config.categories[0].landing_zone,
             PathBuf::from("/var/lib/sequencer/landing-zone-core")
         );
-        assert_eq!(nano.categories[1].prefix, "ONT_");
+        assert!(config.categories[1].regex.is_match("ONT_raw_run2"));
         assert_eq!(
-            nano.categories[1].landing_zone,
+            config.categories[1].landing_zone,
             PathBuf::from("/var/lib/sequencer/landing-zone-other")
         );
     }
@@ -440,92 +284,29 @@ mod tests {
         let config = Config::from_toml_str(NEXTSEQ_EXAMPLE).expect("nextseq config should parse");
 
         assert_eq!(config.flockdir, PathBuf::from("/var/lib/sequencer/flock"));
-        let PlatformConfig::NextSeq(ref ns) = config.platform else {
-            panic!("expected NextSeq platform");
-        };
-        assert_eq!(ns.source, PathBuf::from("/data/nextseq"));
-        assert!(ns.regex.is_match("240101_"));
+        assert_eq!(config.source, PathBuf::from("/data/nextseq"));
+        assert_eq!(config.categories.len(), 1);
+        assert!(config.categories[0].regex.is_match("240101_"));
         assert_eq!(
-            ns.landing_zone,
+            config.categories[0].landing_zone,
             PathBuf::from("/var/lib/sequencer/landing-zone")
         );
     }
 
     #[test]
-    fn rejects_config_with_no_platform() {
+    fn rejects_config_with_no_categories() {
         let error = Config::from_toml_str(
             r#"
 flockdir = "/var/lib/sequencer/flock"
 server_user = "sequencer-sync"
 server_port = 22
 server_host = "sequencer.example.org"
+source = "/data/sequencer"
 "#,
         )
-        .expect_err("config with no platform should fail");
+        .expect_err("config with no categories should fail");
 
-        assert!(matches!(error, ConfigError::NoPlatformSection));
-    }
-
-    #[test]
-    fn rejects_config_with_both_platforms() {
-        let error = Config::from_toml_str(
-            r#"
-flockdir = "/var/lib/sequencer/flock"
-server_user = "sequencer-sync"
-server_port = 22
-server_host = "sequencer.example.org"
-
-[nanopore]
-source = "/data/nanopore"
-
-[nanopore.basecalled]
-prefix = "ONT_WGS_"
-landing_zone = "/var/lib/sequencer/landing-zone-core"
-completion_file_glob = "report*.html"
-
-[nanopore.alldata]
-prefix = "ONT_"
-landing_zone = "/var/lib/sequencer/landing-zone-other"
-completion_file_glob = "report*.html"
-
-[nextseq]
-source = "/data/nextseq"
-regex = "^\\d{6}_"
-landing_zone = "/var/lib/sequencer/landing-zone"
-completion_file_glob = "PrimaryAnalysisMetrics/PrimaryAnalysisMetrics.csv"
-"#,
-        )
-        .expect_err("config with both platforms should fail");
-
-        assert!(matches!(error, ConfigError::MultiplePlatformSections));
-    }
-
-    #[test]
-    fn rejects_duplicate_nanopore_prefixes() {
-        let error = Config::from_toml_str(
-            r#"
-flockdir = "/var/lib/sequencer/flock"
-server_user = "sequencer-sync"
-server_port = 22
-server_host = "sequencer.example.org"
-
-[nanopore]
-source = "/data/nanopore"
-
-[nanopore.basecalled]
-prefix = "ONT_"
-landing_zone = "/var/lib/sequencer/landing-zone-core"
-completion_file_glob = "report*.html"
-
-[nanopore.alldata]
-prefix = "ONT_"
-landing_zone = "/var/lib/sequencer/landing-zone-other"
-completion_file_glob = "report*.html"
-"#,
-        )
-        .expect_err("duplicate prefixes should fail");
-
-        assert!(matches!(error, ConfigError::DuplicatePrefix { .. }));
+        assert!(matches!(error, ConfigError::NoCategoriesConfigured));
     }
 
     #[test]
@@ -536,9 +317,9 @@ flockdir = "/var/lib/sequencer/flock"
 server_user = "sequencer-sync"
 server_port = 22
 server_host = "sequencer.example.org"
-
-[nextseq]
 source = "relative/data"
+
+[[category]]
 regex = "^\\d{6}_"
 landing_zone = "/var/lib/sequencer/landing-zone"
 completion_file_glob = "PrimaryAnalysisMetrics/PrimaryAnalysisMetrics.csv"
@@ -549,7 +330,7 @@ completion_file_glob = "PrimaryAnalysisMetrics/PrimaryAnalysisMetrics.csv"
         assert!(matches!(
             error,
             ConfigError::PathNotAbsolute {
-                field: "nextseq.source",
+                field: "source",
                 ..
             }
         ));
@@ -563,9 +344,9 @@ flockdir = "/var/lib/sequencer/flock"
 server_user = "   "
 server_port = 22
 server_host = "sequencer.example.org"
+source = "/data/sequencer"
 
-[nextseq]
-source = "/data/nextseq"
+[[category]]
 regex = "^\\d{6}_"
 landing_zone = "/var/lib/sequencer/landing-zone"
 completion_file_glob = "PrimaryAnalysisMetrics/PrimaryAnalysisMetrics.csv"
@@ -582,84 +363,108 @@ completion_file_glob = "PrimaryAnalysisMetrics/PrimaryAnalysisMetrics.csv"
     }
 
     #[test]
-    fn classify_matches_longest_prefix_first() {
-        let config = NanoporeConfig {
-            source: PathBuf::from("/data/nanopore"),
-            categories: [
-                super::NanoporeCategory {
-                    prefix: "ONT_WGS_".to_string(),
-                    landing_zone: PathBuf::from("/landing/core"),
-                    exclude: vec![],
-                    completion_file_glob: Pattern::new("report*.html").unwrap(),
-                },
-                super::NanoporeCategory {
-                    prefix: "ONT_".to_string(),
-                    landing_zone: PathBuf::from("/landing/other"),
-                    exclude: vec![],
-                    completion_file_glob: Pattern::new("report*.html").unwrap(),
-                },
-            ],
-        };
-
-        let cat = config
-            .classify("ONT_WGS_run1")
-            .expect("should match basecalled");
-        assert_eq!(cat.prefix, "ONT_WGS_");
-
-        let cat = config
-            .classify("ONT_raw_run2")
-            .expect("should match alldata");
-        assert_eq!(cat.prefix, "ONT_");
-    }
-
-    #[test]
-    fn classify_returns_none_for_unmatched() {
-        let config = NanoporeConfig {
-            source: PathBuf::from("/data/nanopore"),
-            categories: [
-                super::NanoporeCategory {
-                    prefix: "ONT_WGS_".to_string(),
-                    landing_zone: PathBuf::from("/landing/core"),
-                    exclude: vec![],
-                    completion_file_glob: Pattern::new("report*.html").unwrap(),
-                },
-                super::NanoporeCategory {
-                    prefix: "ONT_".to_string(),
-                    landing_zone: PathBuf::from("/landing/other"),
-                    exclude: vec![],
-                    completion_file_glob: Pattern::new("report*.html").unwrap(),
-                },
-            ],
-        };
-
-        assert!(config.classify("ILLUMINA_run1").is_none());
-    }
-
-    #[test]
-    fn rejects_empty_nanopore_prefix() {
-        let error = Config::from_toml_str(
+    fn classify_matches_first_regex() {
+        let config = Config::from_toml_str(
             r#"
 flockdir = "/var/lib/sequencer/flock"
 server_user = "sequencer-sync"
 server_port = 22
 server_host = "sequencer.example.org"
-
-[nanopore]
 source = "/data/nanopore"
 
-[nanopore.basecalled]
-prefix = ""
-landing_zone = "/var/lib/sequencer/landing-zone-core"
+[[category]]
+regex = "^ONT_WGS_"
+landing_zone = "/landing/core"
 completion_file_glob = "report*.html"
 
-[nanopore.alldata]
-prefix = "ONT_"
-landing_zone = "/var/lib/sequencer/landing-zone-other"
+[[category]]
+regex = "^ONT_"
+landing_zone = "/landing/other"
 completion_file_glob = "report*.html"
 "#,
         )
-        .expect_err("empty prefix should fail");
+        .unwrap();
 
-        assert!(matches!(error, ConfigError::EmptyField { .. }));
+        // ONT_WGS_ matches first category
+        let matched = config
+            .categories
+            .iter()
+            .find(|c| c.regex.is_match("ONT_WGS_run1"));
+        assert_eq!(
+            matched.unwrap().landing_zone,
+            PathBuf::from("/landing/core")
+        );
+
+        // ONT_raw_ matches second category (first doesn't match)
+        let matched = config
+            .categories
+            .iter()
+            .find(|c| c.regex.is_match("ONT_raw_run2"));
+        assert_eq!(
+            matched.unwrap().landing_zone,
+            PathBuf::from("/landing/other")
+        );
+    }
+
+    #[test]
+    fn classify_first_match_wins() {
+        let config = Config::from_toml_str(
+            r#"
+flockdir = "/var/lib/sequencer/flock"
+server_user = "sequencer-sync"
+server_port = 22
+server_host = "sequencer.example.org"
+source = "/data/nanopore"
+
+[[category]]
+regex = "^ONT_WGS_"
+landing_zone = "/landing/core"
+completion_file_glob = "report*.html"
+
+[[category]]
+regex = "^ONT_"
+landing_zone = "/landing/other"
+completion_file_glob = "report*.html"
+"#,
+        )
+        .unwrap();
+
+        // ONT_WGS_run1 matches both regexes but first-match wins
+        let matched = config
+            .categories
+            .iter()
+            .find(|c| c.regex.is_match("ONT_WGS_run1"))
+            .unwrap();
+        assert_eq!(matched.landing_zone, PathBuf::from("/landing/core"));
+    }
+
+    #[test]
+    fn classify_returns_none_for_unmatched() {
+        let config = Config::from_toml_str(
+            r#"
+flockdir = "/var/lib/sequencer/flock"
+server_user = "sequencer-sync"
+server_port = 22
+server_host = "sequencer.example.org"
+source = "/data/nanopore"
+
+[[category]]
+regex = "^ONT_WGS_"
+landing_zone = "/landing/core"
+completion_file_glob = "report*.html"
+
+[[category]]
+regex = "^ONT_"
+landing_zone = "/landing/other"
+completion_file_glob = "report*.html"
+"#,
+        )
+        .unwrap();
+
+        let matched = config
+            .categories
+            .iter()
+            .find(|c| c.regex.is_match("ILLUMINA_run1"));
+        assert!(matched.is_none());
     }
 }

@@ -45,18 +45,16 @@ impl TestFixture {
 server_user = "test"
 server_port = 22
 server_host = "localhost"
-
-[nanopore]
 source = "{source}"
 
-[nanopore.basecalled]
-prefix = "ONT_WGS_"
+[[category]]
+regex = "^ONT_WGS_"
 landing_zone = "{landing_core}"
 exclude = []
 completion_file_glob = "report*.html"
 
-[nanopore.alldata]
-prefix = "ONT_"
+[[category]]
+regex = "^ONT_"
 landing_zone = "{landing_other}"
 exclude = []
 completion_file_glob = "report*.html"
@@ -77,9 +75,9 @@ completion_file_glob = "report*.html"
 server_user = "test"
 server_port = 22
 server_host = "localhost"
-
-[nextseq]
 source = "{source}"
+
+[[category]]
 regex = "^\\d{{6}}_"
 landing_zone = "{landing}"
 exclude = []
@@ -196,7 +194,6 @@ fn run_fails_missing_flockdir() {
     cmd()
         .args(["run", "--config-path"])
         .arg(&config_path)
-        .args(["--platform", "nanopore"])
         .assert()
         .failure();
 }
@@ -214,18 +211,16 @@ fn run_fails_nonexistent_landing_zone() {
 server_user = "test"
 server_port = 22
 server_host = "localhost"
-
-[nanopore]
 source = "{source}"
 
-[nanopore.basecalled]
-prefix = "ONT_WGS_"
+[[category]]
+regex = "^ONT_WGS_"
 landing_zone = "{landing_core}"
 exclude = []
 completion_file_glob = "report*.html"
 
-[nanopore.alldata]
-prefix = "ONT_"
+[[category]]
+regex = "^ONT_"
 landing_zone = "{root}/no-such-parent/nanopore-landing-other"
 exclude = []
 completion_file_glob = "report*.html"
@@ -241,7 +236,6 @@ completion_file_glob = "report*.html"
     cmd()
         .args(["run", "--config-path"])
         .arg(&config_path)
-        .args(["--platform", "nanopore"])
         .assert()
         .failure();
 }
@@ -254,7 +248,6 @@ fn nanopore_transfers_complete_runs() {
     cmd()
         .args(["run", "--config-path"])
         .arg(&config_path)
-        .args(["--platform", "nanopore"])
         .assert()
         .success();
 
@@ -303,7 +296,6 @@ fn nextseq_skips_incomplete_runs() {
     cmd()
         .args(["run", "--config-path"])
         .arg(&config_path)
-        .args(["--platform", "nextseq"])
         .assert()
         .success();
 
@@ -336,7 +328,7 @@ fn nextseq_ignore_incomplete_transfers_all() {
     cmd()
         .args(["run", "--config-path"])
         .arg(&config_path)
-        .args(["--platform", "nextseq", "--ignore-incomplete"])
+        .args(["--ignore-incomplete"])
         .assert()
         .success();
 
@@ -364,7 +356,6 @@ fn second_run_is_noop() {
     cmd()
         .args(["run", "--config-path"])
         .arg(&config_path)
-        .args(["--platform", "nanopore"])
         .assert()
         .success();
 
@@ -376,7 +367,6 @@ fn second_run_is_noop() {
     cmd()
         .args(["run", "--config-path"])
         .arg(&config_path)
-        .args(["--platform", "nanopore"])
         .assert()
         .success();
 
@@ -406,7 +396,6 @@ fn retry_failed() {
     cmd()
         .args(["run", "--config-path"])
         .arg(&config_path)
-        .args(["--platform", "nextseq"])
         .assert()
         .success();
 
@@ -422,7 +411,7 @@ fn retry_failed() {
     cmd()
         .args(["run", "--config-path"])
         .arg(&config_path)
-        .args(["--platform", "nextseq", "--retry-failed"])
+        .args(["--retry-failed"])
         .assert()
         .success();
 
@@ -450,7 +439,7 @@ fn setup_with_skip_ssh_check() {
     cmd()
         .args(["setup", "--config-path"])
         .arg(&config_path)
-        .args(["--platform", "nanopore", "--skip-ssh-check"])
+        .args(["--skip-ssh-check"])
         .assert()
         .success();
 
@@ -466,7 +455,7 @@ fn dry_run_prints_plan_without_copying() {
     let output = cmd()
         .args(["run", "--config-path"])
         .arg(&config_path)
-        .args(["--platform", "nanopore", "--dry-run"])
+        .args(["--dry-run"])
         .output()
         .unwrap();
 
@@ -504,18 +493,16 @@ fn dry_run_shows_exclude_patterns() {
 server_user = "test"
 server_port = 22
 server_host = "localhost"
-
-[nanopore]
 source = "{source}"
 
-[nanopore.basecalled]
-prefix = "ONT_WGS_"
+[[category]]
+regex = "^ONT_WGS_"
 landing_zone = "{landing_core}"
 exclude = ["*_skip", "pod5*"]
 completion_file_glob = "report*.html"
 
-[nanopore.alldata]
-prefix = "ONT_"
+[[category]]
+regex = "^ONT_"
 landing_zone = "{landing_other}"
 exclude = []
 completion_file_glob = "report*.html"
@@ -531,7 +518,7 @@ completion_file_glob = "report*.html"
     let output = cmd()
         .args(["run", "--config-path"])
         .arg(&config_path)
-        .args(["--platform", "nanopore", "--dry-run"])
+        .args(["--dry-run"])
         .output()
         .unwrap();
 
@@ -548,7 +535,7 @@ fn dry_run_respects_completion_check() {
     let output = cmd()
         .args(["run", "--config-path"])
         .arg(&config_path)
-        .args(["--platform", "nextseq", "--dry-run"])
+        .args(["--dry-run"])
         .output()
         .unwrap();
 
@@ -572,7 +559,7 @@ fn setup_fails_missing_source() {
     cmd()
         .args(["setup", "--config-path"])
         .arg(&config_path)
-        .args(["--platform", "nanopore", "--skip-ssh-check"])
+        .args(["--skip-ssh-check"])
         .assert()
         .failure();
 }
@@ -589,7 +576,7 @@ fn setup_fails_missing_landing_zone() {
     cmd()
         .args(["setup", "--config-path"])
         .arg(&config_path)
-        .args(["--platform", "nanopore", "--skip-ssh-check"])
+        .args(["--skip-ssh-check"])
         .assert()
         .failure();
 }
@@ -606,18 +593,16 @@ fn setup_fails_duplicate_landing_zones() {
 server_user = "test"
 server_port = 22
 server_host = "localhost"
-
-[nanopore]
 source = "{source}"
 
-[nanopore.basecalled]
-prefix = "ONT_WGS_"
+[[category]]
+regex = "^ONT_WGS_"
 landing_zone = "{landing}"
 exclude = []
 completion_file_glob = "report*.html"
 
-[nanopore.alldata]
-prefix = "ONT_"
+[[category]]
+regex = "^ONT_"
 landing_zone = "{landing}"
 exclude = []
 completion_file_glob = "report*.html"
@@ -632,7 +617,7 @@ completion_file_glob = "report*.html"
     cmd()
         .args(["setup", "--config-path"])
         .arg(&config_path)
-        .args(["--platform", "nanopore", "--skip-ssh-check"])
+        .args(["--skip-ssh-check"])
         .assert()
         .failure();
 }
@@ -648,9 +633,9 @@ fn setup_fails_landing_zone_equals_flockdir() {
 server_user = "test"
 server_port = 22
 server_host = "localhost"
-
-[nextseq]
 source = "{source}"
+
+[[category]]
 regex = "^\\d{{6}}_"
 landing_zone = "{shared}"
 exclude = []
@@ -665,7 +650,7 @@ completion_file_glob = "PrimaryAnalysisMetrics/PrimaryAnalysisMetrics.csv"
     cmd()
         .args(["setup", "--config-path"])
         .arg(&config_path)
-        .args(["--platform", "nextseq", "--skip-ssh-check"])
+        .args(["--skip-ssh-check"])
         .assert()
         .failure();
 }

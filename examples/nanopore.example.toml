@@ -2,18 +2,16 @@ flockdir = "/var/lib/sequencer/flock"
 server_user = "sequencer-sync"
 server_port = 22
 server_host = "sequencer.example.org"
-
-[nanopore]
 source = "/data/nanopore"
 
-[nanopore.basecalled]
-prefix = "ONT_WGS_"
+[[category]]
+regex = "^ONT_WGS_"
 landing_zone = "/var/lib/sequencer/landing-zone-core"
 exclude = ["*_skip", "pod5*"]
 completion_file_glob = "report*.html"
 
-[nanopore.alldata]
-prefix = "ONT_"
+[[category]]
+regex = "^ONT_"
 landing_zone = "/var/lib/sequencer/landing-zone-other"
 exclude = ["*_skip", "pod5*"]
 completion_file_glob = "report*.html"

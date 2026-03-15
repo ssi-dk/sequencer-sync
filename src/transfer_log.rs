@@ -9,6 +9,8 @@ use thiserror::Error;
 
 const TRANSFER_LOG_FILE_NAME: &str = "transferred-directories.jsonl";
 
+// Machine readable log in JSONL format. Authorative source of which directories
+// have been previosly copied and whether the copy was successful
 pub struct TransferLog {
     path: PathBuf,
     /// Maps directory key to whether the transfer succeeded.

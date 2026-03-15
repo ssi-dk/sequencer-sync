@@ -2,9 +2,9 @@ flockdir = "/var/lib/sequencer/flock"
 server_user = "sequencer-sync"
 server_port = 22
 server_host = "sequencer.example.org"
-
-[nextseq]
 source = "/data/nextseq"
+
+[[category]]
 regex = "^\\d{6}_"
 landing_zone = "/var/lib/sequencer/landing-zone"
 completion_file_glob = "PrimaryAnalysisMetrics/PrimaryAnalysisMetrics.csv"

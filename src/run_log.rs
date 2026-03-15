@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 
 use chrono::Local;
 
+// Human-readable log. Two files: Full log, and latest run which did something.
 pub struct RunLog {
     /// Absolute path to the append-only log that accumulates across all runs.
     full_log_path: PathBuf,
