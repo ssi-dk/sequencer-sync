@@ -15,4 +15,15 @@ This program is run regularly by a cron job.
 * Copy the cron file from the flockdir into ~/crontab.d
 * Launch cron with `cat ~/crontab.d | cron -`
 
-## Options
+## Behaviour
+When `sequencer-sync run` is invoked (typically by cron), it:
+
+* Loads and validates the config file
+* Acquires a file lock to prevent concurrent runs
+* Loads the transfer log (JSONL) which tracks previously transferred directories
+* Scans the source directory for subdirectories not yet in the transfer log
+* For each new directory, matches it against the configured categories by regex
+* Skips directories where the completion file glob doesn't match (i.e. the sequencing run is still in progress), unless `--ignore-incomplete` is set
+* Transfers matching directories to the category's landing zone via `rsync -a`, respecting exclude patterns found in config
+* Records success/failure in the transfer log; on success, writes a `transfer_successful.txt` marker in the transferred directory
+* Previously failed transfers can be retried with `--retry-failed`
