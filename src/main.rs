@@ -80,6 +80,7 @@ fn setup(args: SetupArgs) -> Result<(), AppError> {
 
     validate_environment(&config, args.skip_ssh_check)?;
     check_lock_is_available(&config.flockdir)?;
+    eprintln!("Setup successful!");
     let cron_path = write_cron_file(&config.flockdir, &config_path)?;
     eprintln!(
         "Install the generated cron job with your system cron configuration: {}",

@@ -1,0 +1,48 @@
+# Writeable directory where the file lock and log files are to be written
+flockdir = "/var/lib/sequencer/flock"
+
+# Check password-free access to ssh -p <port> <server_user>@<server_host>
+server_user = "sequencer-sync"
+server_port = 22
+server_host = "sequencer.example.org"
+
+# Search for subdirectories under the source for new sequencing runs.
+# Each run is assumed to be one directory.
+source = "/data/nanopore"
+
+# We might want to distinguish e.g. core facility run (copy only fastq)
+# versus project runs (copy also raw data).
+# These are distinct categories. Each sequencing run (directory) is
+# classified as a category based on whether its directory name matches
+# the regex. Categories are checked top from bottom; first match classifies.
+
+[[category]]
+
+# If directory matches this regex, the run is classified
+# as this category
+regex = "^ONT_WGS_"
+
+# Copy to this directory
+landing_zone = "/var/lib/sequencer/landing-zone-core"
+
+# Passed to rsync command with --exclude 
+exclude = ["*_skip", "pod5*"]
+
+# Only if a file matching this glob is present in the directory,
+# we consider the sequencing run complete. Incomplete runs are
+# skipped by default
+completion_file_glob = "report*.html"
+
+# If this is set to true (default false), then a directory name "240101_NB123"
+# is transferred into "<landing_zone>/2024/240101_NB123".
+# The "2024/" is "20" + the first two characters of the directory name,
+# If this is set, then the directory name MUST begin with two digits.
+# Ensure regex is set to only capture dir names with two leading digits.
+year_subdirectory = false
+
+
+[[category]]
+regex = "^ONT_"
+landing_zone = "/var/lib/sequencer/landing-zone-other"
+exclude = ["*_skip", "pod5*"]
+completion_file_glob = "report*.html"

@@ -252,12 +252,23 @@ mod tests {
 
     use super::{Config, ConfigError};
 
-    const NANOPORE_EXAMPLE: &str = include_str!("../examples/nanopore.example.toml");
-    const NEXTSEQ_EXAMPLE: &str = include_str!("../examples/nextseq.example.toml");
+    const EXAMPLE_CONFIG: &str = include_str!("../examples/config.toml");
+    const NEXTSEQ_EXAMPLE: &str = r#"
+flockdir = "/var/lib/sequencer/flock"
+server_user = "sequencer-sync"
+server_port = 22
+server_host = "sequencer.example.org"
+source = "/data/nextseq"
+
+[[category]]
+regex = "^\\d{6}_"
+landing_zone = "/var/lib/sequencer/landing-zone"
+completion_file_glob = "PrimaryAnalysisMetrics/PrimaryAnalysisMetrics.csv"
+"#;
 
     #[test]
-    fn parses_nanopore_example_config() {
-        let config = Config::from_toml_str(NANOPORE_EXAMPLE).expect("nanopore config should parse");
+    fn parses_example_config() {
+        let config = Config::from_toml_str(EXAMPLE_CONFIG).expect("nanopore config should parse");
 
         assert_eq!(config.flockdir, PathBuf::from("/var/lib/sequencer/flock"));
         assert_eq!(config.server_user, "sequencer-sync");
