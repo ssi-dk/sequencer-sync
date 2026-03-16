@@ -41,53 +41,52 @@ impl TestFixture {
 
     fn write_nanopore_config(&self) -> PathBuf {
         let config = format!(
-            r#"flockdir = "{flockdir}"
-server_user = "test"
-server_port = 22
-server_host = "localhost"
-source = "{source}"
+            r#"flockdir: "{flockdir}"
+server_user: "test"
+server_port: 22
+server_host: "localhost"
+source: "{source}"
 
-[[category]]
-regex = "^ONT_WGS_"
-landing_zone = "{landing_core}"
-exclude = []
-completion_file_glob = "report*.html"
+category:
+  - regex: "^ONT_WGS_"
+    landing_zone: "{landing_core}"
+    exclude: []
+    completion_file_glob: "report*.html"
 
-[[category]]
-regex = "^ONT_"
-landing_zone = "{landing_other}"
-exclude = []
-completion_file_glob = "report*.html"
+  - regex: "^ONT_"
+    landing_zone: "{landing_other}"
+    exclude: []
+    completion_file_glob: "report*.html"
 "#,
             flockdir = self.path("flockdir").display(),
             source = self.path("nanopore-source").display(),
             landing_core = self.path("nanopore-landing-core").display(),
             landing_other = self.path("nanopore-landing-other").display(),
         );
-        let path = self.path("nanopore.toml");
+        let path = self.path("nanopore.yaml");
         fs::write(&path, config).unwrap();
         path
     }
 
     fn write_nextseq_config(&self) -> PathBuf {
         let config = format!(
-            r#"flockdir = "{flockdir}"
-server_user = "test"
-server_port = 22
-server_host = "localhost"
-source = "{source}"
+            r#"flockdir: "{flockdir}"
+server_user: "test"
+server_port: 22
+server_host: "localhost"
+source: "{source}"
 
-[[category]]
-regex = "^\\d{{6}}_"
-landing_zone = "{landing}"
-exclude = []
-completion_file_glob = "PrimaryAnalysisMetrics/PrimaryAnalysisMetrics.csv"
+category:
+  - regex: "^\\d{{6}}_"
+    landing_zone: "{landing}"
+    exclude: []
+    completion_file_glob: "PrimaryAnalysisMetrics/PrimaryAnalysisMetrics.csv"
 "#,
             flockdir = self.path("flockdir").display(),
             source = self.path("nextseq-source").display(),
             landing = self.path("nextseq-landing").display(),
         );
-        let path = self.path("nextseq.toml");
+        let path = self.path("nextseq.yaml");
         fs::write(&path, config).unwrap();
         path
     }
@@ -207,30 +206,29 @@ fn run_fails_nonexistent_landing_zone() {
 
     // landing-other points to a nonexistent path — caught at config load time.
     let config = format!(
-        r#"flockdir = "{flockdir}"
-server_user = "test"
-server_port = 22
-server_host = "localhost"
-source = "{source}"
+        r#"flockdir: "{flockdir}"
+server_user: "test"
+server_port: 22
+server_host: "localhost"
+source: "{source}"
 
-[[category]]
-regex = "^ONT_WGS_"
-landing_zone = "{landing_core}"
-exclude = []
-completion_file_glob = "report*.html"
+category:
+  - regex: "^ONT_WGS_"
+    landing_zone: "{landing_core}"
+    exclude: []
+    completion_file_glob: "report*.html"
 
-[[category]]
-regex = "^ONT_"
-landing_zone = "{root}/no-such-parent/nanopore-landing-other"
-exclude = []
-completion_file_glob = "report*.html"
+  - regex: "^ONT_"
+    landing_zone: "{root}/no-such-parent/nanopore-landing-other"
+    exclude: []
+    completion_file_glob: "report*.html"
 "#,
         flockdir = fixture.path("flockdir").display(),
         source = fixture.path("nanopore-source").display(),
         landing_core = fixture.path("nanopore-landing-core").display(),
         root = fixture.root.display(),
     );
-    let config_path = fixture.path("nanopore.toml");
+    let config_path = fixture.path("nanopore.yaml");
     fs::write(&config_path, config).unwrap();
 
     cmd()
@@ -489,30 +487,29 @@ fn dry_run_shows_exclude_patterns() {
 
     // Config with exclude patterns
     let config = format!(
-        r#"flockdir = "{flockdir}"
-server_user = "test"
-server_port = 22
-server_host = "localhost"
-source = "{source}"
+        r#"flockdir: "{flockdir}"
+server_user: "test"
+server_port: 22
+server_host: "localhost"
+source: "{source}"
 
-[[category]]
-regex = "^ONT_WGS_"
-landing_zone = "{landing_core}"
-exclude = ["*_skip", "pod5*"]
-completion_file_glob = "report*.html"
+category:
+  - regex: "^ONT_WGS_"
+    landing_zone: "{landing_core}"
+    exclude: ["*_skip", "pod5*"]
+    completion_file_glob: "report*.html"
 
-[[category]]
-regex = "^ONT_"
-landing_zone = "{landing_other}"
-exclude = []
-completion_file_glob = "report*.html"
+  - regex: "^ONT_"
+    landing_zone: "{landing_other}"
+    exclude: []
+    completion_file_glob: "report*.html"
 "#,
         flockdir = fixture.path("flockdir").display(),
         source = fixture.path("nanopore-source").display(),
         landing_core = fixture.path("nanopore-landing-core").display(),
         landing_other = fixture.path("nanopore-landing-other").display(),
     );
-    let config_path = fixture.path("nanopore.toml");
+    let config_path = fixture.path("nanopore.yaml");
     fs::write(&config_path, config).unwrap();
 
     let output = cmd()
@@ -589,29 +586,28 @@ fn setup_fails_duplicate_landing_zones() {
     let shared_landing = fixture.mkdir("nanopore-landing-shared");
 
     let config = format!(
-        r#"flockdir = "{flockdir}"
-server_user = "test"
-server_port = 22
-server_host = "localhost"
-source = "{source}"
+        r#"flockdir: "{flockdir}"
+server_user: "test"
+server_port: 22
+server_host: "localhost"
+source: "{source}"
 
-[[category]]
-regex = "^ONT_WGS_"
-landing_zone = "{landing}"
-exclude = []
-completion_file_glob = "report*.html"
+category:
+  - regex: "^ONT_WGS_"
+    landing_zone: "{landing}"
+    exclude: []
+    completion_file_glob: "report*.html"
 
-[[category]]
-regex = "^ONT_"
-landing_zone = "{landing}"
-exclude = []
-completion_file_glob = "report*.html"
+  - regex: "^ONT_"
+    landing_zone: "{landing}"
+    exclude: []
+    completion_file_glob: "report*.html"
 "#,
         flockdir = fixture.path("flockdir").display(),
         source = fixture.path("nanopore-source").display(),
         landing = shared_landing.display(),
     );
-    let config_path = fixture.path("nanopore.toml");
+    let config_path = fixture.path("nanopore.yaml");
     fs::write(&config_path, config).unwrap();
 
     cmd()
@@ -629,22 +625,22 @@ fn setup_fails_landing_zone_equals_flockdir() {
     fixture.mkdir("nextseq-source");
 
     let config = format!(
-        r#"flockdir = "{shared}"
-server_user = "test"
-server_port = 22
-server_host = "localhost"
-source = "{source}"
+        r#"flockdir: "{shared}"
+server_user: "test"
+server_port: 22
+server_host: "localhost"
+source: "{source}"
 
-[[category]]
-regex = "^\\d{{6}}_"
-landing_zone = "{shared}"
-exclude = []
-completion_file_glob = "PrimaryAnalysisMetrics/PrimaryAnalysisMetrics.csv"
+category:
+  - regex: "^\\d{{6}}_"
+    landing_zone: "{shared}"
+    exclude: []
+    completion_file_glob: "PrimaryAnalysisMetrics/PrimaryAnalysisMetrics.csv"
 "#,
         shared = shared.display(),
         source = fixture.path("nextseq-source").display(),
     );
-    let config_path = fixture.path("nextseq.toml");
+    let config_path = fixture.path("nextseq.yaml");
     fs::write(&config_path, config).unwrap();
 
     cmd()

@@ -604,11 +604,11 @@ mod tests {
 
     #[test]
     fn renders_cron_file() {
-        let block = render_cron_file(Path::new("/etc/sequencer-sync/config.toml"));
+        let block = render_cron_file(Path::new("/etc/sequencer-sync/config.yaml"));
 
         assert!(block.contains("# Install this file into cron manually."));
         assert!(block.contains(
-            "*/15 * * * * sequencer-sync run --config-path '/etc/sequencer-sync/config.toml'"
+            "*/15 * * * * sequencer-sync run --config-path '/etc/sequencer-sync/config.yaml'"
         ));
         assert!(!block.contains("--platform"));
     }

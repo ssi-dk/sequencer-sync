@@ -5,7 +5,7 @@ This program is run regularly by a cron job.
 
 ## Installation
 * Compile the code to the target platform (likely x86_64-unknown-linux-gnu)
-* Copy the binary and `examples/config.toml` to the sequencer
+* Copy the binary and `examples/config.yaml` to the sequencer
 * Update all fields in the config to the correct values
 * Ensure:
     - Source directory exists and is readable

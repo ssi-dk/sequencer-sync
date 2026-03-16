@@ -64,8 +64,8 @@ pub enum ConfigError {
         #[source]
         source: std::io::Error,
     },
-    #[error("failed to parse TOML config: {0}")]
-    Parse(toml::de::Error),
+    #[error("failed to parse YAML config: {0}")]
+    Parse(serde_yaml::Error),
     #[error("config field `{field}` must not be empty")]
     EmptyField { field: &'static str },
     #[error("config field `{field}` must not be 0")]
@@ -111,14 +111,15 @@ impl Config {
             source,
         })?;
 
-        let mut config = Self::from_toml_str(&contents)?;
+        let mut config = Self::from_yaml_str(&contents)?;
         config.canonicalize_paths()?;
         Ok(config)
     }
 
     // Note: This doesn't canonicalize paths!
-    fn from_toml_str(contents: &str) -> Result<Self, ConfigError> {
-        let config: UnvalidatedConfig = toml::from_str(contents).map_err(ConfigError::Parse)?;
+    fn from_yaml_str(contents: &str) -> Result<Self, ConfigError> {
+        let config: UnvalidatedConfig =
+            serde_yaml::from_str(contents).map_err(ConfigError::Parse)?;
         config.validate()
     }
 
@@ -252,23 +253,23 @@ mod tests {
 
     use super::{Config, ConfigError};
 
-    const EXAMPLE_CONFIG: &str = include_str!("../examples/config.toml");
+    const EXAMPLE_CONFIG: &str = include_str!("../examples/config.yaml");
     const NEXTSEQ_EXAMPLE: &str = r#"
-flockdir = "/var/lib/sequencer/flock"
-server_user = "sequencer-sync"
-server_port = 22
-server_host = "sequencer.example.org"
-source = "/data/nextseq"
+flockdir: "/var/lib/sequencer/flock"
+server_user: "sequencer-sync"
+server_port: 22
+server_host: "sequencer.example.org"
+source: "/data/nextseq"
 
-[[category]]
-regex = "^\\d{6}_"
-landing_zone = "/var/lib/sequencer/landing-zone"
-completion_file_glob = "PrimaryAnalysisMetrics/PrimaryAnalysisMetrics.csv"
+category:
+  - regex: "^\\d{6}_"
+    landing_zone: "/var/lib/sequencer/landing-zone"
+    completion_file_glob: "PrimaryAnalysisMetrics/PrimaryAnalysisMetrics.csv"
 "#;
 
     #[test]
     fn parses_example_config() {
-        let config = Config::from_toml_str(EXAMPLE_CONFIG).expect("nanopore config should parse");
+        let config = Config::from_yaml_str(EXAMPLE_CONFIG).expect("nanopore config should parse");
 
         assert_eq!(config.flockdir, PathBuf::from("/var/lib/sequencer/flock"));
         assert_eq!(config.server_user, "sequencer-sync");
@@ -292,7 +293,7 @@ completion_file_glob = "PrimaryAnalysisMetrics/PrimaryAnalysisMetrics.csv"
 
     #[test]
     fn parses_nextseq_example_config() {
-        let config = Config::from_toml_str(NEXTSEQ_EXAMPLE).expect("nextseq config should parse");
+        let config = Config::from_yaml_str(NEXTSEQ_EXAMPLE).expect("nextseq config should parse");
 
         assert_eq!(config.flockdir, PathBuf::from("/var/lib/sequencer/flock"));
         assert_eq!(config.source, PathBuf::from("/data/nextseq"));
@@ -306,13 +307,13 @@ completion_file_glob = "PrimaryAnalysisMetrics/PrimaryAnalysisMetrics.csv"
 
     #[test]
     fn rejects_config_with_no_categories() {
-        let error = Config::from_toml_str(
+        let error = Config::from_yaml_str(
             r#"
-flockdir = "/var/lib/sequencer/flock"
-server_user = "sequencer-sync"
-server_port = 22
-server_host = "sequencer.example.org"
-source = "/data/sequencer"
+flockdir: "/var/lib/sequencer/flock"
+server_user: "sequencer-sync"
+server_port: 22
+server_host: "sequencer.example.org"
+source: "/data/sequencer"
 "#,
         )
         .expect_err("config with no categories should fail");
@@ -322,18 +323,18 @@ source = "/data/sequencer"
 
     #[test]
     fn rejects_relative_source_path() {
-        let error = Config::from_toml_str(
+        let error = Config::from_yaml_str(
             r#"
-flockdir = "/var/lib/sequencer/flock"
-server_user = "sequencer-sync"
-server_port = 22
-server_host = "sequencer.example.org"
-source = "relative/data"
+flockdir: "/var/lib/sequencer/flock"
+server_user: "sequencer-sync"
+server_port: 22
+server_host: "sequencer.example.org"
+source: "relative/data"
 
-[[category]]
-regex = "^\\d{6}_"
-landing_zone = "/var/lib/sequencer/landing-zone"
-completion_file_glob = "PrimaryAnalysisMetrics/PrimaryAnalysisMetrics.csv"
+category:
+  - regex: "^\\d{6}_"
+    landing_zone: "/var/lib/sequencer/landing-zone"
+    completion_file_glob: "PrimaryAnalysisMetrics/PrimaryAnalysisMetrics.csv"
 "#,
         )
         .expect_err("relative source path should fail validation");
@@ -349,18 +350,18 @@ completion_file_glob = "PrimaryAnalysisMetrics/PrimaryAnalysisMetrics.csv"
 
     #[test]
     fn rejects_empty_server_user() {
-        let error = Config::from_toml_str(
+        let error = Config::from_yaml_str(
             r#"
-flockdir = "/var/lib/sequencer/flock"
-server_user = "   "
-server_port = 22
-server_host = "sequencer.example.org"
-source = "/data/sequencer"
+flockdir: "/var/lib/sequencer/flock"
+server_user: "   "
+server_port: 22
+server_host: "sequencer.example.org"
+source: "/data/sequencer"
 
-[[category]]
-regex = "^\\d{6}_"
-landing_zone = "/var/lib/sequencer/landing-zone"
-completion_file_glob = "PrimaryAnalysisMetrics/PrimaryAnalysisMetrics.csv"
+category:
+  - regex: "^\\d{6}_"
+    landing_zone: "/var/lib/sequencer/landing-zone"
+    completion_file_glob: "PrimaryAnalysisMetrics/PrimaryAnalysisMetrics.csv"
 "#,
         )
         .expect_err("empty server_user should fail validation");
@@ -375,23 +376,22 @@ completion_file_glob = "PrimaryAnalysisMetrics/PrimaryAnalysisMetrics.csv"
 
     #[test]
     fn classify_matches_first_regex() {
-        let config = Config::from_toml_str(
+        let config = Config::from_yaml_str(
             r#"
-flockdir = "/var/lib/sequencer/flock"
-server_user = "sequencer-sync"
-server_port = 22
-server_host = "sequencer.example.org"
-source = "/data/nanopore"
+flockdir: "/var/lib/sequencer/flock"
+server_user: "sequencer-sync"
+server_port: 22
+server_host: "sequencer.example.org"
+source: "/data/nanopore"
 
-[[category]]
-regex = "^ONT_WGS_"
-landing_zone = "/landing/core"
-completion_file_glob = "report*.html"
+category:
+  - regex: "^ONT_WGS_"
+    landing_zone: "/landing/core"
+    completion_file_glob: "report*.html"
 
-[[category]]
-regex = "^ONT_"
-landing_zone = "/landing/other"
-completion_file_glob = "report*.html"
+  - regex: "^ONT_"
+    landing_zone: "/landing/other"
+    completion_file_glob: "report*.html"
 "#,
         )
         .unwrap();
@@ -419,23 +419,22 @@ completion_file_glob = "report*.html"
 
     #[test]
     fn classify_first_match_wins() {
-        let config = Config::from_toml_str(
+        let config = Config::from_yaml_str(
             r#"
-flockdir = "/var/lib/sequencer/flock"
-server_user = "sequencer-sync"
-server_port = 22
-server_host = "sequencer.example.org"
-source = "/data/nanopore"
+flockdir: "/var/lib/sequencer/flock"
+server_user: "sequencer-sync"
+server_port: 22
+server_host: "sequencer.example.org"
+source: "/data/nanopore"
 
-[[category]]
-regex = "^ONT_WGS_"
-landing_zone = "/landing/core"
-completion_file_glob = "report*.html"
+category:
+  - regex: "^ONT_WGS_"
+    landing_zone: "/landing/core"
+    completion_file_glob: "report*.html"
 
-[[category]]
-regex = "^ONT_"
-landing_zone = "/landing/other"
-completion_file_glob = "report*.html"
+  - regex: "^ONT_"
+    landing_zone: "/landing/other"
+    completion_file_glob: "report*.html"
 "#,
         )
         .unwrap();
@@ -451,23 +450,22 @@ completion_file_glob = "report*.html"
 
     #[test]
     fn classify_returns_none_for_unmatched() {
-        let config = Config::from_toml_str(
+        let config = Config::from_yaml_str(
             r#"
-flockdir = "/var/lib/sequencer/flock"
-server_user = "sequencer-sync"
-server_port = 22
-server_host = "sequencer.example.org"
-source = "/data/nanopore"
+flockdir: "/var/lib/sequencer/flock"
+server_user: "sequencer-sync"
+server_port: 22
+server_host: "sequencer.example.org"
+source: "/data/nanopore"
 
-[[category]]
-regex = "^ONT_WGS_"
-landing_zone = "/landing/core"
-completion_file_glob = "report*.html"
+category:
+  - regex: "^ONT_WGS_"
+    landing_zone: "/landing/core"
+    completion_file_glob: "report*.html"
 
-[[category]]
-regex = "^ONT_"
-landing_zone = "/landing/other"
-completion_file_glob = "report*.html"
+  - regex: "^ONT_"
+    landing_zone: "/landing/other"
+    completion_file_glob: "report*.html"
 "#,
         )
         .unwrap();
