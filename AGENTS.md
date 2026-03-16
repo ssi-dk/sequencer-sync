@@ -2,10 +2,10 @@
 This file provides guidelines for agents working with this codebase.
 
 This is a Rust binary with a CLI interface which runs on DNA sequencer machines, and which is responsible for copying files from sequencing runs.
-It copies a subset of files from the "data dir", where files from complete sequencing runs are found, to a "landing zone", a separate directory on the same computer.
+It copies a subset of files from the "source" directory, where files from complete sequencing runs are found, to a "landing zone", a separate directory on the same computer.
 A separate program then copies from the landing zone onto a remote server.
 
-The program has two subcommands:
+Subcommands:
 
 * `sequencer-sync setup`:
 	- Validates config file (paths must exist, no duplicates after canonicalization)
@@ -14,11 +14,11 @@ The program has two subcommands:
 	- Generates a cron file for scheduling `run`. User must schedule
       the cron job to run `run` themselves.
   Setup should be idempotent.
-  Purpose is to set up new sequencer. Need only be run once if successful
+  Purpose is to set up new sequencer. Need only be run once every time software is updated, if successful.
 * `sequencer-sync run`:
     - Loads and validates config file
     - Loads the transfer log (JSONL) with previous transfers
-    - Checks for directories in data dir not in transfer log
+    - Checks for directories in source dir not in transfer log
     - Transfers those to landing zone using rsync
     - Records transfer in JSONL log (authoritative), then best-effort writes to
       the human-readable run log and transfer marker file
@@ -26,7 +26,7 @@ The program has two subcommands:
 
 ## Coding guidelines
 * Do not put yourself as git co-author
-* Run `cargo clippy` after each round of changes and address lints, then run `cargo fmt`
-* This program runs on a sequencer and so runtime crashes are inconvenient.
-  Make an extra effort to avoid runtime crashes, and lean on the type system
+* Run `cargo clippy` after each round of changes and address lints, then run `cargo fmt`.
+* This program runs on a sequencer and in the background so runtime crashes are inconvenient.
+  Make an extra effort to avoid possible but unlikely sources of errors, and lean on the type system
   to statically avoid bugs.

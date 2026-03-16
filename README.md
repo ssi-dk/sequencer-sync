@@ -27,3 +27,7 @@ When `sequencer-sync run` is invoked (typically by cron), it:
 * Transfers matching directories to the category's landing zone via `rsync -a`, respecting exclude patterns found in config
 * Records success/failure in the transfer log; on success, writes a `transfer_successful.txt` marker in the transferred directory
 * Previously failed transfers can be retried with `--retry-failed`
+
+## Misc information
+* The file lock is not necessarily held if the lock file exists. Instead, the lock is managed with
+  `flock()` system calls. Use the `flock` tool to check if the lock is held.
