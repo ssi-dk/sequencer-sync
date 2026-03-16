@@ -1,5 +1,8 @@
-# Writeable directory where the file lock and log files are to be written
+# Writeable directory for the file lock (prevents concurrent runs)
 flockdir: "/var/lib/sequencer/flock"
+
+# Writeable directory for log files (transfer log, run log, cron file)
+logdir: "/var/lib/sequencer/log"
 
 # Check password-free access to ssh -p <port> <server_user>@<server_host>
 server_user: "sequencer-sync"

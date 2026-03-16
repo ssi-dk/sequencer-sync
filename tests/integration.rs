@@ -42,6 +42,7 @@ impl TestFixture {
     fn write_nanopore_config(&self) -> PathBuf {
         let config = format!(
             r#"flockdir: "{flockdir}"
+logdir: "{logdir}"
 server_user: "test"
 server_port: 22
 server_host: "localhost"
@@ -59,6 +60,7 @@ category:
     completion_file_glob: "report*.html"
 "#,
             flockdir = self.path("flockdir").display(),
+            logdir = self.path("logdir").display(),
             source = self.path("nanopore-source").display(),
             landing_core = self.path("nanopore-landing-core").display(),
             landing_other = self.path("nanopore-landing-other").display(),
@@ -71,6 +73,7 @@ category:
     fn write_nextseq_config(&self) -> PathBuf {
         let config = format!(
             r#"flockdir: "{flockdir}"
+logdir: "{logdir}"
 server_user: "test"
 server_port: 22
 server_host: "localhost"
@@ -83,6 +86,7 @@ category:
     completion_file_glob: "PrimaryAnalysisMetrics/PrimaryAnalysisMetrics.csv"
 "#,
             flockdir = self.path("flockdir").display(),
+            logdir = self.path("logdir").display(),
             source = self.path("nextseq-source").display(),
             landing = self.path("nextseq-landing").display(),
         );
@@ -94,6 +98,7 @@ category:
     /// Set up directories for a nanopore test scenario.
     fn setup_nanopore(&self) -> PathBuf {
         self.mkdir("flockdir");
+        self.mkdir("logdir");
         self.mkdir("nanopore-source");
         self.mkdir("nanopore-landing-core");
         self.mkdir("nanopore-landing-other");
@@ -113,6 +118,7 @@ category:
     /// Set up directories for a nextseq test scenario.
     fn setup_nextseq(&self) -> PathBuf {
         self.mkdir("flockdir");
+        self.mkdir("logdir");
         self.mkdir("nextseq-source");
         self.mkdir("nextseq-landing");
 
@@ -144,7 +150,7 @@ fn cmd() -> Command {
 }
 
 fn transfer_log_path(fixture: &TestFixture) -> PathBuf {
-    fixture.path("flockdir/transferred-directories.jsonl")
+    fixture.path("logdir/transferred-directories.jsonl")
 }
 
 fn read_transfer_log(fixture: &TestFixture) -> String {
@@ -157,7 +163,7 @@ fn read_transfer_log(fixture: &TestFixture) -> String {
 }
 
 fn read_run_log(fixture: &TestFixture) -> String {
-    let path = fixture.path("flockdir/sequencer-sync.log");
+    let path = fixture.path("logdir/sequencer-sync.log");
     if path.exists() {
         fs::read_to_string(&path).unwrap()
     } else {
@@ -166,7 +172,7 @@ fn read_run_log(fixture: &TestFixture) -> String {
 }
 
 fn read_latest_log(fixture: &TestFixture) -> String {
-    let path = fixture.path("flockdir/sequencer-sync-latest.log");
+    let path = fixture.path("logdir/sequencer-sync-latest.log");
     if path.exists() {
         fs::read_to_string(&path).unwrap()
     } else {
@@ -185,6 +191,7 @@ fn transfer_log_line_count(fixture: &TestFixture) -> usize {
 fn run_fails_missing_flockdir() {
     let fixture = TestFixture::new("missing-flockdir");
     // Create source and landing zones but NOT flockdir
+    fixture.mkdir("logdir");
     fixture.mkdir("nanopore-source");
     fixture.mkdir("nanopore-landing-core");
     fixture.mkdir("nanopore-landing-other");
@@ -201,12 +208,14 @@ fn run_fails_missing_flockdir() {
 fn run_fails_nonexistent_landing_zone() {
     let fixture = TestFixture::new("nonexistent-landing");
     fixture.mkdir("flockdir");
+    fixture.mkdir("logdir");
     fixture.mkdir("nanopore-source");
     fixture.mkdir("nanopore-landing-core");
 
     // landing-other points to a nonexistent path — caught at config load time.
     let config = format!(
         r#"flockdir: "{flockdir}"
+logdir: "{logdir}"
 server_user: "test"
 server_port: 22
 server_host: "localhost"
@@ -224,6 +233,7 @@ category:
     completion_file_glob: "report*.html"
 "#,
         flockdir = fixture.path("flockdir").display(),
+        logdir = fixture.path("logdir").display(),
         source = fixture.path("nanopore-source").display(),
         landing_core = fixture.path("nanopore-landing-core").display(),
         root = fixture.root.display(),
@@ -442,7 +452,7 @@ fn setup_with_skip_ssh_check() {
         .success();
 
     // Cron file should be created
-    assert!(fixture.path("flockdir/sequencer-sync.cron").exists());
+    assert!(fixture.path("logdir/sequencer-sync.cron").exists());
 }
 
 #[test]
@@ -478,6 +488,7 @@ fn dry_run_prints_plan_without_copying() {
 fn dry_run_shows_exclude_patterns() {
     let fixture = TestFixture::new("dry-run-exclude");
     fixture.mkdir("flockdir");
+    fixture.mkdir("logdir");
     fixture.mkdir("nanopore-source");
     fixture.mkdir("nanopore-landing-core");
     fixture.mkdir("nanopore-landing-other");
@@ -488,6 +499,7 @@ fn dry_run_shows_exclude_patterns() {
     // Config with exclude patterns
     let config = format!(
         r#"flockdir: "{flockdir}"
+logdir: "{logdir}"
 server_user: "test"
 server_port: 22
 server_host: "localhost"
@@ -505,6 +517,7 @@ category:
     completion_file_glob: "report*.html"
 "#,
         flockdir = fixture.path("flockdir").display(),
+        logdir = fixture.path("logdir").display(),
         source = fixture.path("nanopore-source").display(),
         landing_core = fixture.path("nanopore-landing-core").display(),
         landing_other = fixture.path("nanopore-landing-other").display(),
@@ -548,6 +561,7 @@ fn dry_run_respects_completion_check() {
 fn setup_fails_missing_source() {
     let fixture = TestFixture::new("setup-no-source");
     fixture.mkdir("flockdir");
+    fixture.mkdir("logdir");
     // Do NOT create nanopore-source
     fixture.mkdir("nanopore-landing-core");
     fixture.mkdir("nanopore-landing-other");
@@ -565,6 +579,7 @@ fn setup_fails_missing_source() {
 fn setup_fails_missing_landing_zone() {
     let fixture = TestFixture::new("setup-no-landing");
     fixture.mkdir("flockdir");
+    fixture.mkdir("logdir");
     fixture.mkdir("nanopore-source");
     fixture.mkdir("nanopore-landing-core");
     // Do NOT create nanopore-landing-other
@@ -582,11 +597,13 @@ fn setup_fails_missing_landing_zone() {
 fn setup_fails_duplicate_landing_zones() {
     let fixture = TestFixture::new("setup-dup-landing");
     fixture.mkdir("flockdir");
+    fixture.mkdir("logdir");
     fixture.mkdir("nanopore-source");
     let shared_landing = fixture.mkdir("nanopore-landing-shared");
 
     let config = format!(
         r#"flockdir: "{flockdir}"
+logdir: "{logdir}"
 server_user: "test"
 server_port: 22
 server_host: "localhost"
@@ -604,6 +621,7 @@ category:
     completion_file_glob: "report*.html"
 "#,
         flockdir = fixture.path("flockdir").display(),
+        logdir = fixture.path("logdir").display(),
         source = fixture.path("nanopore-source").display(),
         landing = shared_landing.display(),
     );
@@ -622,10 +640,12 @@ category:
 fn setup_fails_landing_zone_equals_flockdir() {
     let fixture = TestFixture::new("setup-landing-is-flock");
     let shared = fixture.mkdir("shared");
+    fixture.mkdir("logdir");
     fixture.mkdir("nextseq-source");
 
     let config = format!(
         r#"flockdir: "{shared}"
+logdir: "{logdir}"
 server_user: "test"
 server_port: 22
 server_host: "localhost"
@@ -638,6 +658,7 @@ category:
     completion_file_glob: "PrimaryAnalysisMetrics/PrimaryAnalysisMetrics.csv"
 "#,
         shared = shared.display(),
+        logdir = fixture.path("logdir").display(),
         source = fixture.path("nextseq-source").display(),
     );
     let config_path = fixture.path("nextseq.yaml");

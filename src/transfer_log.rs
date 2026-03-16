@@ -81,8 +81,8 @@ fn default_succeeded() -> bool {
 }
 
 impl TransferLog {
-    pub fn load(flockdir: &Path) -> Result<Self, TransferLogError> {
-        let path = transfer_log_path(flockdir);
+    pub fn load(logdir: &Path) -> Result<Self, TransferLogError> {
+        let path = transfer_log_path(logdir);
         let file = match fs::File::open(&path) {
             Ok(file) => file,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -209,8 +209,8 @@ pub fn relative_directory_key(
         })
 }
 
-pub fn transfer_log_path(flockdir: &Path) -> PathBuf {
-    flockdir.join(TRANSFER_LOG_FILE_NAME)
+pub fn transfer_log_path(logdir: &Path) -> PathBuf {
+    logdir.join(TRANSFER_LOG_FILE_NAME)
 }
 
 #[cfg(test)]

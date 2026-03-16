@@ -8,8 +8,11 @@ use thiserror::Error;
 
 #[derive(Debug)]
 pub struct Config {
-    /// Canonicalized absolute path. Directory with log files and file lock.
+    /// Canonicalized absolute path. Directory for the file lock.
     pub flockdir: PathBuf,
+    /// Canonicalized absolute path. Directory for log files (transfer log, run
+    /// log, cron file).
+    pub logdir: PathBuf,
 
     // You must have ssh access to this server with this port, user name.
     pub server_user: String,
@@ -37,6 +40,7 @@ pub struct Category {
 #[derive(Debug, Deserialize)]
 struct UnvalidatedConfig {
     flockdir: PathBuf,
+    logdir: PathBuf,
     server_user: String,
     server_port: u16,
     server_host: String,
@@ -128,14 +132,18 @@ impl Config {
     /// directory.
     fn canonicalize_paths(&mut self) -> Result<(), ConfigError> {
         self.flockdir = canonicalize_field("flockdir", &self.flockdir)?;
+        self.logdir = canonicalize_field("logdir", &self.logdir)?;
         self.source = canonicalize_field("source", &self.source)?;
 
         for cat in &mut self.categories {
             cat.landing_zone = canonicalize_field("category.landing_zone", &cat.landing_zone)?;
         }
 
-        let mut paths: Vec<(&'static str, &Path)> =
-            vec![("source", &self.source), ("flockdir", &self.flockdir)];
+        let mut paths: Vec<(&'static str, &Path)> = vec![
+            ("source", &self.source),
+            ("flockdir", &self.flockdir),
+            ("logdir", &self.logdir),
+        ];
         for cat in &self.categories {
             paths.push(("category.landing_zone", &cat.landing_zone));
         }
@@ -156,6 +164,7 @@ fn canonicalize_field(field: &'static str, path: &Path) -> Result<PathBuf, Confi
 impl UnvalidatedConfig {
     fn validate(self) -> Result<Config, ConfigError> {
         validate_absolute_path("flockdir", &self.flockdir)?;
+        validate_absolute_path("logdir", &self.logdir)?;
         validate_non_empty("server_user", &self.server_user)?;
         validate_non_empty("server_host", &self.server_host)?;
 
@@ -178,6 +187,7 @@ impl UnvalidatedConfig {
 
         Ok(Config {
             flockdir: self.flockdir,
+            logdir: self.logdir,
             server_user: self.server_user,
             server_port: self.server_port,
             server_host: self.server_host,
@@ -256,6 +266,7 @@ mod tests {
     const EXAMPLE_CONFIG: &str = include_str!("../examples/config.yaml");
     const NEXTSEQ_EXAMPLE: &str = r#"
 flockdir: "/var/lib/sequencer/flock"
+logdir: "/var/lib/sequencer/log"
 server_user: "sequencer-sync"
 server_port: 22
 server_host: "sequencer.example.org"
@@ -272,6 +283,7 @@ category:
         let config = Config::from_yaml_str(EXAMPLE_CONFIG).expect("nanopore config should parse");
 
         assert_eq!(config.flockdir, PathBuf::from("/var/lib/sequencer/flock"));
+        assert_eq!(config.logdir, PathBuf::from("/var/lib/sequencer/log"));
         assert_eq!(config.server_user, "sequencer-sync");
         assert_eq!(config.server_port, 22);
         assert_eq!(config.server_host, "sequencer.example.org");
@@ -296,6 +308,7 @@ category:
         let config = Config::from_yaml_str(NEXTSEQ_EXAMPLE).expect("nextseq config should parse");
 
         assert_eq!(config.flockdir, PathBuf::from("/var/lib/sequencer/flock"));
+        assert_eq!(config.logdir, PathBuf::from("/var/lib/sequencer/log"));
         assert_eq!(config.source, PathBuf::from("/data/nextseq"));
         assert_eq!(config.categories.len(), 1);
         assert!(config.categories[0].regex.is_match("240101_"));
@@ -310,6 +323,7 @@ category:
         let error = Config::from_yaml_str(
             r#"
 flockdir: "/var/lib/sequencer/flock"
+logdir: "/var/lib/sequencer/log"
 server_user: "sequencer-sync"
 server_port: 22
 server_host: "sequencer.example.org"
@@ -326,6 +340,7 @@ source: "/data/sequencer"
         let error = Config::from_yaml_str(
             r#"
 flockdir: "/var/lib/sequencer/flock"
+logdir: "/var/lib/sequencer/log"
 server_user: "sequencer-sync"
 server_port: 22
 server_host: "sequencer.example.org"
@@ -353,6 +368,7 @@ category:
         let error = Config::from_yaml_str(
             r#"
 flockdir: "/var/lib/sequencer/flock"
+logdir: "/var/lib/sequencer/log"
 server_user: "   "
 server_port: 22
 server_host: "sequencer.example.org"
@@ -379,6 +395,7 @@ category:
         let config = Config::from_yaml_str(
             r#"
 flockdir: "/var/lib/sequencer/flock"
+logdir: "/var/lib/sequencer/log"
 server_user: "sequencer-sync"
 server_port: 22
 server_host: "sequencer.example.org"
@@ -422,6 +439,7 @@ category:
         let config = Config::from_yaml_str(
             r#"
 flockdir: "/var/lib/sequencer/flock"
+logdir: "/var/lib/sequencer/log"
 server_user: "sequencer-sync"
 server_port: 22
 server_host: "sequencer.example.org"
@@ -453,6 +471,7 @@ category:
         let config = Config::from_yaml_str(
             r#"
 flockdir: "/var/lib/sequencer/flock"
+logdir: "/var/lib/sequencer/log"
 server_user: "sequencer-sync"
 server_port: 22
 server_host: "sequencer.example.org"

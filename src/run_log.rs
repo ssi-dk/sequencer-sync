@@ -19,10 +19,10 @@ pub struct RunLog {
 }
 
 impl RunLog {
-    pub fn new(flockdir: &Path) -> Self {
+    pub fn new(logdir: &Path) -> Self {
         Self {
-            full_log_path: flockdir.join("sequencer-sync.log"),
-            latest_log_path: flockdir.join("sequencer-sync-latest.log"),
+            full_log_path: logdir.join("sequencer-sync.log"),
+            latest_log_path: logdir.join("sequencer-sync-latest.log"),
             latest_started: false,
             had_error: false,
         }

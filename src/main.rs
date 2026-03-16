@@ -81,7 +81,7 @@ fn setup(args: SetupArgs) -> Result<(), AppError> {
     validate_environment(&config, args.skip_ssh_check)?;
     check_lock_is_available(&config.flockdir)?;
     eprintln!("Setup successful!");
-    let cron_path = write_cron_file(&config.flockdir, &config_path)?;
+    let cron_path = write_cron_file(&config.logdir, &config_path)?;
     eprintln!(
         "Install the generated cron job with your system cron configuration: {}",
         cron_path.display()
@@ -110,8 +110,8 @@ fn run_command(args: RunArgs) -> Result<(), AppError> {
             return Ok(());
         }
     };
-    let mut transfer_log = TransferLog::load(&config.flockdir).map_err(AppError::TransferLog)?;
-    let mut run_log = RunLog::new(&config.flockdir);
+    let mut transfer_log = TransferLog::load(&config.logdir).map_err(AppError::TransferLog)?;
+    let mut run_log = RunLog::new(&config.logdir);
 
     transfer_new_directories(
         &config.source,
@@ -139,6 +139,7 @@ fn validate_environment(config: &Config, skip_ssh_check: bool) -> Result<(), App
         check_writable_directory(&cat.landing_zone, "category.landing_zone")?;
     }
     check_writable_directory(&config.flockdir, "flockdir")?;
+    check_writable_directory(&config.logdir, "logdir")?;
     Ok(())
 }
 
@@ -436,8 +437,8 @@ fn canonicalize_config_path(path: &Path) -> Result<PathBuf, AppError> {
     })
 }
 
-fn write_cron_file(flockdir: &Path, config_path: &Path) -> Result<PathBuf, AppError> {
-    let cron_path = cron_file_path(flockdir);
+fn write_cron_file(logdir: &Path, config_path: &Path) -> Result<PathBuf, AppError> {
+    let cron_path = cron_file_path(logdir);
     let contents = render_cron_file(config_path);
     fs::write(&cron_path, contents).map_err(|source| AppError::WriteCronFile {
         path: cron_path.clone(),
@@ -446,8 +447,8 @@ fn write_cron_file(flockdir: &Path, config_path: &Path) -> Result<PathBuf, AppEr
     Ok(cron_path)
 }
 
-fn cron_file_path(flockdir: &Path) -> PathBuf {
-    flockdir.join("sequencer-sync.cron")
+fn cron_file_path(logdir: &Path) -> PathBuf {
+    logdir.join("sequencer-sync.cron")
 }
 
 fn lock_file_path(flockdir: &Path) -> PathBuf {
@@ -630,12 +631,12 @@ mod tests {
     }
 
     #[test]
-    fn computes_cron_file_path_in_flockdir() {
-        let path = cron_file_path(Path::new("/var/lib/sequencer/flock"));
+    fn computes_cron_file_path_in_logdir() {
+        let path = cron_file_path(Path::new("/var/lib/sequencer/log"));
 
         assert_eq!(
             path,
-            Path::new("/var/lib/sequencer/flock/sequencer-sync.cron")
+            Path::new("/var/lib/sequencer/log/sequencer-sync.cron")
         );
     }
 
