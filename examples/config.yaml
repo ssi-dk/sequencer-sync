@@ -38,7 +38,7 @@ category:
     # Only if a file matching this glob is present in the directory,
     # we consider the sequencing run complete. Incomplete runs are
     # skipped by default
-    completion_file_glob: "report*.html"
+    completion_file_glob: "*/*/report*.html"
 
     # If this is set to true (default false), then a directory name "240101_NB123"
     # is transferred into "<landing_zone>/2024/240101_NB123".
@@ -52,4 +52,4 @@ category:
     exclude:
       - "*_skip"
       - "pod5*"
-    completion_file_glob: "report*.html"
+    completion_file_glob: "*/*/report*.html"
