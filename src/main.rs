@@ -6,7 +6,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use clap::{Args, Parser, Subcommand};
 use config::{Config, ConfigError};
-use fs2::FileExt;
 use run_log::RunLog;
 use thiserror::Error;
 use transfer_log::TransferLog;
@@ -464,29 +463,20 @@ fn render_cron_file(config_path: &Path) -> String {
 }
 
 fn check_lock_is_available(flockdir: &Path) -> Result<(), AppError> {
-    let _lock = acquire_run_lock(flockdir)?.ok_or_else(|| AppError::RunLockHeld {
-        path: lock_file_path(flockdir),
-    })?;
+    let path = lock_file_path(flockdir);
+    if path.exists() {
+        return Err(AppError::RunLockHeld { path });
+    }
     Ok(())
 }
 
 fn acquire_run_lock(flockdir: &Path) -> Result<Option<RunLock>, AppError> {
     let path = lock_file_path(flockdir);
-    let file = OpenOptions::new()
-        .create(true)
-        .read(true)
-        .write(true)
-        .truncate(false)
-        .open(&path)
-        .map_err(|source| AppError::OpenRunLockFile {
-            path: path.clone(),
-            source,
-        })?;
 
-    match file.try_lock_exclusive() {
-        Ok(()) => Ok(Some(RunLock { file })),
-        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
-        Err(source) => Err(AppError::AcquireRunLock { path, source }),
+    match OpenOptions::new().create_new(true).write(true).open(&path) {
+        Ok(_) => Ok(Some(RunLock { path })),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(None),
+        Err(source) => Err(AppError::CreateRunLockFile { path, source }),
     }
 }
 
@@ -499,12 +489,12 @@ fn shell_quote(value: &str) -> String {
 const LOCK_FILE_NAME: &str = "sequencer-sync.lock";
 
 struct RunLock {
-    file: File,
+    path: PathBuf,
 }
 
 impl Drop for RunLock {
     fn drop(&mut self) {
-        let _ = self.file.unlock();
+        let _ = fs::remove_file(&self.path);
     }
 }
 
@@ -570,14 +560,8 @@ enum AppError {
     },
     #[error(transparent)]
     TransferLog(#[from] transfer_log::TransferLogError),
-    #[error("failed to open run lock file {}: {source}", path.display())]
-    OpenRunLockFile {
-        path: PathBuf,
-        #[source]
-        source: std::io::Error,
-    },
-    #[error("failed to acquire run lock {}: {source}", path.display())]
-    AcquireRunLock {
+    #[error("failed to create run lock file {}: {source}", path.display())]
+    CreateRunLockFile {
         path: PathBuf,
         #[source]
         source: std::io::Error,
