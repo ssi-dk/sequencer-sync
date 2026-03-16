@@ -79,7 +79,7 @@ fn setup(args: SetupArgs) -> Result<(), AppError> {
     let config = load_config(&args.config_path)?;
 
     validate_environment(&config, args.skip_ssh_check)?;
-    check_lock_is_available(&config.flockdir)?;
+    check_lock_is_available(&config.flockdir, &config.lock_file_name)?;
     eprintln!("Setup successful!");
     let cron_path = write_cron_file(&config.logdir, &config_path)?;
     eprintln!(
@@ -103,7 +103,7 @@ struct TransferTarget {
 fn run_command(args: RunArgs) -> Result<(), AppError> {
     let config = load_config(&args.config_path)?;
 
-    let _lock = match acquire_run_lock(&config.flockdir)? {
+    let _lock = match acquire_run_lock(&config.flockdir, &config.lock_file_name)? {
         Some(lock) => lock,
         None => {
             eprintln!("Another sequencer-sync run is already in progress; exiting.");
@@ -451,8 +451,8 @@ fn cron_file_path(logdir: &Path) -> PathBuf {
     logdir.join("sequencer-sync.cron")
 }
 
-fn lock_file_path(flockdir: &Path) -> PathBuf {
-    flockdir.join(LOCK_FILE_NAME)
+fn lock_file_path(flockdir: &Path, lock_file_name: &str) -> PathBuf {
+    flockdir.join(lock_file_name)
 }
 
 fn render_cron_file(config_path: &Path) -> String {
@@ -464,15 +464,16 @@ fn render_cron_file(config_path: &Path) -> String {
     format!("# Install this file into cron manually.\n*/15 * * * * {command}\n")
 }
 
-fn check_lock_is_available(flockdir: &Path) -> Result<(), AppError> {
-    let _lock = acquire_run_lock(flockdir)?.ok_or_else(|| AppError::RunLockHeld {
-        path: lock_file_path(flockdir),
-    })?;
+fn check_lock_is_available(flockdir: &Path, lock_file_name: &str) -> Result<(), AppError> {
+    let _lock =
+        acquire_run_lock(flockdir, lock_file_name)?.ok_or_else(|| AppError::RunLockHeld {
+            path: lock_file_path(flockdir, lock_file_name),
+        })?;
     Ok(())
 }
 
-fn acquire_run_lock(flockdir: &Path) -> Result<Option<RunLock>, AppError> {
-    let path = lock_file_path(flockdir);
+fn acquire_run_lock(flockdir: &Path, lock_file_name: &str) -> Result<Option<RunLock>, AppError> {
+    let path = lock_file_path(flockdir, lock_file_name);
     let file = OpenOptions::new()
         .create(true)
         .read(true)
@@ -495,9 +496,6 @@ fn shell_quote(value: &str) -> String {
     let escaped = value.replace('\'', r#"'\''"#);
     format!("'{escaped}'")
 }
-
-// Ensure only one instance of this program runs at a time
-const LOCK_FILE_NAME: &str = "sequencer-sync.lock";
 
 struct RunLock {
     file: File,
@@ -617,7 +615,7 @@ enum AppError {
 mod tests {
     use std::path::Path;
 
-    use super::{LOCK_FILE_NAME, cron_file_path, lock_file_path, render_cron_file};
+    use super::{cron_file_path, lock_file_path, render_cron_file};
 
     #[test]
     fn renders_cron_file() {
@@ -642,11 +640,8 @@ mod tests {
 
     #[test]
     fn computes_lock_file_path_in_flockdir() {
-        let path = lock_file_path(Path::new("/var/lib/sequencer/flock"));
+        let path = lock_file_path(Path::new("/var/lib/sequencer/flock"), "my.lock");
 
-        assert_eq!(
-            path,
-            Path::new("/var/lib/sequencer/flock").join(LOCK_FILE_NAME)
-        );
+        assert_eq!(path, Path::new("/var/lib/sequencer/flock/my.lock"));
     }
 }

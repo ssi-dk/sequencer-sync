@@ -1,6 +1,9 @@
 # Writeable directory for the file lock (prevents concurrent runs)
 flockdir: "/var/lib/sequencer/flock"
 
+# Name of the lock file inside flockdir
+lock_file_name: "sequencer-sync.lock"
+
 # Writeable directory for log files (transfer log, run log, cron file)
 logdir: "/var/lib/sequencer/log"
 

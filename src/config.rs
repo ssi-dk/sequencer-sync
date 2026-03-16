@@ -10,6 +10,8 @@ use thiserror::Error;
 pub struct Config {
     /// Canonicalized absolute path. Directory for the file lock.
     pub flockdir: PathBuf,
+    /// Base name of the lock file inside `flockdir`.
+    pub lock_file_name: String,
     /// Canonicalized absolute path. Directory for log files (transfer log, run
     /// log, cron file).
     pub logdir: PathBuf,
@@ -40,6 +42,7 @@ pub struct Category {
 #[derive(Debug, Deserialize)]
 struct UnvalidatedConfig {
     flockdir: PathBuf,
+    lock_file_name: String,
     logdir: PathBuf,
     server_user: String,
     server_port: u16,
@@ -99,6 +102,10 @@ pub enum ConfigError {
         #[source]
         source: glob::PatternError,
     },
+    #[error(
+        "config field `{field}` must be a valid file base name (no slashes, not \".\" or \"..\"): {value:?}"
+    )]
+    InvalidBaseName { field: &'static str, value: String },
     #[error("failed to canonicalize `{field}` path {}: {source}", path.display())]
     CanonicalizePath {
         field: &'static str,
@@ -164,6 +171,7 @@ fn canonicalize_field(field: &'static str, path: &Path) -> Result<PathBuf, Confi
 impl UnvalidatedConfig {
     fn validate(self) -> Result<Config, ConfigError> {
         validate_absolute_path("flockdir", &self.flockdir)?;
+        validate_base_name("lock_file_name", &self.lock_file_name)?;
         validate_absolute_path("logdir", &self.logdir)?;
         validate_non_empty("server_user", &self.server_user)?;
         validate_non_empty("server_host", &self.server_host)?;
@@ -187,6 +195,7 @@ impl UnvalidatedConfig {
 
         Ok(Config {
             flockdir: self.flockdir,
+            lock_file_name: self.lock_file_name,
             logdir: self.logdir,
             server_user: self.server_user,
             server_port: self.server_port,
@@ -238,6 +247,17 @@ fn validate_non_empty(field: &'static str, value: &str) -> Result<(), ConfigErro
     }
 }
 
+fn validate_base_name(field: &'static str, value: &str) -> Result<(), ConfigError> {
+    if value.is_empty() || value.contains('/') || value == "." || value == ".." {
+        Err(ConfigError::InvalidBaseName {
+            field,
+            value: value.to_string(),
+        })
+    } else {
+        Ok(())
+    }
+}
+
 fn validate_glob(field: &'static str, pattern: &str) -> Result<Pattern, ConfigError> {
     Pattern::new(pattern).map_err(|source| ConfigError::InvalidGlob { field, source })
 }
@@ -266,6 +286,7 @@ mod tests {
     const EXAMPLE_CONFIG: &str = include_str!("../examples/config.yaml");
     const NEXTSEQ_EXAMPLE: &str = r#"
 flockdir: "/var/lib/sequencer/flock"
+lock_file_name: "sequencer-sync.lock"
 logdir: "/var/lib/sequencer/log"
 server_user: "sequencer-sync"
 server_port: 22
@@ -283,6 +304,7 @@ category:
         let config = Config::from_yaml_str(EXAMPLE_CONFIG).expect("nanopore config should parse");
 
         assert_eq!(config.flockdir, PathBuf::from("/var/lib/sequencer/flock"));
+        assert_eq!(config.lock_file_name, "sequencer-sync.lock");
         assert_eq!(config.logdir, PathBuf::from("/var/lib/sequencer/log"));
         assert_eq!(config.server_user, "sequencer-sync");
         assert_eq!(config.server_port, 22);
@@ -323,6 +345,7 @@ category:
         let error = Config::from_yaml_str(
             r#"
 flockdir: "/var/lib/sequencer/flock"
+lock_file_name: "sequencer-sync.lock"
 logdir: "/var/lib/sequencer/log"
 server_user: "sequencer-sync"
 server_port: 22
@@ -340,6 +363,7 @@ source: "/data/sequencer"
         let error = Config::from_yaml_str(
             r#"
 flockdir: "/var/lib/sequencer/flock"
+lock_file_name: "sequencer-sync.lock"
 logdir: "/var/lib/sequencer/log"
 server_user: "sequencer-sync"
 server_port: 22
@@ -368,6 +392,7 @@ category:
         let error = Config::from_yaml_str(
             r#"
 flockdir: "/var/lib/sequencer/flock"
+lock_file_name: "sequencer-sync.lock"
 logdir: "/var/lib/sequencer/log"
 server_user: "   "
 server_port: 22
@@ -395,6 +420,7 @@ category:
         let config = Config::from_yaml_str(
             r#"
 flockdir: "/var/lib/sequencer/flock"
+lock_file_name: "sequencer-sync.lock"
 logdir: "/var/lib/sequencer/log"
 server_user: "sequencer-sync"
 server_port: 22
@@ -439,6 +465,7 @@ category:
         let config = Config::from_yaml_str(
             r#"
 flockdir: "/var/lib/sequencer/flock"
+lock_file_name: "sequencer-sync.lock"
 logdir: "/var/lib/sequencer/log"
 server_user: "sequencer-sync"
 server_port: 22
@@ -471,6 +498,7 @@ category:
         let config = Config::from_yaml_str(
             r#"
 flockdir: "/var/lib/sequencer/flock"
+lock_file_name: "sequencer-sync.lock"
 logdir: "/var/lib/sequencer/log"
 server_user: "sequencer-sync"
 server_port: 22

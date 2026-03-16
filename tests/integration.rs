@@ -42,6 +42,7 @@ impl TestFixture {
     fn write_nanopore_config(&self) -> PathBuf {
         let config = format!(
             r#"flockdir: "{flockdir}"
+lock_file_name: "sequencer-sync.lock"
 logdir: "{logdir}"
 server_user: "test"
 server_port: 22
@@ -73,6 +74,7 @@ category:
     fn write_nextseq_config(&self) -> PathBuf {
         let config = format!(
             r#"flockdir: "{flockdir}"
+lock_file_name: "sequencer-sync.lock"
 logdir: "{logdir}"
 server_user: "test"
 server_port: 22
@@ -215,6 +217,7 @@ fn run_fails_nonexistent_landing_zone() {
     // landing-other points to a nonexistent path — caught at config load time.
     let config = format!(
         r#"flockdir: "{flockdir}"
+lock_file_name: "sequencer-sync.lock"
 logdir: "{logdir}"
 server_user: "test"
 server_port: 22
@@ -499,6 +502,7 @@ fn dry_run_shows_exclude_patterns() {
     // Config with exclude patterns
     let config = format!(
         r#"flockdir: "{flockdir}"
+lock_file_name: "sequencer-sync.lock"
 logdir: "{logdir}"
 server_user: "test"
 server_port: 22
@@ -603,6 +607,7 @@ fn setup_fails_duplicate_landing_zones() {
 
     let config = format!(
         r#"flockdir: "{flockdir}"
+lock_file_name: "sequencer-sync.lock"
 logdir: "{logdir}"
 server_user: "test"
 server_port: 22
@@ -645,6 +650,7 @@ fn setup_fails_landing_zone_equals_flockdir() {
 
     let config = format!(
         r#"flockdir: "{shared}"
+lock_file_name: "sequencer-sync.lock"
 logdir: "{logdir}"
 server_user: "test"
 server_port: 22
