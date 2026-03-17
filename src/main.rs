@@ -50,7 +50,7 @@ struct RunArgs {
     retry_failed: bool,
     /// Transfer directories even if the completion file is not present.
     #[arg(long, default_value_t = false)]
-    ignore_incomplete: bool,
+    transfer_incomplete: bool,
     /// Print what would be copied instead of actually copying.
     #[arg(long, default_value_t = false)]
     dry_run: bool,
@@ -119,7 +119,7 @@ fn run_command(args: RunArgs) -> Result<(), AppError> {
         &mut transfer_log,
         &mut run_log,
         args.retry_failed,
-        args.ignore_incomplete,
+        args.transfer_incomplete,
         args.dry_run,
     )?;
 
@@ -239,7 +239,7 @@ fn transfer_new_directories(
     transfer_log: &mut TransferLog,
     run_log: &mut RunLog,
     retry_failed: bool,
-    ignore_incomplete: bool,
+    transfer_incomplete: bool,
     dry_run: bool,
 ) -> Result<(), AppError> {
     for (entry, reason) in new_directories(source, transfer_log, retry_failed)? {
@@ -251,7 +251,7 @@ fn transfer_new_directories(
             None => continue,
         };
 
-        if !ignore_incomplete && !run_is_complete(&entry.path(), &target.completion_file_glob) {
+        if !run_is_complete(&entry.path(), &target.completion_file_glob) && !transfer_incomplete {
             continue;
         }
 

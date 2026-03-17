@@ -23,7 +23,7 @@ When `sequencer-sync run` is invoked (typically by cron), it:
 * Loads the transfer log (JSONL) which tracks previously transferred directories
 * Scans the source directory for subdirectories not yet in the transfer log
 * For each new directory, matches it against the configured categories by regex
-* Skips directories where the completion file glob doesn't match (i.e. the sequencing run is still in progress), unless `--ignore-incomplete` is set
+* Skips directories where the completion file glob doesn't match (i.e. the sequencing run is still in progress), unless `--transfer-incomplete` is set
 * Transfers matching directories to the category's landing zone via `rsync -a`, respecting exclude patterns found in config
 * Records success/failure in the transfer log; on success, writes a `transfer_successful.txt` marker in the transferred directory
 * Previously failed transfers can be retried with `--retry-failed`

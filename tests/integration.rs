@@ -339,7 +339,7 @@ fn nextseq_ignore_incomplete_transfers_all() {
     cmd()
         .args(["run", "--config-path"])
         .arg(&config_path)
-        .args(["--ignore-incomplete"])
+        .args(["--transfer-incomplete"])
         .assert()
         .success();
 
