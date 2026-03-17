@@ -541,8 +541,11 @@ fn canonicalize_config_path(path: &Path) -> Result<PathBuf, AppError> {
 
 fn write_cron_file(logdir: &Path, config_path: &Path) -> Result<PathBuf, AppError> {
     debug!("Determining cron file content");
+    let binary_path = std::env::current_exe()
+        .and_then(fs::canonicalize)
+        .map_err(|source| AppError::CurrentExe { source })?;
     let cron_path = cron_file_path(logdir);
-    let contents = render_cron_file(config_path);
+    let contents = render_cron_file(config_path, &binary_path);
     debug!(
         "Writing cron content to cron file at {}",
         cron_path.display()
@@ -562,9 +565,10 @@ fn lock_file_path(flockdir: &Path, lock_file_name: &str) -> PathBuf {
     flockdir.join(lock_file_name)
 }
 
-fn render_cron_file(config_path: &Path) -> String {
+fn render_cron_file(config_path: &Path, binary_path: &Path) -> String {
     let command = format!(
-        "sequencer-sync run --config-path {}",
+        "{} run --config-path {}",
+        shell_quote(binary_path.to_string_lossy().as_ref()),
         shell_quote(config_path.to_string_lossy().as_ref()),
     );
 
@@ -715,6 +719,11 @@ enum AppError {
     },
     #[error("one or more run log writes failed (see warnings above)")]
     RunLogWriteFailed,
+    #[error("failed to determine path to current executable: {source}")]
+    CurrentExe {
+        #[source]
+        source: std::io::Error,
+    },
     #[error(
         "directory `{dir_name}` matched category regex `{category_regex}` with year_subdirectory enabled, but name does not start with two ASCII digits"
     )]
@@ -732,12 +741,15 @@ mod tests {
 
     #[test]
     fn renders_cron_file() {
-        let block = render_cron_file(Path::new("/etc/sequencer-sync/config.yaml"));
+        let block = render_cron_file(
+            Path::new("/etc/sequencer-sync/config.yaml"),
+            Path::new("/usr/local/bin/sequencer-sync"),
+        );
 
         assert!(block.contains("# Install this file into cron manually."));
-        assert!(block.contains(
-            "*/15 * * * * sequencer-sync run --config-path '/etc/sequencer-sync/config.yaml'"
-        ));
+        assert!(block.contains("*/15 * * * *"));
+        assert!(block.contains("'/usr/local/bin/sequencer-sync' run"));
+        assert!(block.contains("--config-path '/etc/sequencer-sync/config.yaml'"));
         assert!(!block.contains("--platform"));
     }
 
