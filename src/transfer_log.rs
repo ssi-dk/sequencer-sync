@@ -7,6 +7,8 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::{TransferAction, TransferReason};
+
 const TRANSFER_LOG_FILE_NAME: &str = "transferred-directories.jsonl";
 
 // Machine readable log in JSONL format. Authorative source of which directories
@@ -127,20 +129,13 @@ impl TransferLog {
         })
     }
 
-    /// Returns whether this directory should be skipped.
-    /// A directory is skipped if it was previously transferred successfully,
-    /// or if it failed and `retry_failed` is false.
-    pub fn should_skip(&self, directory: &Path, retry_failed: bool) -> bool {
-        self.transferred_directories
-            .get(directory)
-            .is_some_and(|&succeeded| succeeded || !retry_failed)
-    }
-
-    /// Returns true if the directory is in the log with a failed transfer.
-    pub fn previously_failed(&self, directory: &Path) -> bool {
-        self.transferred_directories
-            .get(directory)
-            .is_some_and(|&succeeded| !succeeded)
+    pub fn transfer_action(&self, directory: &Path, retry_failed: bool) -> TransferAction {
+        match (self.transferred_directories.get(directory), retry_failed) {
+            (None, _) => TransferAction::Tranfer(TransferReason::New),
+            (Some(true), _) => TransferAction::Skip(crate::SkipReason::AlreadyTranferred),
+            (Some(false), true) => TransferAction::Tranfer(TransferReason::Retry),
+            (Some(false), false) => TransferAction::Skip(crate::SkipReason::FailedNoRetry),
+        }
     }
 
     pub fn record_transfer(
@@ -219,6 +214,8 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    use crate::{SkipReason, TransferAction, TransferReason};
+
     use super::{TransferLog, TransferLogError, relative_directory_key, transfer_log_path};
 
     #[test]
@@ -227,7 +224,10 @@ mod tests {
 
         let log = TransferLog::load(&tempdir).expect("missing log should load");
 
-        assert!(!log.should_skip(Path::new("run-001"), false));
+        assert!(matches!(
+            log.transfer_action(Path::new("run-001"), false),
+            TransferAction::Tranfer(TransferReason::New)
+        ));
         cleanup_temp_dir(&tempdir);
     }
 
@@ -245,8 +245,14 @@ mod tests {
 
         let log = TransferLog::load(&tempdir).expect("log should parse");
 
-        assert!(log.should_skip(Path::new("run-001"), false));
-        assert!(log.should_skip(Path::new("run-002"), false));
+        assert!(matches!(
+            log.transfer_action(Path::new("run-001"), false),
+            TransferAction::Skip(SkipReason::AlreadyTranferred)
+        ));
+        assert!(matches!(
+            log.transfer_action(Path::new("run-002"), false),
+            TransferAction::Skip(SkipReason::AlreadyTranferred)
+        ));
         cleanup_temp_dir(&tempdir);
     }
 
@@ -292,10 +298,16 @@ mod tests {
         log.record_transfer(Path::new("run-001"), true)
             .expect("append should succeed");
 
-        assert!(log.should_skip(Path::new("run-001"), false));
+        assert!(matches!(
+            log.transfer_action(Path::new("run-001"), false),
+            TransferAction::Skip(SkipReason::AlreadyTranferred)
+        ));
 
         let reloaded = TransferLog::load(&tempdir).expect("reloaded log should parse");
-        assert!(reloaded.should_skip(Path::new("run-001"), false));
+        assert!(matches!(
+            reloaded.transfer_action(Path::new("run-001"), false),
+            TransferAction::Skip(SkipReason::AlreadyTranferred)
+        ));
 
         let contents =
             fs::read_to_string(transfer_log_path(&tempdir)).expect("should read transfer log");

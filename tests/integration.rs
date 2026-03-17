@@ -437,9 +437,9 @@ fn retry_failed() {
     let log = read_transfer_log(&fixture);
     assert!(log.contains("\"succeeded\":true"));
 
-    // Run log should contain "Retrying" line
+    // Run log should indicate this was a retry
     let run_log = read_run_log(&fixture);
-    assert!(run_log.contains("Retrying previously failed transfer: 240101_NB001"));
+    assert!(run_log.contains("Transferred previously failed transfer 240101_NB001"));
 }
 
 #[test]

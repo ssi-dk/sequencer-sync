@@ -7,6 +7,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use clap::{Args, Parser, Subcommand};
 use config::{Config, ConfigError};
 use fs2::FileExt;
+use log::debug;
 use run_log::RunLog;
 use thiserror::Error;
 use transfer_log::TransferLog;
@@ -57,11 +58,12 @@ struct RunArgs {
 }
 
 fn main() -> ExitCode {
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
+    debug!("sequencer-sync starting");
     if let Err(error) = try_main() {
         eprintln!("Error: {error}");
         return ExitCode::FAILURE;
     }
-
     ExitCode::SUCCESS
 }
 
@@ -75,7 +77,12 @@ fn try_main() -> Result<(), AppError> {
 }
 
 fn setup(args: SetupArgs) -> Result<(), AppError> {
+    debug!(
+        "Canonicalizing config path: Path given from CLI: {}",
+        args.config_path.display()
+    );
     let config_path = canonicalize_config_path(&args.config_path)?;
+    debug!("Loading config path at {}", config_path.display());
     let config = load_config(&args.config_path)?;
 
     validate_environment(&config, args.skip_ssh_check)?;
@@ -106,7 +113,7 @@ fn run_command(args: RunArgs) -> Result<(), AppError> {
     let _lock = match acquire_run_lock(&config.flockdir, &config.lock_file_name)? {
         Some(lock) => lock,
         None => {
-            eprintln!("Another sequencer-sync run is already in progress; exiting.");
+            debug!("Another sequencer-sync run is already in progress; exiting.");
             return Ok(());
         }
     };
@@ -133,12 +140,31 @@ fn run_command(args: RunArgs) -> Result<(), AppError> {
 fn validate_environment(config: &Config, skip_ssh_check: bool) -> Result<(), AppError> {
     if !skip_ssh_check {
         check_ssh_access(config)?;
+    } else {
+        debug!("SSH check skipped due to command line flag.")
     }
+    debug!(
+        "Checking that source directory is readable: {}",
+        config.source.display()
+    );
     check_readable_directory(&config.source, "source")?;
-    for cat in &config.categories {
+    for (category_index, cat) in config.categories.iter().enumerate() {
+        debug!(
+            "Checking writability of category {} landing zone: {}",
+            category_index + 1,
+            cat.landing_zone.display()
+        );
         check_writable_directory(&cat.landing_zone, "category.landing_zone")?;
     }
+    debug!(
+        "Checking writability of flockdir: {}",
+        config.flockdir.display()
+    );
     check_writable_directory(&config.flockdir, "flockdir")?;
+    debug!(
+        "Checking writability of logdir: {}",
+        config.logdir.display()
+    );
     check_writable_directory(&config.logdir, "logdir")?;
     Ok(())
 }
@@ -150,11 +176,26 @@ enum TransferReason {
     Retry,
 }
 
+enum SkipReason {
+    // Should not be transferred: Previously failed, --retry-failed not set
+    FailedNoRetry,
+
+    // Should not be transferred: Already successfully transferred
+    AlreadyTranferred,
+}
+
+enum TransferAction {
+    Tranfer(TransferReason),
+    Skip(SkipReason),
+}
+
 fn new_directories(
     source: &Path,
     transfer_log: &TransferLog,
     retry_failed: bool,
 ) -> Result<Vec<(fs::DirEntry, TransferReason)>, AppError> {
+    debug!("Searching for new directories in {}", source.display());
+
     let entries = fs::read_dir(source).map_err(|e| AppError::ReadDirectory {
         field: "source",
         path: source.to_path_buf(),
@@ -180,28 +221,43 @@ fn new_directories(
 
         let key = transfer_log::relative_directory_key(source, &entry.path())
             .map_err(AppError::TransferLog)?;
-        if transfer_log.should_skip(&key, retry_failed) {
-            continue;
-        }
 
-        let reason = if transfer_log.previously_failed(&key) {
-            TransferReason::Retry
-        } else {
-            TransferReason::New
+        let action = transfer_log.transfer_action(&key, retry_failed);
+        let reason: TransferReason = match action {
+            TransferAction::Skip(SkipReason::AlreadyTranferred) => {
+                debug!("Skipping already-transferred directory: {}", key.display());
+                continue;
+            }
+            TransferAction::Skip(SkipReason::FailedNoRetry) => {
+                debug!(
+                    "Skipping directory where transfer previously failed (--retry-failed not set): {}",
+                    key.display()
+                );
+                continue;
+            }
+            TransferAction::Tranfer(reason) => reason,
         };
-
         result.push((entry, reason));
     }
+
+    debug!("Total directories to transfer: {}", result.len());
 
     Ok(result)
 }
 
-fn run_is_complete(run_dir: &Path, completion_file_glob: &glob::Pattern) -> bool {
+fn run_is_complete(run_dir: &Path, completion_file_glob: &glob::Pattern) -> Result<bool, AppError> {
     let pattern = run_dir.join(completion_file_glob.as_str());
     let pattern = pattern.to_string_lossy();
-    glob::glob(&pattern)
-        .map(|mut paths| paths.next().is_some())
-        .unwrap_or(false)
+    // The pattern was validated at config load time, so PatternError is not expected here.
+    let mut paths = glob::glob(&pattern).expect("completion file glob pattern should be valid");
+    match paths.next() {
+        None => Ok(false),
+        Some(Ok(_)) => Ok(true),
+        Some(Err(source)) => Err(AppError::CompletionFileScan {
+            run_dir: run_dir.to_path_buf(),
+            source,
+        }),
+    }
 }
 
 fn classify(
@@ -242,17 +298,41 @@ fn transfer_new_directories(
     transfer_incomplete: bool,
     dry_run: bool,
 ) -> Result<(), AppError> {
+    let (mut succeeded, mut failed) = (0u32, 0u32);
+
     for (entry, reason) in new_directories(source, transfer_log, retry_failed)? {
         let dir_name = entry.file_name();
         let dir_name = dir_name.to_string_lossy();
 
         let target = match classify(&dir_name, categories)? {
-            Some(t) => t,
-            None => continue,
+            Some(t) => {
+                debug!(
+                    "Match: Run directory {} to landing zone {}",
+                    dir_name,
+                    &t.destination.display()
+                );
+                t
+            }
+            None => {
+                debug!("No category match: {}", dir_name);
+                continue;
+            }
         };
 
-        if !run_is_complete(&entry.path(), &target.completion_file_glob) && !transfer_incomplete {
-            continue;
+        let is_complete = run_is_complete(&entry.path(), &target.completion_file_glob)?;
+        if !is_complete {
+            if transfer_incomplete {
+                debug!(
+                    "Transferring incomplete run due to --transfer-incomplete flag: {}",
+                    &entry.path().display()
+                );
+            } else {
+                debug!(
+                    "Completion file not found; skipping {}",
+                    &entry.path().display()
+                );
+                continue;
+            }
         }
 
         if dry_run {
@@ -260,35 +340,47 @@ fn transfer_new_directories(
             continue;
         }
 
-        if matches!(reason, TransferReason::Retry) {
-            run_log.log(&format!("Retrying previously failed transfer: {dir_name}"));
-        }
-
         let destination_display = target.destination.display();
-        let succeeded = rsync_directory(&entry.path(), &target.destination, &target.exclude);
-        if let Err(ref error) = succeeded {
-            eprintln!("{error}");
-        }
-        let succeeded = succeeded.is_ok();
+        let rsync_result = rsync_directory(&entry.path(), &target.destination, &target.exclude);
 
         let key = transfer_log::relative_directory_key(source, &entry.path())
             .map_err(AppError::TransferLog)?;
         transfer_log
-            .record_transfer(&key, succeeded)
+            .record_transfer(&key, rsync_result.is_ok())
             .map_err(AppError::TransferLog)?;
 
-        if succeeded {
-            run_log.log(&format!("Transferred {dir_name} -> {destination_display}"));
-            if let Err(error) = touch_transfer_marker(&target.destination.join(entry.file_name())) {
-                eprintln!("Warning: {error}");
-                run_log.log(&format!("Warning: {error}"));
-                run_log.record_error();
+        match rsync_result {
+            Ok(()) => {
+                succeeded += 1;
+                let reason_str = match reason {
+                    TransferReason::New => "new directory",
+                    TransferReason::Retry => "previously failed transfer",
+                };
+
+                run_log.info(&format!(
+                    "Transferred {reason_str} {dir_name} -> {destination_display}"
+                ));
+                if let Err(error) =
+                    touch_transfer_marker(&target.destination.join(entry.file_name()))
+                {
+                    run_log.error(&format!(
+                        "Warning: failed to write transfer marker: {error}"
+                    ));
+                }
             }
-        } else {
-            run_log.log(&format!(
-                "FAILED transfer {dir_name} -> {destination_display}"
-            ));
+            Err(error) => {
+                failed += 1;
+                run_log.error(&format!(
+                    "FAILED transfer {dir_name} -> {destination_display}: {error}"
+                ));
+            }
         }
+    }
+
+    if succeeded + failed > 0 {
+        run_log.info(&format!(
+            "Run complete: {succeeded} transferred, {failed} failed"
+        ));
     }
 
     Ok(())
@@ -316,6 +408,12 @@ fn print_dry_run(source: &Path, destination: &Path, exclude: &[String]) {
 }
 
 fn rsync_directory(source: &Path, destination: &Path, exclude: &[String]) -> Result<(), AppError> {
+    debug!(
+        "Running rsync from {} to {} with exclude {}",
+        source.display(),
+        destination.display(),
+        exclude.join(" ")
+    );
     let mut cmd = Command::new("rsync");
     cmd.arg("-a");
     for pattern in exclude {
@@ -346,6 +444,10 @@ fn load_config(config_path: &Path) -> Result<Config, AppError> {
 }
 
 fn check_ssh_access(config: &Config) -> Result<(), AppError> {
+    debug!(
+        "Checking SSH access. User name: {} port: {} domain name: {}",
+        config.server_user, config.server_port, config.server_host
+    );
     let status = Command::new("ssh")
         .arg("-o")
         .arg("BatchMode=yes")
@@ -438,8 +540,13 @@ fn canonicalize_config_path(path: &Path) -> Result<PathBuf, AppError> {
 }
 
 fn write_cron_file(logdir: &Path, config_path: &Path) -> Result<PathBuf, AppError> {
+    debug!("Determining cron file content");
     let cron_path = cron_file_path(logdir);
     let contents = render_cron_file(config_path);
+    debug!(
+        "Writing cron content to cron file at {}",
+        cron_path.display()
+    );
     fs::write(&cron_path, contents).map_err(|source| AppError::WriteCronFile {
         path: cron_path.clone(),
         source,
@@ -465,10 +572,10 @@ fn render_cron_file(config_path: &Path) -> String {
 }
 
 fn check_lock_is_available(flockdir: &Path, lock_file_name: &str) -> Result<(), AppError> {
+    let path = lock_file_path(flockdir, lock_file_name);
+    debug!("Checking availability of lock file at {}", path.display());
     let _lock =
-        acquire_run_lock(flockdir, lock_file_name)?.ok_or_else(|| AppError::RunLockHeld {
-            path: lock_file_path(flockdir, lock_file_name),
-        })?;
+        acquire_run_lock(flockdir, lock_file_name)?.ok_or(AppError::RunLockHeld { path })?;
     Ok(())
 }
 
@@ -593,6 +700,12 @@ enum AppError {
         source_path: PathBuf,
         destination: PathBuf,
         exit_code: Option<i32>,
+    },
+    #[error("failed to scan for completion file in {}: {source}", run_dir.display())]
+    CompletionFileScan {
+        run_dir: PathBuf,
+        #[source]
+        source: glob::GlobError,
     },
     #[error("failed to write transfer marker {}: {source}", path.display())]
     WriteTransferMarker {
