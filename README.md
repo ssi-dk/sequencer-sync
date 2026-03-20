@@ -31,3 +31,13 @@ When `sequencer-sync run` is invoked (typically by cron), it:
 ## Misc information
 * The file lock is not necessarily held if the lock file exists. Instead, the lock is managed with
   `flock()` system calls. Use the `flock` tool to check if the lock is held.
+
+## Commands:
+* `sequencer-sync setup`: Validate config file, check directories have correct permissions, and print cron tab
+	* `--config-path` (required): path to config file to load, see our deploy repo 
+	* `--skip-ssh-check`: By default, setup will check that you have passwordless SSH access with username/host/port provided by the config file. If this option is set, skip that check.
+
+* `sequencer-sync run`: Synchronize files to the landing zone
+	* `--config-path` (required): path to config file to load, see our deploy repo
+	* `--retry-failed` A failed transfer is logged as unsuccessful in the `log/transferred-direcotries.jsonl` and skipped in future runs. If this flag is set, failed directories are not skipped (unless they also appear as succeeded later in the log).
+	* `--transfer-incomplete` Data from sequencing runs are only considered complete if a file matching `completion_file_glob` in the config is found. Without this flag set, incomplete runs are skipped.
