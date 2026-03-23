@@ -4,7 +4,7 @@ The `landingzones` program then syncronizes the landing zone with a directory on
 This program is run regularly by a cron job.
 
 ## Installation
-* Compile the code to the target platform (likely x86_64-unknown-linux-gnu)
+* Compile the code to the target platform (likely x86_64-unknown-linux-musl)
 * Copy the binary and `examples/config.yaml` to the sequencer
 * Update all fields in the config to the correct values
 * Ensure:

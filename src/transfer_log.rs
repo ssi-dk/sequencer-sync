@@ -208,6 +208,53 @@ pub fn transfer_log_path(logdir: &Path) -> PathBuf {
     logdir.join(TRANSFER_LOG_FILE_NAME)
 }
 
+/// Write a sentinel record to the transfer log if the file is absent or blank.
+/// This ensures the file is always present after setup, making it easy to
+/// inspect the log format even before any real transfers have occurred.
+pub fn initialize_if_absent(logdir: &Path) -> Result<(), TransferLogError> {
+    let path = transfer_log_path(logdir);
+
+    let needs_init = match fs::read_to_string(&path) {
+        Ok(contents) => contents.trim().is_empty(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+        Err(source) => return Err(TransferLogError::Read { path, source }),
+    };
+
+    if !needs_init {
+        return Ok(());
+    }
+
+    let record = TransferRecord {
+        directory: PathBuf::from("_sequencer_sync_setup_"),
+        transferred_at: Utc::now().to_rfc3339(),
+        succeeded: true,
+    };
+
+    let line = serde_json::to_string(&record).map_err(|source| TransferLogError::Serialize {
+        directory: record.directory.display().to_string(),
+        source,
+    })?;
+
+    let mut file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&path)
+        .map_err(|source| TransferLogError::Append {
+            path: path.clone(),
+            source,
+        })?;
+
+    writeln!(file, "{line}").map_err(|source| TransferLogError::Append {
+        path: path.clone(),
+        source,
+    })?;
+    file.sync_all()
+        .map_err(|source| TransferLogError::Append { path, source })?;
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;

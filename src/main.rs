@@ -87,6 +87,7 @@ fn setup(args: SetupArgs) -> Result<(), AppError> {
 
     validate_environment(&config, args.skip_ssh_check)?;
     check_lock_is_available(&config.flockdir, &config.lock_file_name)?;
+    transfer_log::initialize_if_absent(&config.logdir).map_err(AppError::TransferLog)?;
     eprintln!("Setup successful!");
     let cron_path = write_cron_file(&config.logdir, &config_path)?;
     eprintln!(
