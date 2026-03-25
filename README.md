@@ -23,7 +23,7 @@ When `sequencer-sync run` is invoked (typically by cron), it:
 * Loads the transfer log (JSONL) which tracks previously transferred directories
 * Scans the source directory for subdirectories not yet in the transfer log
 * For each new directory, matches it against the configured categories by regex
-* Skips directories where the completion file glob doesn't match (i.e. the sequencing run is still in progress), unless `--transfer-incomplete` is set
+* Skips directories where any configured completion file glob fails to match (i.e. the sequencing run is still in progress), unless `--transfer-incomplete` is set
 * Transfers matching directories to the category's landing zone via `rsync -a`, respecting exclude patterns found in config
 * Records success/failure in the transfer log; on success, writes a `transfer_successful.txt` marker in the transferred directory
 
@@ -43,4 +43,4 @@ When `sequencer-sync run` is invoked (typically by cron), it:
 * `sequencer-sync run`: Synchronize files to the landing zone
 	* `--config-path` (required): path to config file to load, see our deploy repo
 	* `--retry-failed` A failed transfer is logged as unsuccessful in the `log/transferred-direcotries.jsonl` and skipped in future runs. If this flag is set, failed directories are not skipped (unless they also appear as succeeded later in the log).
-	* `--transfer-incomplete` Data from sequencing runs are only considered complete if a file matching `completion_file_glob` in the config is found. Without this flag set, incomplete runs are skipped.
+	* `--transfer-incomplete` Data from sequencing runs are only considered complete if every glob in `completion_file_globs` matches at least one file. Without this flag set, incomplete runs are skipped.

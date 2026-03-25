@@ -32,7 +32,7 @@ pub struct Category {
     /// Canonicalized absolute path.
     pub landing_zone: PathBuf,
     pub exclude: Vec<String>,
-    pub completion_file_glob: Pattern,
+    pub completion_file_globs: Vec<Pattern>,
     /// When true, place runs into a year-based subdirectory under the landing
     /// zone. The year is derived from the directory name by prepending "20" to
     /// its first two characters (e.g. "240101_NB123" → "2024/").
@@ -58,7 +58,7 @@ struct UnvalidatedCategory {
     landing_zone: PathBuf,
     #[serde(default)]
     exclude: Vec<String>,
-    completion_file_glob: String,
+    completion_file_globs: Vec<String>,
     #[serde(default)]
     year_subdirectory: bool,
 }
@@ -102,6 +102,8 @@ pub enum ConfigError {
         #[source]
         source: glob::PatternError,
     },
+    #[error("config field `{field}` must contain at least one glob pattern")]
+    EmptyGlobList { field: &'static str },
     #[error(
         "config field `{field}` must be a valid file base name (no slashes, not \".\" or \"..\"): {value:?}"
     )]
@@ -215,14 +217,16 @@ impl UnvalidatedCategory {
             source,
         })?;
 
-        let completion_file_glob =
-            validate_glob("category.completion_file_glob", &self.completion_file_glob)?;
+        let completion_file_globs = validate_globs(
+            "category.completion_file_globs",
+            &self.completion_file_globs,
+        )?;
 
         Ok(Category {
             regex,
             landing_zone: self.landing_zone,
             exclude: self.exclude,
-            completion_file_glob,
+            completion_file_globs,
             year_subdirectory: self.year_subdirectory,
         })
     }
@@ -262,6 +266,17 @@ fn validate_glob(field: &'static str, pattern: &str) -> Result<Pattern, ConfigEr
     Pattern::new(pattern).map_err(|source| ConfigError::InvalidGlob { field, source })
 }
 
+fn validate_globs(field: &'static str, patterns: &[String]) -> Result<Vec<Pattern>, ConfigError> {
+    if patterns.is_empty() {
+        return Err(ConfigError::EmptyGlobList { field });
+    }
+
+    patterns
+        .iter()
+        .map(|pattern| validate_glob(field, pattern))
+        .collect()
+}
+
 fn validate_all_paths_distinct(paths: &[(&'static str, &Path)]) -> Result<(), ConfigError> {
     for i in 0..paths.len() {
         for j in (i + 1)..paths.len() {
@@ -296,7 +311,8 @@ source: "/data/nextseq"
 category:
   - regex: "^\\d{6}_"
     landing_zone: "/var/lib/sequencer/landing-zone"
-    completion_file_glob: "PrimaryAnalysisMetrics/PrimaryAnalysisMetrics.csv"
+    completion_file_globs:
+      - "PrimaryAnalysisMetrics/PrimaryAnalysisMetrics.csv"
 "#;
 
     #[test]
@@ -373,7 +389,8 @@ source: "relative/data"
 category:
   - regex: "^\\d{6}_"
     landing_zone: "/var/lib/sequencer/landing-zone"
-    completion_file_glob: "PrimaryAnalysisMetrics/PrimaryAnalysisMetrics.csv"
+    completion_file_globs:
+      - "PrimaryAnalysisMetrics/PrimaryAnalysisMetrics.csv"
 "#,
         )
         .expect_err("relative source path should fail validation");
@@ -402,7 +419,8 @@ source: "/data/sequencer"
 category:
   - regex: "^\\d{6}_"
     landing_zone: "/var/lib/sequencer/landing-zone"
-    completion_file_glob: "PrimaryAnalysisMetrics/PrimaryAnalysisMetrics.csv"
+    completion_file_globs:
+      - "PrimaryAnalysisMetrics/PrimaryAnalysisMetrics.csv"
 "#,
         )
         .expect_err("empty server_user should fail validation");
@@ -430,11 +448,13 @@ source: "/data/nanopore"
 category:
   - regex: "^ONT_WGS_"
     landing_zone: "/landing/core"
-    completion_file_glob: "report*.html"
+    completion_file_globs:
+      - "report*.html"
 
   - regex: "^ONT_"
     landing_zone: "/landing/other"
-    completion_file_glob: "report*.html"
+    completion_file_globs:
+      - "report*.html"
 "#,
         )
         .unwrap();
@@ -475,11 +495,13 @@ source: "/data/nanopore"
 category:
   - regex: "^ONT_WGS_"
     landing_zone: "/landing/core"
-    completion_file_glob: "report*.html"
+    completion_file_globs:
+      - "report*.html"
 
   - regex: "^ONT_"
     landing_zone: "/landing/other"
-    completion_file_glob: "report*.html"
+    completion_file_globs:
+      - "report*.html"
 "#,
         )
         .unwrap();
@@ -508,11 +530,13 @@ source: "/data/nanopore"
 category:
   - regex: "^ONT_WGS_"
     landing_zone: "/landing/core"
-    completion_file_glob: "report*.html"
+    completion_file_globs:
+      - "report*.html"
 
   - regex: "^ONT_"
     landing_zone: "/landing/other"
-    completion_file_glob: "report*.html"
+    completion_file_globs:
+      - "report*.html"
 "#,
         )
         .unwrap();
@@ -522,5 +546,33 @@ category:
             .iter()
             .find(|c| c.regex.is_match("ILLUMINA_run1"));
         assert!(matched.is_none());
+    }
+
+    #[test]
+    fn rejects_empty_completion_glob_list() {
+        let error = Config::from_yaml_str(
+            r#"
+flockdir: "/var/lib/sequencer/flock"
+lock_file_name: "sequencer-sync.lock"
+logdir: "/var/lib/sequencer/log"
+server_user: "sequencer-sync"
+server_port: 22
+server_host: "sequencer.example.org"
+source: "/data/nextseq"
+
+category:
+  - regex: "^\\d{6}_"
+    landing_zone: "/var/lib/sequencer/landing-zone"
+    completion_file_globs: []
+"#,
+        )
+        .expect_err("empty completion glob list should fail");
+
+        assert!(matches!(
+            error,
+            ConfigError::EmptyGlobList {
+                field: "category.completion_file_globs"
+            }
+        ));
     }
 }

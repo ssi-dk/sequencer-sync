@@ -105,7 +105,7 @@ fn setup(args: SetupArgs) -> Result<(), AppError> {
 struct TransferTarget {
     destination: PathBuf,
     exclude: Vec<String>,
-    completion_file_glob: glob::Pattern,
+    completion_file_globs: Vec<glob::Pattern>,
 }
 
 fn run_command(args: RunArgs) -> Result<(), AppError> {
@@ -248,19 +248,28 @@ fn new_directories(
     Ok(result)
 }
 
-fn run_is_complete(run_dir: &Path, completion_file_glob: &glob::Pattern) -> Result<bool, AppError> {
-    let pattern = run_dir.join(completion_file_glob.as_str());
-    let pattern = pattern.to_string_lossy();
-    // The pattern was validated at config load time, so PatternError is not expected here.
-    let mut paths = glob::glob(&pattern).expect("completion file glob pattern should be valid");
-    match paths.next() {
-        None => Ok(false),
-        Some(Ok(_)) => Ok(true),
-        Some(Err(source)) => Err(AppError::CompletionFileScan {
-            run_dir: run_dir.to_path_buf(),
-            source,
-        }),
+fn run_is_complete(
+    run_dir: &Path,
+    completion_file_globs: &[glob::Pattern],
+) -> Result<bool, AppError> {
+    for completion_file_glob in completion_file_globs {
+        let pattern = run_dir.join(completion_file_glob.as_str());
+        let pattern = pattern.to_string_lossy();
+        // The pattern was validated at config load time, so PatternError is not expected here.
+        let mut paths = glob::glob(&pattern).expect("completion file glob pattern should be valid");
+        match paths.next() {
+            None => return Ok(false),
+            Some(Ok(_)) => {}
+            Some(Err(source)) => {
+                return Err(AppError::CompletionFileScan {
+                    run_dir: run_dir.to_path_buf(),
+                    source,
+                });
+            }
+        }
     }
+
+    Ok(true)
 }
 
 fn classify(
@@ -286,7 +295,7 @@ fn classify(
         return Ok(Some(TransferTarget {
             destination,
             exclude: cat.exclude.clone(),
-            completion_file_glob: cat.completion_file_glob.clone(),
+            completion_file_globs: cat.completion_file_globs.clone(),
         }));
     }
     Ok(None)
@@ -322,7 +331,7 @@ fn transfer_new_directories(
             }
         };
 
-        let is_complete = run_is_complete(&entry.path(), &target.completion_file_glob)?;
+        let is_complete = run_is_complete(&entry.path(), &target.completion_file_globs)?;
         if !is_complete {
             if transfer_incomplete {
                 debug!(

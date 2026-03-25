@@ -53,12 +53,14 @@ category:
   - regex: "^ONT_WGS_"
     landing_zone: "{landing_core}"
     exclude: []
-    completion_file_glob: "report*.html"
+    completion_file_globs:
+      - "report*.html"
 
   - regex: "^ONT_"
     landing_zone: "{landing_other}"
     exclude: []
-    completion_file_glob: "report*.html"
+    completion_file_globs:
+      - "report*.html"
 "#,
             flockdir = self.path("flockdir").display(),
             logdir = self.path("logdir").display(),
@@ -85,7 +87,8 @@ category:
   - regex: "^\\d{{6}}_"
     landing_zone: "{landing}"
     exclude: []
-    completion_file_glob: "PrimaryAnalysisMetrics/PrimaryAnalysisMetrics.csv"
+    completion_file_globs:
+      - "PrimaryAnalysisMetrics/PrimaryAnalysisMetrics.csv"
 "#,
             flockdir = self.path("flockdir").display(),
             logdir = self.path("logdir").display(),
@@ -228,12 +231,14 @@ category:
   - regex: "^ONT_WGS_"
     landing_zone: "{landing_core}"
     exclude: []
-    completion_file_glob: "report*.html"
+    completion_file_globs:
+      - "report*.html"
 
   - regex: "^ONT_"
     landing_zone: "{root}/no-such-parent/nanopore-landing-other"
     exclude: []
-    completion_file_glob: "report*.html"
+    completion_file_globs:
+      - "report*.html"
 "#,
         flockdir = fixture.path("flockdir").display(),
         logdir = fixture.path("logdir").display(),
@@ -356,6 +361,56 @@ fn nextseq_ignore_incomplete_transfers_all() {
     );
 
     assert_eq!(transfer_log_line_count(&fixture), 2);
+}
+
+#[test]
+fn nextseq_requires_all_completion_globs() {
+    let fixture = TestFixture::new("nextseq-all-completion-globs");
+    fixture.mkdir("flockdir");
+    fixture.mkdir("logdir");
+    fixture.mkdir("nextseq-source");
+    fixture.mkdir("nextseq-landing");
+    fixture.mkdir("nextseq-source/240101_NB001");
+    fixture.mkdir("nextseq-source/240101_NB001/PrimaryAnalysisMetrics");
+    fixture.write_file(
+        "nextseq-source/240101_NB001/PrimaryAnalysisMetrics/PrimaryAnalysisMetrics.csv",
+        "metrics",
+    );
+    fixture.write_file("nextseq-source/240101_NB001/data.txt", "data");
+
+    let config = format!(
+        r#"flockdir: "{flockdir}"
+lock_file_name: "sequencer-sync.lock"
+logdir: "{logdir}"
+server_user: "test"
+server_port: 22
+server_host: "localhost"
+source: "{source}"
+
+category:
+  - regex: "^\\d{{6}}_"
+    landing_zone: "{landing}"
+    exclude: []
+    completion_file_globs:
+      - "PrimaryAnalysisMetrics/PrimaryAnalysisMetrics.csv"
+      - "Analysis/*/Data/fastq/Logs/FastqComplete.txt"
+"#,
+        flockdir = fixture.path("flockdir").display(),
+        logdir = fixture.path("logdir").display(),
+        source = fixture.path("nextseq-source").display(),
+        landing = fixture.path("nextseq-landing").display(),
+    );
+    let config_path = fixture.path("nextseq.yaml");
+    fs::write(&config_path, config).unwrap();
+
+    cmd()
+        .args(["run", "--config-path"])
+        .arg(&config_path)
+        .assert()
+        .success();
+
+    assert!(!fixture.path("nextseq-landing/240101_NB001").exists());
+    assert_eq!(transfer_log_line_count(&fixture), 0);
 }
 
 #[test]
@@ -554,12 +609,14 @@ category:
   - regex: "^ONT_WGS_"
     landing_zone: "{landing_core}"
     exclude: ["*_skip", "pod5*"]
-    completion_file_glob: "report*.html"
+    completion_file_globs:
+      - "report*.html"
 
   - regex: "^ONT_"
     landing_zone: "{landing_other}"
     exclude: []
-    completion_file_glob: "report*.html"
+    completion_file_globs:
+      - "report*.html"
 "#,
         flockdir = fixture.path("flockdir").display(),
         logdir = fixture.path("logdir").display(),
@@ -659,12 +716,14 @@ category:
   - regex: "^ONT_WGS_"
     landing_zone: "{landing}"
     exclude: []
-    completion_file_glob: "report*.html"
+    completion_file_globs:
+      - "report*.html"
 
   - regex: "^ONT_"
     landing_zone: "{landing}"
     exclude: []
-    completion_file_glob: "report*.html"
+    completion_file_globs:
+      - "report*.html"
 "#,
         flockdir = fixture.path("flockdir").display(),
         logdir = fixture.path("logdir").display(),
@@ -702,7 +761,8 @@ category:
   - regex: "^\\d{{6}}_"
     landing_zone: "{shared}"
     exclude: []
-    completion_file_glob: "PrimaryAnalysisMetrics/PrimaryAnalysisMetrics.csv"
+    completion_file_globs:
+      - "PrimaryAnalysisMetrics/PrimaryAnalysisMetrics.csv"
 "#,
         shared = shared.display(),
         logdir = fixture.path("logdir").display(),
