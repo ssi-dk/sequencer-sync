@@ -3,7 +3,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -15,8 +15,8 @@ const TRANSFER_LOG_FILE_NAME: &str = "transferred-directories.jsonl";
 // have been previosly copied and whether the copy was successful
 pub struct TransferLog {
     path: PathBuf,
-    /// Maps directory key to whether the transfer succeeded.
-    transferred_directories: HashMap<PathBuf, bool>,
+    /// Maps directory key to its latest transfer state.
+    transferred_directories: HashMap<PathBuf, TransferState>,
     /// Lazily opened file handle for appending records.
     file: Option<File>,
 }
@@ -44,6 +44,16 @@ pub enum TransferLogError {
         line: usize,
         #[source]
         source: serde_json::Error,
+    },
+    #[error(
+        "failed to parse transfer log timestamp in {} line {line}: {source}",
+        path.display()
+    )]
+    ParseTimestamp {
+        path: PathBuf,
+        line: usize,
+        #[source]
+        source: chrono::ParseError,
     },
     #[error("failed to append to transfer log {}: {source}", path.display())]
     Append {
@@ -76,10 +86,18 @@ struct TransferRecord {
     transferred_at: String, // UTC time, but in String format for serialization
     #[serde(default = "default_succeeded")]
     succeeded: bool,
+    redo: bool,
 }
 
 fn default_succeeded() -> bool {
     true
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct TransferState {
+    succeeded: bool,
+    redo: bool,
+    transferred_at: DateTime<Utc>,
 }
 
 impl TransferLog {
@@ -98,7 +116,7 @@ impl TransferLog {
         };
 
         let reader = BufReader::new(file);
-        let mut transferred_directories = HashMap::new();
+        let mut transferred_directories: HashMap<PathBuf, TransferState> = HashMap::new();
 
         for (index, line_result) in reader.lines().enumerate() {
             let line = line_result.map_err(|source| TransferLogError::Read {
@@ -118,8 +136,31 @@ impl TransferLog {
                     source,
                 })?;
 
-            // Later entries override earlier ones (e.g. a retry after failure)
-            transferred_directories.insert(record.directory.clone(), record.succeeded);
+            let transferred_at = chrono::DateTime::parse_from_rfc3339(&record.transferred_at)
+                .map_err(|source| TransferLogError::ParseTimestamp {
+                    path: path.clone(),
+                    line: line_number,
+                    source,
+                })?
+                .with_timezone(&Utc);
+
+            let new_state = TransferState {
+                succeeded: record.succeeded,
+                redo: record.redo,
+                transferred_at,
+            };
+
+            // The newest timestamp wins; equal timestamps keep the existing state
+            // to avoid depending on file order.
+            match transferred_directories.get_mut(&record.directory) {
+                Some(existing) if new_state.transferred_at > existing.transferred_at => {
+                    *existing = new_state;
+                }
+                Some(_) => {}
+                None => {
+                    transferred_directories.insert(record.directory.clone(), new_state);
+                }
+            }
         }
 
         Ok(Self {
@@ -130,11 +171,24 @@ impl TransferLog {
     }
 
     pub fn transfer_action(&self, directory: &Path, retry_failed: bool) -> TransferAction {
-        match (self.transferred_directories.get(directory), retry_failed) {
-            (None, _) => TransferAction::Tranfer(TransferReason::New),
-            (Some(true), _) => TransferAction::Skip(crate::SkipReason::AlreadyTranferred),
-            (Some(false), true) => TransferAction::Tranfer(TransferReason::Retry),
-            (Some(false), false) => TransferAction::Skip(crate::SkipReason::FailedNoRetry),
+        match self.transferred_directories.get(directory).copied() {
+            None => TransferAction::Tranfer(TransferReason::New),
+            Some(TransferState { redo: true, .. }) => TransferAction::Tranfer(TransferReason::Redo),
+            Some(TransferState {
+                succeeded: true,
+                redo: false,
+                ..
+            }) => TransferAction::Skip(crate::SkipReason::AlreadyTranferred),
+            Some(TransferState {
+                succeeded: false,
+                redo: false,
+                ..
+            }) if retry_failed => TransferAction::Tranfer(TransferReason::Retry),
+            Some(TransferState {
+                succeeded: false,
+                redo: false,
+                ..
+            }) => TransferAction::Skip(crate::SkipReason::FailedNoRetry),
         }
     }
 
@@ -149,6 +203,7 @@ impl TransferLog {
             directory: directory.clone(),
             transferred_at: Utc::now().to_rfc3339(),
             succeeded,
+            redo: false,
         };
 
         let line =
@@ -171,7 +226,14 @@ impl TransferLog {
             source,
         })?;
 
-        self.transferred_directories.insert(directory, succeeded);
+        self.transferred_directories.insert(
+            directory,
+            TransferState {
+                succeeded,
+                redo: false,
+                transferred_at: DateTime::<Utc>::MAX_UTC,
+            },
+        );
         Ok(())
     }
 
@@ -228,6 +290,7 @@ pub fn initialize_if_absent(logdir: &Path) -> Result<(), TransferLogError> {
         directory: PathBuf::from("_sequencer_sync_setup_"),
         transferred_at: Utc::now().to_rfc3339(),
         succeeded: true,
+        redo: false,
     };
 
     let line = serde_json::to_string(&record).map_err(|source| TransferLogError::Serialize {
@@ -259,11 +322,14 @@ pub fn initialize_if_absent(logdir: &Path) -> Result<(), TransferLogError> {
 mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use crate::{SkipReason, TransferAction, TransferReason};
 
     use super::{TransferLog, TransferLogError, relative_directory_key, transfer_log_path};
+
+    static NEXT_TEST_DIR_ID: AtomicU64 = AtomicU64::new(0);
 
     #[test]
     fn missing_log_loads_empty_state() {
@@ -284,8 +350,8 @@ mod tests {
         fs::write(
             transfer_log_path(&tempdir),
             concat!(
-                "{\"directory\":\"run-001\",\"transferred_at\":\"2026-03-13T10:00:00Z\"}\n",
-                "{\"directory\":\"run-002\",\"transferred_at\":\"2026-03-13T11:00:00Z\"}\n"
+                "{\"directory\":\"run-001\",\"transferred_at\":\"2026-03-13T10:00:00Z\",\"redo\":false}\n",
+                "{\"directory\":\"run-002\",\"transferred_at\":\"2026-03-13T11:00:00Z\",\"redo\":false}\n"
             ),
         )
         .expect("should write log fixture");
@@ -309,8 +375,8 @@ mod tests {
         fs::write(
             transfer_log_path(&tempdir),
             concat!(
-                "{\"directory\":\"run-001\",\"transferred_at\":\"2026-03-13T10:00:00Z\"}\n",
-                "{\"directory\":\"run-001\",\"transferred_at\":\"2026-03-13T11:00:00Z\"}\n"
+                "{\"directory\":\"run-001\",\"transferred_at\":\"2026-03-13T10:00:00Z\",\"redo\":false}\n",
+                "{\"directory\":\"run-001\",\"transferred_at\":\"2026-03-13T11:00:00Z\",\"redo\":false}\n"
             ),
         )
         .expect("should write log fixture");
@@ -320,12 +386,75 @@ mod tests {
     }
 
     #[test]
+    fn later_entries_override_earlier_state_for_same_directory() {
+        let tempdir = make_temp_dir();
+        fs::write(
+            transfer_log_path(&tempdir),
+            concat!(
+                "{\"directory\":\"run-001\",\"transferred_at\":\"2026-03-13T10:00:00Z\",\"succeeded\":true,\"redo\":true}\n",
+                "{\"directory\":\"run-001\",\"transferred_at\":\"2026-03-13T11:00:00Z\",\"succeeded\":true,\"redo\":false}\n"
+            ),
+        )
+        .expect("should write log fixture");
+
+        let log = TransferLog::load(&tempdir).expect("duplicate directory should not error");
+
+        assert!(matches!(
+            log.transfer_action(Path::new("run-001"), false),
+            TransferAction::Skip(SkipReason::AlreadyTranferred)
+        ));
+        cleanup_temp_dir(&tempdir);
+    }
+
+    #[test]
+    fn line_order_does_not_override_newer_timestamp() {
+        let tempdir = make_temp_dir();
+        fs::write(
+            transfer_log_path(&tempdir),
+            concat!(
+                "{\"directory\":\"run-001\",\"transferred_at\":\"2026-03-13T11:00:00Z\",\"succeeded\":true,\"redo\":false}\n",
+                "{\"directory\":\"run-001\",\"transferred_at\":\"2026-03-13T10:00:00Z\",\"succeeded\":true,\"redo\":true}\n"
+            ),
+        )
+        .expect("should write log fixture");
+
+        let log = TransferLog::load(&tempdir).expect("duplicate directory should not error");
+
+        assert!(matches!(
+            log.transfer_action(Path::new("run-001"), false),
+            TransferAction::Skip(SkipReason::AlreadyTranferred)
+        ));
+        cleanup_temp_dir(&tempdir);
+    }
+
+    #[test]
+    fn equal_timestamps_keep_existing_state() {
+        let tempdir = make_temp_dir();
+        fs::write(
+            transfer_log_path(&tempdir),
+            concat!(
+                "{\"directory\":\"run-001\",\"transferred_at\":\"2026-03-13T10:00:00Z\",\"succeeded\":true,\"redo\":false}\n",
+                "{\"directory\":\"run-001\",\"transferred_at\":\"2026-03-13T10:00:00Z\",\"succeeded\":true,\"redo\":true}\n"
+            ),
+        )
+        .expect("should write log fixture");
+
+        let log = TransferLog::load(&tempdir).expect("duplicate directory should not error");
+
+        assert!(matches!(
+            log.transfer_action(Path::new("run-001"), false),
+            TransferAction::Skip(SkipReason::AlreadyTranferred)
+        ));
+        cleanup_temp_dir(&tempdir);
+    }
+
+    #[test]
     fn malformed_json_line_reports_line_number() {
         let tempdir = make_temp_dir();
         fs::write(
             transfer_log_path(&tempdir),
             concat!(
-                "{\"directory\":\"run-001\",\"transferred_at\":\"2026-03-13T10:00:00Z\"}\n",
+                "{\"directory\":\"run-001\",\"transferred_at\":\"2026-03-13T10:00:00Z\",\"redo\":false}\n",
                 "{not-json}\n"
             ),
         )
@@ -334,6 +463,24 @@ mod tests {
         let error = TransferLog::load(&tempdir).expect_err("malformed json should error");
 
         assert!(matches!(error, TransferLogError::Parse { line: 2, .. }));
+        cleanup_temp_dir(&tempdir);
+    }
+
+    #[test]
+    fn malformed_timestamp_reports_line_number() {
+        let tempdir = make_temp_dir();
+        fs::write(
+            transfer_log_path(&tempdir),
+            "{\"directory\":\"run-001\",\"transferred_at\":\"not-a-timestamp\",\"redo\":false}\n",
+        )
+        .expect("should write log fixture");
+
+        let error = TransferLog::load(&tempdir).expect_err("bad timestamp should error");
+
+        assert!(matches!(
+            error,
+            TransferLogError::ParseTimestamp { line: 1, .. }
+        ));
         cleanup_temp_dir(&tempdir);
     }
 
@@ -360,6 +507,7 @@ mod tests {
             fs::read_to_string(transfer_log_path(&tempdir)).expect("should read transfer log");
         assert_eq!(contents.lines().count(), 1);
         assert!(contents.contains("\"directory\":\"run-001\""));
+        assert!(contents.contains("\"redo\":false"));
         cleanup_temp_dir(&tempdir);
     }
 
@@ -402,9 +550,10 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("system time should be after unix epoch")
             .as_nanos();
+        let unique_id = NEXT_TEST_DIR_ID.fetch_add(1, Ordering::Relaxed);
         let path = std::env::temp_dir().join(format!(
-            "sequencer-sync-transfer-log-test-{}-{timestamp}",
-            std::process::id()
+            "sequencer-sync-transfer-log-test-{}-{timestamp}-{unique_id}",
+            std::process::id(),
         ));
         fs::create_dir(&path).expect("should create temp dir");
         path

@@ -26,7 +26,10 @@ When `sequencer-sync run` is invoked (typically by cron), it:
 * Skips directories where the completion file glob doesn't match (i.e. the sequencing run is still in progress), unless `--transfer-incomplete` is set
 * Transfers matching directories to the category's landing zone via `rsync -a`, respecting exclude patterns found in config
 * Records success/failure in the transfer log; on success, writes a `transfer_successful.txt` marker in the transferred directory
-* Previously failed transfers can be retried with `--retry-failed`
+
+- Previously failed transfers can be retried with `--retry-failed`
+- If "redo" is manually set to true in the JSONL transfer log, previously transferred directories are re-transferred 
+- When the same directory is present multiple times in the transfer log, later entries override earlier.
 
 ## Misc information
 * The file lock is not necessarily held if the lock file exists. Instead, the lock is managed with

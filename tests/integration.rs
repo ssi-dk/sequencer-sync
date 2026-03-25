@@ -399,7 +399,7 @@ fn retry_failed() {
     let log_path = transfer_log_path(&fixture);
     fs::write(
         &log_path,
-        "{\"directory\":\"240101_NB001\",\"transferred_at\":\"2026-01-01T00:00:00Z\",\"succeeded\":false}\n",
+        "{\"directory\":\"240101_NB001\",\"transferred_at\":\"2026-01-01T00:00:00Z\",\"succeeded\":false,\"redo\":false}\n",
     )
     .unwrap();
 
@@ -440,6 +440,47 @@ fn retry_failed() {
     // Run log should indicate this was a retry
     let run_log = read_run_log(&fixture);
     assert!(run_log.contains("Transferred previously failed transfer 240101_NB001"));
+}
+
+#[test]
+fn redo_true_retransfers_succeeded_directory() {
+    let fixture = TestFixture::new("redo-true");
+    let config_path = fixture.setup_nextseq();
+
+    cmd()
+        .args(["run", "--config-path"])
+        .arg(&config_path)
+        .assert()
+        .success();
+
+    let log_path = transfer_log_path(&fixture);
+    fs::write(
+        &log_path,
+        concat!(
+            "{\"directory\":\"240101_NB001\",\"transferred_at\":\"2026-01-01T00:00:00Z\",\"succeeded\":true,\"redo\":false}\n",
+            "{\"directory\":\"240101_NB001\",\"transferred_at\":\"2026-01-01T00:00:01Z\",\"succeeded\":true,\"redo\":true}\n"
+        ),
+    )
+    .unwrap();
+
+    let transferred_file = fixture.path("nextseq-landing/240101_NB001/data.txt");
+    fs::remove_file(&transferred_file).unwrap();
+    assert!(!transferred_file.exists());
+
+    cmd()
+        .args(["run", "--config-path"])
+        .arg(&config_path)
+        .assert()
+        .success();
+
+    assert!(transferred_file.exists());
+
+    let log = read_transfer_log(&fixture);
+    assert!(log.contains("\"redo\":false"));
+    assert!(log.contains("\"succeeded\":true"));
+
+    let run_log = read_run_log(&fixture);
+    assert!(run_log.contains("Transferred directory marked for redo 240101_NB001"));
 }
 
 #[test]

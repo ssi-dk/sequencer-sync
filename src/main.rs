@@ -175,6 +175,8 @@ enum TransferReason {
     New,
     /// Directory was previously transferred but failed; being retried via --retry-failed.
     Retry,
+    /// Directory was manually marked for transfer by setting redo=true in the transfer log.
+    Redo,
 }
 
 enum SkipReason {
@@ -356,6 +358,7 @@ fn transfer_new_directories(
                 let reason_str = match reason {
                     TransferReason::New => "new directory",
                     TransferReason::Retry => "previously failed transfer",
+                    TransferReason::Redo => "directory marked for redo",
                 };
 
                 run_log.info(&format!(
