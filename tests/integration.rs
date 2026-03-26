@@ -555,6 +555,20 @@ fn setup_with_skip_ssh_check() {
 }
 
 #[test]
+fn setup_fails_malformed_existing_transfer_log() {
+    let fixture = TestFixture::new("setup-malformed-transfer-log");
+    let config_path = fixture.setup_nanopore();
+    fs::write(transfer_log_path(&fixture), "{not-json}\n").unwrap();
+
+    cmd()
+        .args(["setup", "--config-path"])
+        .arg(&config_path)
+        .args(["--skip-ssh-check"])
+        .assert()
+        .failure();
+}
+
+#[test]
 fn dry_run_prints_plan_without_copying() {
     let fixture = TestFixture::new("dry-run");
     let config_path = fixture.setup_nanopore();
