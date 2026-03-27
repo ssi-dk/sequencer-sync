@@ -259,8 +259,15 @@ fn run_is_complete(
         // The pattern was validated at config load time, so PatternError is not expected here.
         let mut paths = glob::glob(&pattern).expect("completion file glob pattern should be valid");
         match paths.next() {
-            None => return Ok(false),
-            Some(Ok(_)) => {}
+            None => {
+                return {
+                    debug!("Not found: Completion glob {completion_file_glob}");
+                    Ok(false)
+                };
+            }
+            Some(Ok(_)) => {
+                debug!("Found: Completion glob {completion_file_glob}")
+            }
             Some(Err(source)) => {
                 return Err(AppError::CompletionFileScan {
                     run_dir: run_dir.to_path_buf(),
