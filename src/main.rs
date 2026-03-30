@@ -245,8 +245,6 @@ fn new_directories(
         result.push((entry, reason));
     }
 
-    debug!("Total directories to transfer: {}", result.len());
-
     Ok(result)
 }
 
@@ -320,6 +318,7 @@ fn transfer_new_directories(
     dry_run: bool,
 ) -> Result<(), AppError> {
     let (mut succeeded, mut failed) = (0u32, 0u32);
+    let mut planned_transfers = Vec::new();
 
     for (entry, reason) in new_directories(source, transfer_log, retry_failed)? {
         let dir_name = entry.file_name();
@@ -355,6 +354,15 @@ fn transfer_new_directories(
                 continue;
             }
         }
+
+        planned_transfers.push((entry, reason, target));
+    }
+
+    debug!("Total directories to transfer: {}", planned_transfers.len());
+
+    for (entry, reason, target) in planned_transfers {
+        let dir_name = entry.file_name();
+        let dir_name = dir_name.to_string_lossy();
 
         let transferred_dir = target.destination.join(entry.file_name());
 
