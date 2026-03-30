@@ -622,7 +622,7 @@ source: "{source}"
 category:
   - regex: "^ONT_WGS_"
     landing_zone: "{landing_core}"
-    exclude: ["*_skip", "pod5*"]
+    exclude: ["/Data", "/AutoCenter"]
     completion_file_globs:
       - "report*.html"
 
@@ -649,8 +649,97 @@ category:
         .unwrap();
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("exclude: *_skip"));
-    assert!(stdout.contains("exclude: pod5*"));
+    assert!(stdout.contains("exclude: /Data"));
+    assert!(stdout.contains("exclude: /AutoCenter"));
+}
+
+#[test]
+fn rsync_excludes_patterns_relative_to_transferred_directory() {
+    let fixture = TestFixture::new("rsync-exclude-patterns");
+    fixture.mkdir("flockdir");
+    fixture.mkdir("logdir");
+    fixture.mkdir("nanopore-source");
+    fixture.mkdir("nanopore-landing-core");
+    fixture.mkdir("nanopore-landing-other");
+
+    fixture.mkdir("nanopore-source/ONT_WGS_run1");
+    fixture.write_file("nanopore-source/ONT_WGS_run1/report_final.html", "report");
+    fixture.write_file("nanopore-source/ONT_WGS_run1/data.txt", "keep");
+    fixture.write_file(
+        "nanopore-source/ONT_WGS_run1/Data/top_level.txt",
+        "exclude at root",
+    );
+    fixture.write_file(
+        "nanopore-source/ONT_WGS_run1/other/Data/nested.txt",
+        "keep nested data",
+    );
+    fixture.write_file(
+        "nanopore-source/ONT_WGS_run1/AutoCenter/metrics.txt",
+        "exclude at root",
+    );
+
+    let config = format!(
+        r#"flockdir: "{flockdir}"
+lock_file_name: "sequencer-sync.lock"
+logdir: "{logdir}"
+server_user: "test"
+server_port: 22
+server_host: "localhost"
+source: "{source}"
+
+category:
+  - regex: "^ONT_WGS_"
+    landing_zone: "{landing_core}"
+    exclude: ["/Data", "/AutoCenter"]
+    completion_file_globs:
+      - "report*.html"
+
+  - regex: "^ONT_"
+    landing_zone: "{landing_other}"
+    exclude: []
+    completion_file_globs:
+      - "report*.html"
+"#,
+        flockdir = fixture.path("flockdir").display(),
+        logdir = fixture.path("logdir").display(),
+        source = fixture.path("nanopore-source").display(),
+        landing_core = fixture.path("nanopore-landing-core").display(),
+        landing_other = fixture.path("nanopore-landing-other").display(),
+    );
+    let config_path = fixture.path("nanopore.yaml");
+    fs::write(&config_path, config).unwrap();
+
+    cmd()
+        .args(["run", "--config-path"])
+        .arg(&config_path)
+        .assert()
+        .success();
+
+    assert!(
+        fixture
+            .path("nanopore-landing-core/ONT_WGS_run1/data.txt")
+            .exists()
+    );
+    assert!(
+        fixture
+            .path("nanopore-landing-core/ONT_WGS_run1/report_final.html")
+            .exists()
+    );
+    assert!(
+        !fixture
+            .path("nanopore-landing-core/ONT_WGS_run1/Data")
+            .exists()
+    );
+    assert!(
+        !fixture
+            .path("nanopore-landing-core/ONT_WGS_run1/AutoCenter")
+            .exists()
+    );
+    assert!(
+        fixture
+            .path("nanopore-landing-core/ONT_WGS_run1/other/Data/nested.txt")
+            .exists()
+    );
 }
 
 #[test]

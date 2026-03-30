@@ -1,3 +1,4 @@
+use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -355,13 +356,20 @@ fn transfer_new_directories(
             }
         }
 
+        let transferred_dir = target.destination.join(entry.file_name());
+
         if dry_run {
-            print_dry_run(&entry.path(), &target.destination, &target.exclude);
+            print_dry_run(&entry.path(), &transferred_dir, &target.exclude);
             continue;
         }
 
-        let destination_display = target.destination.display();
-        let rsync_result = rsync_directory(&entry.path(), &target.destination, &target.exclude);
+        fs::create_dir_all(&transferred_dir).map_err(|source| AppError::CreateTransferDir {
+            path: transferred_dir.clone(),
+            source,
+        })?;
+
+        let destination_display = transferred_dir.display();
+        let rsync_result = rsync_directory(&entry.path(), &transferred_dir, &target.exclude);
 
         let key = transfer_log::relative_directory_key(source, &entry.path())
             .map_err(AppError::TransferLog)?;
@@ -381,9 +389,7 @@ fn transfer_new_directories(
                 run_log.info(&format!(
                     "Transferred {reason_str} {dir_name} -> {destination_display}"
                 ));
-                if let Err(error) =
-                    touch_transfer_marker(&target.destination.join(entry.file_name()))
-                {
+                if let Err(error) = touch_transfer_marker(&transferred_dir) {
                     run_log.error(&format!(
                         "Warning: failed to write transfer marker: {error}"
                     ));
@@ -440,9 +446,11 @@ fn rsync_directory(source: &Path, destination: &Path, exclude: &[String]) -> Res
     for pattern in exclude {
         cmd.arg("--exclude").arg(pattern);
     }
+    let source_contents = path_with_trailing_separator(source);
+    let destination_dir = path_with_trailing_separator(destination);
     let status = cmd
-        .arg(source)
-        .arg(destination)
+        .arg(source_contents)
+        .arg(destination_dir)
         .status()
         .map_err(|source| AppError::SpawnRsync { source })?;
 
@@ -455,6 +463,15 @@ fn rsync_directory(source: &Path, destination: &Path, exclude: &[String]) -> Res
             exit_code: status.code(),
         })
     }
+}
+
+fn path_with_trailing_separator(path: &Path) -> OsString {
+    let mut path_with_separator = path.as_os_str().to_os_string();
+    let path_str = path.as_os_str().to_string_lossy();
+    if !path_str.ends_with(std::path::MAIN_SEPARATOR) {
+        path_with_separator.push(std::path::MAIN_SEPARATOR_STR);
+    }
+    path_with_separator
 }
 
 fn load_config(config_path: &Path) -> Result<Config, AppError> {
@@ -695,6 +712,12 @@ enum AppError {
     },
     #[error("failed to write cron file {}: {source}", path.display())]
     WriteCronFile {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("failed to create transfer directory {}: {source}", path.display())]
+    CreateTransferDir {
         path: PathBuf,
         #[source]
         source: std::io::Error,

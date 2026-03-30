@@ -3,20 +3,15 @@ This program runs on DNA sequencers and copies selected files from sequencing ru
 The `landingzones` program then syncronizes the landing zone with a directory on a remote server.
 This program is run regularly by a cron job.
 
-## Installation
-* Compile the code to the target platform (likely x86_64-unknown-linux-musl)
-* Copy the binary and `examples/config.yaml` to the sequencer
-* Update all fields in the config to the correct values
-* Ensure:
-    - Source directory exists and is readable
-    - Landing zone and flockdir exist and are writeable
-* Set up SSH key to the server in the config, must work without password
-* Run `sequencer-sync setup <config_path>` and fix any errors
-* Copy the cron file from the flockdir into ~/crontab.d
-* Launch cron with `cat ~/crontab.d | cron -`
+## How to install / deploy
+For deployment at SSI, see the (private) repo `rit-deploy-sequencer-sync`.
+
+For other users, e.g. non SSI users:
+* Install Rust via `rustup`: https://rustup.rs/
+* Compile with `cargo build --release` from within this repo and find the binary in `target/release`.
 
 ## Behaviour
-When `sequencer-sync run` is invoked (typically by cron), it:
+When `sequencer-sync run` is invoked, it:
 
 * Loads and validates the config file
 * Acquires a file lock to prevent concurrent runs
