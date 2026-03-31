@@ -660,7 +660,7 @@ struct RunLock {
 
 impl Drop for RunLock {
     fn drop(&mut self) {
-        let _ = self.file.unlock();
+        let _ = FileExt::unlock(&self.file);
     }
 }
 
