@@ -4,15 +4,18 @@ use std::path::{Path, PathBuf};
 
 use chrono::Local;
 
-// Human-readable log. Two files: Full log, and latest run which did something.
+// Human-readable log. Two files: Full log, and latest attempted transfer log.
 pub struct RunLog {
     /// Absolute path to the append-only log that accumulates across all runs.
     full_log_path: PathBuf,
-    /// Absolute path to the log that is overwritten on each program invocation.
+    /// Absolute path to the log that is overwritten only once a real transfer
+    /// attempt starts. Runs that do not start rsync append here instead.
     latest_log_path: PathBuf,
-    /// Whether the latest log has been truncated in this invocation. Reset per
-    /// program run, not per directory — the first call to `log()` truncates,
-    /// subsequent calls append.
+    /// Lines buffered for the latest log until we know whether this run should
+    /// append to the existing latest log or replace it.
+    pending_latest_lines: Vec<String>,
+    /// Whether this run has claimed the latest log as the latest attempted
+    /// transfer. Once set, subsequent lines append directly.
     latest_started: bool,
     /// Set to true if any call to `log()` failed during this run.
     had_error: bool,
@@ -23,6 +26,7 @@ impl RunLog {
         Self {
             full_log_path: logdir.join("sequencer-sync.log"),
             latest_log_path: logdir.join("sequencer-sync-latest.log"),
+            pending_latest_lines: Vec::new(),
             latest_started: false,
             had_error: false,
         }
@@ -47,6 +51,67 @@ impl RunLog {
         self.had_error = true;
     }
 
+    /// Mark this run as the latest attempted transfer. Buffered lines for this
+    /// run replace the existing latest log, and subsequent lines append.
+    pub fn start_latest_attempt(&mut self) {
+        if let Err(error) = self.try_start_latest_attempt() {
+            log::warn!("Failed to update latest run log: {error}");
+            self.had_error = true;
+        }
+    }
+
+    fn try_start_latest_attempt(&mut self) -> std::io::Result<()> {
+        if self.latest_started {
+            return Ok(());
+        }
+
+        if self.pending_latest_lines.is_empty() {
+            self.latest_started = true;
+            return Ok(());
+        }
+
+        let mut latest = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&self.latest_log_path)?;
+        for line in &self.pending_latest_lines {
+            latest.write_all(line.as_bytes())?;
+        }
+        latest.sync_all()?;
+
+        self.pending_latest_lines.clear();
+        self.latest_started = true;
+        Ok(())
+    }
+
+    /// Flush any buffered lines by appending them to the existing latest log.
+    /// This is used for noteworthy runs that did not actually start rsync.
+    pub fn finish(&mut self) {
+        if let Err(error) = self.try_finish() {
+            log::warn!("Failed to finalize latest run log: {error}");
+            self.had_error = true;
+        }
+    }
+
+    fn try_finish(&mut self) -> std::io::Result<()> {
+        if self.latest_started || self.pending_latest_lines.is_empty() {
+            return Ok(());
+        }
+
+        let mut latest = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.latest_log_path)?;
+        for line in &self.pending_latest_lines {
+            latest.write_all(line.as_bytes())?;
+        }
+        latest.sync_all()?;
+
+        self.pending_latest_lines.clear();
+        Ok(())
+    }
+
     /// Write a message to the log files. If writing fails, emit a warning and
     /// mark this RunLog as having encountered an error.
     fn write(&mut self, message: &str) {
@@ -60,27 +125,28 @@ impl RunLog {
         let timestamp = Local::now().format("%Y-%m-%d %H:%M:%S");
         let line = format!("{timestamp}: {message}\n");
 
-        // Append to full log
-        let mut full = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.full_log_path)?;
-        full.write_all(line.as_bytes())?;
-        full.sync_all()?;
+        self.append_line(&self.full_log_path, &line)?;
 
-        // Write to latest log (truncate on first write, append after)
         if self.latest_started {
-            let mut latest = OpenOptions::new()
-                .append(true)
-                .open(&self.latest_log_path)?;
-            latest.write_all(line.as_bytes())?;
-            latest.sync_all()?;
+            self.append_line(&self.latest_log_path, &line)?;
         } else {
-            std::fs::write(&self.latest_log_path, &line)?;
-            self.latest_started = true;
+            self.pending_latest_lines.push(line);
         }
 
         Ok(())
+    }
+
+    fn append_line(&self, path: &Path, line: &str) -> std::io::Result<()> {
+        let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+        file.write_all(line.as_bytes())?;
+        file.sync_all()?;
+        Ok(())
+    }
+}
+
+impl Drop for RunLog {
+    fn drop(&mut self) {
+        self.finish();
     }
 }
 
@@ -115,6 +181,7 @@ mod tests {
         let mut log = RunLog::new(&tempdir);
 
         log.info("test message");
+        log.finish();
 
         let full = fs::read_to_string(tempdir.join("sequencer-sync.log")).unwrap();
         assert!(full.contains("test message"));
@@ -124,19 +191,19 @@ mod tests {
     }
 
     #[test]
-    fn latest_log_is_truncated_on_new_run() {
+    fn latest_log_is_truncated_on_new_attempted_transfer() {
         let tempdir = make_temp_dir();
 
-        // First run
         {
             let mut log = RunLog::new(&tempdir);
             log.info("first run message");
+            log.start_latest_attempt();
         }
 
-        // Second run
         {
             let mut log = RunLog::new(&tempdir);
             log.info("second run message");
+            log.start_latest_attempt();
         }
 
         let full = fs::read_to_string(tempdir.join("sequencer-sync.log")).unwrap();
@@ -159,6 +226,7 @@ mod tests {
 
         log.info("message one");
         log.info("message two");
+        log.finish();
 
         let latest = fs::read_to_string(tempdir.join("sequencer-sync-latest.log")).unwrap();
         assert!(latest.contains("message one"));
@@ -175,6 +243,29 @@ mod tests {
 
         assert!(!tempdir.join("sequencer-sync.log").exists());
         assert!(!tempdir.join("sequencer-sync-latest.log").exists());
+        cleanup_temp_dir(&tempdir);
+    }
+
+    #[test]
+    fn non_transfer_run_appends_to_existing_latest_log() {
+        let tempdir = make_temp_dir();
+
+        {
+            let mut log = RunLog::new(&tempdir);
+            log.info("first attempted transfer");
+            log.start_latest_attempt();
+        }
+
+        {
+            let mut log = RunLog::new(&tempdir);
+            log.info("file lock already held");
+            log.finish();
+        }
+
+        let latest = fs::read_to_string(tempdir.join("sequencer-sync-latest.log")).unwrap();
+        assert!(latest.contains("first attempted transfer"));
+        assert!(latest.contains("file lock already held"));
+
         cleanup_temp_dir(&tempdir);
     }
 }

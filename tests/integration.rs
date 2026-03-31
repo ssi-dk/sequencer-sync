@@ -427,6 +427,7 @@ fn second_run_is_noop() {
 
     let log_after_first = read_transfer_log(&fixture);
     assert_eq!(transfer_log_line_count(&fixture), 2);
+    let run_log_after_first = read_run_log(&fixture);
     let latest_after_first = read_latest_log(&fixture);
 
     // Second run
@@ -440,9 +441,38 @@ fn second_run_is_noop() {
     let log_after_second = read_transfer_log(&fixture);
     assert_eq!(log_after_first, log_after_second);
 
+    // Full run log unchanged (true no-op doesn't log)
+    let run_log_after_second = read_run_log(&fixture);
+    assert_eq!(run_log_after_first, run_log_after_second);
+
     // Latest log unchanged (no-op doesn't write, so file from first run persists)
     let latest_after_second = read_latest_log(&fixture);
     assert_eq!(latest_after_first, latest_after_second);
+}
+
+#[test]
+fn incomplete_only_run_appends_to_latest_log() {
+    let fixture = TestFixture::new("incomplete-only-appends-latest");
+    let config_path = fixture.setup_nextseq();
+
+    cmd()
+        .args(["run", "--config-path"])
+        .arg(&config_path)
+        .assert()
+        .success();
+
+    let latest_after_first = read_latest_log(&fixture);
+    assert!(latest_after_first.contains("Transferred new directory 240101_NB001"));
+
+    cmd()
+        .args(["run", "--config-path"])
+        .arg(&config_path)
+        .assert()
+        .success();
+
+    let latest_after_second = read_latest_log(&fixture);
+    assert!(latest_after_second.contains("Transferred new directory 240101_NB001"));
+    assert!(latest_after_second.contains("Skipped incomplete directory 240202_NB002"));
 }
 
 #[test]
@@ -595,6 +625,8 @@ fn dry_run_prints_plan_without_copying() {
 
     // Transfer log should be empty (no transfers recorded)
     assert_eq!(transfer_log_line_count(&fixture), 0);
+    assert_eq!(read_run_log(&fixture), "");
+    assert_eq!(read_latest_log(&fixture), "");
 }
 
 #[test]

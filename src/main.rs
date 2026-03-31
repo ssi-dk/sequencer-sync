@@ -53,7 +53,7 @@ struct RunArgs {
     /// Transfer directories even if the completion file is not present.
     #[arg(long, default_value_t = false)]
     transfer_incomplete: bool,
-    /// Print what would be copied instead of actually copying.
+    /// Print what would be copied instead of actually copying; disables run-log writes.
     #[arg(long, default_value_t = false)]
     dry_run: bool,
 }
@@ -105,35 +105,76 @@ fn setup(args: SetupArgs) -> Result<(), AppError> {
 // A TransferTarget stores information about source and destination once we have
 // classified a run as e.g. project/operations/something else.
 struct TransferTarget {
+    regex_string: String,
     destination: PathBuf,
     exclude: Vec<String>,
     completion_file_globs: Vec<glob::Pattern>,
 }
 
+#[derive(Default)]
+// We only retain the scan counts that are useful to operators when deciding
+// whether a run did work or skipped incomplete directories.
+struct ScanSummary {
+    incomplete_skipped: u32,
+    planned: u32,
+}
+
+impl ScanSummary {
+    fn has_noteworthy_activity(&self) -> bool {
+        self.planned > 0 || self.incomplete_skipped > 0
+    }
+}
+
+// Scanning returns both the work to perform and the operator-facing summary so
+// the caller can decide whether to log anything at all before starting rsync.
+// I.e. we don't want to log on noop calls since then running this program via
+// a cron job would flood the log, making it useless.
+struct ScanResult {
+    planned_transfers: Vec<(fs::DirEntry, TransferReason, TransferTarget)>,
+    incomplete_messages: Vec<String>,
+    summary: ScanSummary,
+}
+
 fn run_command(args: RunArgs) -> Result<(), AppError> {
     let config = load_config(&args.config_path)?;
+    let mut run_log = RunLog::new(&config.logdir);
 
     let _lock = match acquire_run_lock(&config.flockdir, &config.lock_file_name)? {
         Some(lock) => lock,
         None => {
-            debug!("Another sequencer-sync run is already in progress; exiting.");
+            if !args.dry_run {
+                run_log.info("Run skipped: file lock already held");
+                run_log.finish();
+                if run_log.had_error() {
+                    return Err(AppError::RunLogWriteFailed);
+                }
+            }
             return Ok(());
         }
     };
-    let mut transfer_log = TransferLog::load(&config.logdir).map_err(AppError::TransferLog)?;
-    let mut run_log = RunLog::new(&config.logdir);
 
-    transfer_new_directories(
+    let mut transfer_log = TransferLog::load(&config.logdir).map_err(AppError::TransferLog)?;
+
+    let result = transfer_new_directories(
         &config.source,
         &config.categories,
         &mut transfer_log,
         &mut run_log,
-        args.retry_failed,
-        args.transfer_incomplete,
-        args.dry_run,
-    )?;
+        &args,
+    );
+    if !args.dry_run {
+        run_log.finish();
+    }
 
-    if run_log.had_error() {
+    if let Err(error) = result {
+        if !args.dry_run {
+            run_log.error(&format!("Run aborted: {error}"));
+            run_log.finish();
+        }
+        return Err(error);
+    }
+
+    if !args.dry_run && run_log.had_error() {
         return Err(AppError::RunLogWriteFailed);
     }
 
@@ -172,6 +213,7 @@ fn validate_environment(config: &Config, skip_ssh_check: bool) -> Result<(), App
     Ok(())
 }
 
+#[derive(Clone, Copy)]
 enum TransferReason {
     /// Directory has never been transferred before.
     New,
@@ -181,6 +223,7 @@ enum TransferReason {
     Redo,
 }
 
+#[derive(Clone, Copy)]
 enum SkipReason {
     // Should not be transferred: Previously failed, --retry-failed not set
     FailedNoRetry,
@@ -194,11 +237,13 @@ enum TransferAction {
     Skip(SkipReason),
 }
 
-fn new_directories(
+fn scan_directories(
     source: &Path,
+    categories: &[config::Category],
     transfer_log: &TransferLog,
     retry_failed: bool,
-) -> Result<Vec<(fs::DirEntry, TransferReason)>, AppError> {
+    transfer_incomplete: bool,
+) -> Result<ScanResult, AppError> {
     debug!("Searching for new directories in {}", source.display());
 
     let entries = fs::read_dir(source).map_err(|e| AppError::ReadDirectory {
@@ -207,7 +252,17 @@ fn new_directories(
         source: e,
     })?;
 
-    let mut result = Vec::new();
+    let mut planned_transfers = Vec::new();
+    let mut incomplete_messages = Vec::new();
+    let mut summary = ScanSummary::default();
+
+    if log::max_level() >= log::LevelFilter::Debug {
+        debug!("Checking for following regex");
+        for cat in categories {
+            debug!("\t{}", cat.regex.as_str());
+        }
+    }
+
     for entry in entries {
         let entry = entry.map_err(|e| AppError::ReadDirectory {
             field: "source",
@@ -223,7 +278,6 @@ fn new_directories(
         if !file_type.is_dir() {
             continue;
         }
-
         let key = transfer_log::relative_directory_key(source, &entry.path())
             .map_err(AppError::TransferLog)?;
 
@@ -242,10 +296,53 @@ fn new_directories(
             }
             TransferAction::Tranfer(reason) => reason,
         };
-        result.push((entry, reason));
-    }
 
-    Ok(result)
+        let dir_name = entry.file_name();
+        let dir_name = dir_name.to_string_lossy();
+
+        let target = match classify(&dir_name, categories)? {
+            Some(t) => {
+                debug!(
+                    "Match: Run directory {} match regex {} to landing zone {}",
+                    dir_name,
+                    &t.regex_string,
+                    &t.destination.display()
+                );
+                t
+            }
+            None => {
+                debug!("No category match: {}", dir_name);
+                continue;
+            }
+        };
+
+        let is_complete = run_is_complete(&entry.path(), &target.completion_file_globs)?;
+        if !is_complete {
+            if transfer_incomplete {
+                debug!(
+                    "Transferring incomplete run due to --transfer-incomplete flag: {}",
+                    &entry.path().display()
+                );
+            } else {
+                summary.incomplete_skipped += 1;
+                debug!(
+                    "Completion file(s) not found; skipping {}",
+                    &entry.path().display()
+                );
+                incomplete_messages.push(format!("Skipped incomplete directory {dir_name}"));
+                continue;
+            }
+        }
+
+        planned_transfers.push((entry, reason, target));
+    }
+    summary.planned = planned_transfers.len() as u32;
+
+    Ok(ScanResult {
+        planned_transfers,
+        incomplete_messages,
+        summary,
+    })
 }
 
 fn run_is_complete(
@@ -260,13 +357,14 @@ fn run_is_complete(
         match paths.next() {
             None => {
                 return {
-                    debug!("Not found: Completion glob {completion_file_glob}");
+                    debug!(
+                        "\tNot found: Completion glob {}",
+                        run_dir.join(completion_file_glob.as_str()).display()
+                    );
                     Ok(false)
                 };
             }
-            Some(Ok(_)) => {
-                debug!("Found: Completion glob {completion_file_glob}")
-            }
+            Some(Ok(_)) => (),
             Some(Err(source)) => {
                 return Err(AppError::CompletionFileScan {
                     run_dir: run_dir.to_path_buf(),
@@ -300,6 +398,7 @@ fn classify(
             cat.landing_zone.clone()
         };
         return Ok(Some(TransferTarget {
+            regex_string: cat.regex.as_str().to_owned(),
             destination,
             exclude: cat.exclude.clone(),
             completion_file_globs: cat.completion_file_globs.clone(),
@@ -313,52 +412,42 @@ fn transfer_new_directories(
     categories: &[config::Category],
     transfer_log: &mut TransferLog,
     run_log: &mut RunLog,
-    retry_failed: bool,
-    transfer_incomplete: bool,
-    dry_run: bool,
+    args: &RunArgs,
 ) -> Result<(), AppError> {
     let (mut succeeded, mut failed) = (0u32, 0u32);
-    let mut planned_transfers = Vec::new();
+    let scan = scan_directories(
+        source,
+        categories,
+        transfer_log,
+        args.retry_failed,
+        args.transfer_incomplete,
+    )?;
 
-    for (entry, reason) in new_directories(source, transfer_log, retry_failed)? {
-        let dir_name = entry.file_name();
-        let dir_name = dir_name.to_string_lossy();
+    debug!(
+        "Total directories to transfer: {}",
+        scan.planned_transfers.len()
+    );
 
-        let target = match classify(&dir_name, categories)? {
-            Some(t) => {
-                debug!(
-                    "Match: Run directory {} to landing zone {}",
-                    dir_name,
-                    &t.destination.display()
-                );
-                t
-            }
-            None => {
-                debug!("No category match: {}", dir_name);
-                continue;
-            }
-        };
-
-        let is_complete = run_is_complete(&entry.path(), &target.completion_file_globs)?;
-        if !is_complete {
-            if transfer_incomplete {
-                debug!(
-                    "Transferring incomplete run due to --transfer-incomplete flag: {}",
-                    &entry.path().display()
-                );
-            } else {
-                debug!(
-                    "Completion file not found; skipping {}",
-                    &entry.path().display()
-                );
-                continue;
-            }
-        }
-
-        planned_transfers.push((entry, reason, target));
+    if !scan.summary.has_noteworthy_activity() {
+        return Ok(());
     }
 
-    debug!("Total directories to transfer: {}", planned_transfers.len());
+    let ScanResult {
+        planned_transfers,
+        incomplete_messages,
+        summary,
+    } = scan;
+
+    if !args.dry_run {
+        run_log.info(&run_started_message(args));
+        run_log.info(&scan_summary_message(&summary));
+        for message in &incomplete_messages {
+            run_log.info(message);
+        }
+        if !planned_transfers.is_empty() {
+            run_log.start_latest_attempt();
+        }
+    }
 
     for (entry, reason, target) in planned_transfers {
         let dir_name = entry.file_name();
@@ -366,7 +455,7 @@ fn transfer_new_directories(
 
         let transferred_dir = target.destination.join(entry.file_name());
 
-        if dry_run {
+        if args.dry_run {
             print_dry_run(&entry.path(), &transferred_dir, &target.exclude);
             continue;
         }
@@ -388,14 +477,9 @@ fn transfer_new_directories(
         match rsync_result {
             Ok(()) => {
                 succeeded += 1;
-                let reason_str = match reason {
-                    TransferReason::New => "new directory",
-                    TransferReason::Retry => "previously failed transfer",
-                    TransferReason::Redo => "directory marked for redo",
-                };
-
                 run_log.info(&format!(
-                    "Transferred {reason_str} {dir_name} -> {destination_display}"
+                    "Transferred {} {dir_name} -> {destination_display}",
+                    transfer_reason_label(reason)
                 ));
                 if let Err(error) = touch_transfer_marker(&transferred_dir) {
                     run_log.error(&format!(
@@ -406,19 +490,44 @@ fn transfer_new_directories(
             Err(error) => {
                 failed += 1;
                 run_log.error(&format!(
-                    "FAILED transfer {dir_name} -> {destination_display}: {error}"
+                    "FAILED transfer {} {dir_name} -> {destination_display}: {error}",
+                    transfer_reason_label(reason)
                 ));
             }
         }
     }
 
-    if succeeded + failed > 0 {
-        run_log.info(&format!(
-            "Run complete: {succeeded} transferred, {failed} failed"
-        ));
+    if !args.dry_run {
+        run_log.info(&run_complete_message(succeeded, failed));
     }
 
     Ok(())
+}
+
+fn run_started_message(args: &RunArgs) -> String {
+    format!(
+        "Run started: retry_failed={} transfer_incomplete={}",
+        args.retry_failed, args.transfer_incomplete
+    )
+}
+
+fn scan_summary_message(summary: &ScanSummary) -> String {
+    format!(
+        "Scan summary: planned={} incomplete_skipped={}",
+        summary.planned, summary.incomplete_skipped
+    )
+}
+
+fn run_complete_message(succeeded: u32, failed: u32) -> String {
+    format!("Run complete: {succeeded} transferred, {failed} failed")
+}
+
+fn transfer_reason_label(reason: TransferReason) -> &'static str {
+    match reason {
+        TransferReason::New => "new directory",
+        TransferReason::Retry => "previously failed transfer",
+        TransferReason::Redo => "directory marked for redo",
+    }
 }
 
 // This marker is useful because once the data has been transferred from the
@@ -456,19 +565,30 @@ fn rsync_directory(source: &Path, destination: &Path, exclude: &[String]) -> Res
     }
     let source_contents = path_with_trailing_separator(source);
     let destination_dir = path_with_trailing_separator(destination);
-    let status = cmd
+    let output = cmd
         .arg(source_contents)
         .arg(destination_dir)
-        .status()
+        .output()
         .map_err(|source| AppError::SpawnRsync { source })?;
 
-    if status.success() {
+    if output.status.success() {
         Ok(())
     } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        debug!(
+            "rsync failed: source={} destination={} exit_code={} stderr={}",
+            source.display(),
+            destination.display(),
+            output
+                .status
+                .code()
+                .map_or_else(|| "unknown".to_string(), |code| code.to_string()),
+            stderr.trim()
+        );
         Err(AppError::RsyncFailed {
             source_path: source.to_path_buf(),
             destination: destination.to_path_buf(),
-            exit_code: status.code(),
+            exit_code: output.status.code(),
         })
     }
 }
@@ -787,9 +907,82 @@ enum AppError {
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::sync::{Mutex, Once};
+    use std::time::{SystemTime, UNIX_EPOCH};
 
-    use super::{cron_file_path, lock_file_path, render_cron_file};
+    use glob::Pattern;
+    use log::{LevelFilter, Log, Metadata, Record};
+    use regex::Regex;
+
+    use super::{classify, cron_file_path, lock_file_path, render_cron_file, run_is_complete};
+    use crate::config::Category;
+
+    struct TestLogger {
+        messages: Mutex<Vec<String>>,
+    }
+
+    impl TestLogger {
+        const fn new() -> Self {
+            Self {
+                messages: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn clear(&self) {
+            self.messages.lock().unwrap().clear();
+        }
+
+        fn lines(&self) -> Vec<String> {
+            self.messages.lock().unwrap().clone()
+        }
+    }
+
+    impl Log for TestLogger {
+        fn enabled(&self, metadata: &Metadata<'_>) -> bool {
+            metadata.level() <= log::max_level()
+        }
+
+        fn log(&self, record: &Record<'_>) {
+            if self.enabled(record.metadata()) {
+                self.messages
+                    .lock()
+                    .unwrap()
+                    .push(format!("{}", record.args()));
+            }
+        }
+
+        fn flush(&self) {}
+    }
+
+    static TEST_LOGGER: TestLogger = TestLogger::new();
+    static INIT_TEST_LOGGER: Once = Once::new();
+
+    fn init_test_logger() {
+        INIT_TEST_LOGGER.call_once(|| {
+            log::set_logger(&TEST_LOGGER).expect("test logger should install exactly once");
+            log::set_max_level(LevelFilter::Debug);
+        });
+        TEST_LOGGER.clear();
+    }
+
+    fn make_temp_dir() -> PathBuf {
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time should be after unix epoch")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "sequencer-sync-main-test-{}-{timestamp}",
+            std::process::id()
+        ));
+        fs::create_dir(&path).expect("should create temp dir");
+        path
+    }
+
+    fn cleanup_temp_dir(path: &Path) {
+        fs::remove_dir_all(path).expect("should remove temp dir");
+    }
 
     #[test]
     fn renders_cron_file() {
@@ -820,5 +1013,39 @@ mod tests {
         let path = lock_file_path(Path::new("/var/lib/sequencer/flock"), "my.lock");
 
         assert_eq!(path, Path::new("/var/lib/sequencer/flock/my.lock"));
+    }
+
+    #[test]
+    fn run_is_complete_logs_full_missing_glob_path() {
+        init_test_logger();
+        let tempdir = make_temp_dir();
+        let glob = Pattern::new("nested/complete.txt").expect("glob should parse");
+
+        let is_complete = run_is_complete(&tempdir, &[glob]).expect("scan should succeed");
+
+        assert!(!is_complete);
+        let expected_path = tempdir.join("nested/complete.txt").display().to_string();
+        assert!(TEST_LOGGER.lines().iter().any(|line| {
+            line.contains("Not found: Completion glob") && line.contains(&expected_path)
+        }));
+
+        cleanup_temp_dir(&tempdir);
+    }
+
+    #[test]
+    fn classify_preserves_matching_regex_string() {
+        let categories = vec![Category {
+            regex: Regex::new(r"^ONT_WGS_").expect("regex should parse"),
+            landing_zone: PathBuf::from("/tmp/landing"),
+            exclude: Vec::new(),
+            completion_file_globs: vec![Pattern::new("report*.html").expect("glob should parse")],
+            year_subdirectory: false,
+        }];
+
+        let target = classify("ONT_WGS_run1", &categories)
+            .expect("classification should succeed")
+            .expect("directory should match category");
+
+        assert_eq!(target.regex_string, "^ONT_WGS_");
     }
 }
