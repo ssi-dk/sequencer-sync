@@ -44,20 +44,21 @@ impl TestFixture {
             r#"flockdir: "{flockdir}"
 lock_file_name: "sequencer-sync.lock"
 logdir: "{logdir}"
-server_user: "test"
-server_port: 22
-server_host: "localhost"
 source: "{source}"
 
 category:
   - regex: "^ONT_WGS_"
-    landing_zone: "{landing_core}"
+    destination:
+      type: local
+      path: "{landing_core}"
     exclude: []
     completion_file_globs:
       - "report*.html"
 
   - regex: "^ONT_"
-    landing_zone: "{landing_other}"
+    destination:
+      type: local
+      path: "{landing_other}"
     exclude: []
     completion_file_globs:
       - "report*.html"
@@ -78,14 +79,13 @@ category:
             r#"flockdir: "{flockdir}"
 lock_file_name: "sequencer-sync.lock"
 logdir: "{logdir}"
-server_user: "test"
-server_port: 22
-server_host: "localhost"
 source: "{source}"
 
 category:
   - regex: "^\\d{{6}}_"
-    landing_zone: "{landing}"
+    destination:
+      type: local
+      path: "{landing}"
     exclude: []
     completion_file_globs:
       - "PrimaryAnalysisMetrics/PrimaryAnalysisMetrics.csv"
@@ -222,20 +222,21 @@ fn run_fails_nonexistent_landing_zone() {
         r#"flockdir: "{flockdir}"
 lock_file_name: "sequencer-sync.lock"
 logdir: "{logdir}"
-server_user: "test"
-server_port: 22
-server_host: "localhost"
 source: "{source}"
 
 category:
   - regex: "^ONT_WGS_"
-    landing_zone: "{landing_core}"
+    destination:
+      type: local
+      path: "{landing_core}"
     exclude: []
     completion_file_globs:
       - "report*.html"
 
   - regex: "^ONT_"
-    landing_zone: "{root}/no-such-parent/nanopore-landing-other"
+    destination:
+      type: local
+      path: "{root}/no-such-parent/nanopore-landing-other"
     exclude: []
     completion_file_globs:
       - "report*.html"
@@ -382,14 +383,13 @@ fn nextseq_requires_all_completion_globs() {
         r#"flockdir: "{flockdir}"
 lock_file_name: "sequencer-sync.lock"
 logdir: "{logdir}"
-server_user: "test"
-server_port: 22
-server_host: "localhost"
 source: "{source}"
 
 category:
   - regex: "^\\d{{6}}_"
-    landing_zone: "{landing}"
+    destination:
+      type: local
+      path: "{landing}"
     exclude: []
     completion_file_globs:
       - "PrimaryAnalysisMetrics/PrimaryAnalysisMetrics.csv"
@@ -646,20 +646,21 @@ fn dry_run_shows_exclude_patterns() {
         r#"flockdir: "{flockdir}"
 lock_file_name: "sequencer-sync.lock"
 logdir: "{logdir}"
-server_user: "test"
-server_port: 22
-server_host: "localhost"
 source: "{source}"
 
 category:
   - regex: "^ONT_WGS_"
-    landing_zone: "{landing_core}"
+    destination:
+      type: local
+      path: "{landing_core}"
     exclude: ["/Data", "/AutoCenter"]
     completion_file_globs:
       - "report*.html"
 
   - regex: "^ONT_"
-    landing_zone: "{landing_other}"
+    destination:
+      type: local
+      path: "{landing_other}"
     exclude: []
     completion_file_globs:
       - "report*.html"
@@ -714,20 +715,21 @@ fn rsync_excludes_patterns_relative_to_transferred_directory() {
         r#"flockdir: "{flockdir}"
 lock_file_name: "sequencer-sync.lock"
 logdir: "{logdir}"
-server_user: "test"
-server_port: 22
-server_host: "localhost"
 source: "{source}"
 
 category:
   - regex: "^ONT_WGS_"
-    landing_zone: "{landing_core}"
+    destination:
+      type: local
+      path: "{landing_core}"
     exclude: ["/Data", "/AutoCenter"]
     completion_file_globs:
       - "report*.html"
 
   - regex: "^ONT_"
-    landing_zone: "{landing_other}"
+    destination:
+      type: local
+      path: "{landing_other}"
     exclude: []
     completion_file_globs:
       - "report*.html"
@@ -795,6 +797,59 @@ fn dry_run_respects_completion_check() {
 }
 
 #[test]
+fn dry_run_prints_remote_destination_without_copying() {
+    let fixture = TestFixture::new("dry-run-remote");
+    fixture.mkdir("flockdir");
+    fixture.mkdir("logdir");
+    fixture.mkdir("nextseq-source");
+    fixture.mkdir("nextseq-source/240101_NB001");
+    fixture.mkdir("nextseq-source/240101_NB001/PrimaryAnalysisMetrics");
+    fixture.write_file(
+        "nextseq-source/240101_NB001/PrimaryAnalysisMetrics/PrimaryAnalysisMetrics.csv",
+        "metrics",
+    );
+    fixture.write_file("nextseq-source/240101_NB001/data.txt", "data");
+
+    let config = format!(
+        r#"flockdir: "{flockdir}"
+lock_file_name: "sequencer-sync.lock"
+logdir: "{logdir}"
+source: "{source}"
+
+category:
+  - regex: "^\\d{{6}}_"
+    destination:
+      type: remote
+      user: "alice"
+      host: "example.org"
+      port: 2222
+      path: "/incoming/nextseq"
+    exclude: []
+    completion_file_globs:
+      - "PrimaryAnalysisMetrics/PrimaryAnalysisMetrics.csv"
+"#,
+        flockdir = fixture.path("flockdir").display(),
+        logdir = fixture.path("logdir").display(),
+        source = fixture.path("nextseq-source").display(),
+    );
+    let config_path = fixture.path("nextseq-remote.yaml");
+    fs::write(&config_path, config).unwrap();
+
+    let output = cmd()
+        .args(["run", "--config-path"])
+        .arg(&config_path)
+        .args(["--dry-run"])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("240101_NB001"));
+    assert!(stdout.contains("alice@example.org:/incoming/nextseq/240101_NB001"));
+    assert_eq!(transfer_log_line_count(&fixture), 0);
+}
+
+#[test]
 fn setup_fails_missing_source() {
     let fixture = TestFixture::new("setup-no-source");
     fixture.mkdir("flockdir");
@@ -842,20 +897,21 @@ fn setup_fails_duplicate_landing_zones() {
         r#"flockdir: "{flockdir}"
 lock_file_name: "sequencer-sync.lock"
 logdir: "{logdir}"
-server_user: "test"
-server_port: 22
-server_host: "localhost"
 source: "{source}"
 
 category:
   - regex: "^ONT_WGS_"
-    landing_zone: "{landing}"
+    destination:
+      type: local
+      path: "{landing}"
     exclude: []
     completion_file_globs:
       - "report*.html"
 
   - regex: "^ONT_"
-    landing_zone: "{landing}"
+    destination:
+      type: local
+      path: "{landing}"
     exclude: []
     completion_file_globs:
       - "report*.html"
@@ -887,14 +943,13 @@ fn setup_fails_landing_zone_equals_flockdir() {
         r#"flockdir: "{shared}"
 lock_file_name: "sequencer-sync.lock"
 logdir: "{logdir}"
-server_user: "test"
-server_port: 22
-server_host: "localhost"
 source: "{source}"
 
 category:
   - regex: "^\\d{{6}}_"
-    landing_zone: "{shared}"
+    destination:
+      type: local
+      path: "{shared}"
     exclude: []
     completion_file_globs:
       - "PrimaryAnalysisMetrics/PrimaryAnalysisMetrics.csv"

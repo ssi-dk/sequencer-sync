@@ -1,7 +1,6 @@
 # Sequencer-sync
-This program runs on DNA sequencers and copies selected files from sequencing runs to a "landing zone" on the same machine.
-The `landingzones` program then syncronizes the landing zone with a directory on a remote server.
-This program is run regularly by a cron job.
+This program runs on DNA sequencers and copies selected output files from sequencing runs to another directory.
+It is intended to run on a cron job, and automatically detects when the run is complete.
 
 ## How to install / deploy
 For deployment at SSI, see the (private) repo `rit-deploy-sequencer-sync`.
@@ -19,8 +18,8 @@ When `sequencer-sync run` is invoked, it:
 * Scans the source directory for subdirectories not yet in the transfer log
 * For each new directory, matches it against the configured categories by regex
 * Skips directories where any configured completion file glob fails to match (i.e. the sequencing run is still in progress), unless `--transfer-incomplete` is set
-* Transfers matching directories to the category's landing zone via `rsync -a`, respecting exclude patterns found in config
-* Records success/failure in the transfer log; on success, writes a `transfer_successful.txt` marker in the transferred directory
+* Transfers matching directories to the category's configured destination via `rsync -a`, respecting exclude patterns found in config
+* Records success/failure in the transfer log; on success, writes a `transfer_successful.txt` marker in the transferred directory or remote destination
 
 - Previously failed transfers can be retried with `--retry-failed`
 - If "redo" is manually set to true in the JSONL transfer log, previously transferred directories are re-transferred 
@@ -31,9 +30,9 @@ When `sequencer-sync run` is invoked, it:
   `flock()` system calls. Use the `flock` tool to check if the lock is held.
 
 ## Commands:
-* `sequencer-sync setup`: Validate config file, check directories have correct permissions, and print cron tab
+* `sequencer-sync setup`: Validate config file, check directories have correct permissions, and write cron file.
 	* `--config-path` (required): path to config file to load, see our deploy repo 
-	* `--skip-ssh-check`: By default, setup will check that you have passwordless SSH access with username/host/port provided by the config file. If this option is set, skip that check.
+	* `--skip-ssh-check`: By default, setup will check passwordless SSH access and remote destination writability for configured remote destinations. If this option is set, skip those checks.
 
 * `sequencer-sync run`: Synchronize files to the landing zone
 	* `--config-path` (required): path to config file to load, see our deploy repo

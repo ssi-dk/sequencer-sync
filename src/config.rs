@@ -15,27 +15,37 @@ pub struct Config {
     /// Canonicalized absolute path. Directory for log files (transfer log, run
     /// log, cron file).
     pub logdir: PathBuf,
-
-    // You must have ssh access to this server with this port, user name.
-    pub server_user: String,
-    pub server_port: u16,
-    pub server_host: String,
-
     /// Canonicalized absolute path.
     pub source: PathBuf,
     pub categories: Vec<Category>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Destination {
+    Local { path: PathBuf },
+    Remote(RemoteDestination),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RemoteDestination {
+    // Transfer will ssh to <user>@<host>:/path
+    pub user: String,
+    pub host: String,
+    pub port: u16,
+    // Absolute path, but not canonicalized, because that cannot be
+    // done on the local machine.
+    pub path: PathBuf,
+}
+
 #[derive(Debug)]
 pub struct Category {
     pub regex: Regex,
-    /// Canonicalized absolute path.
-    pub landing_zone: PathBuf,
+    pub destination: Destination,
     pub exclude: Vec<String>,
     pub completion_file_globs: Vec<Pattern>,
     /// When true, place runs into a year-based subdirectory under the landing
     /// zone. The year is derived from the directory name by prepending "20" to
-    /// its first two characters (e.g. "240101_NB123" → "2024/").
+    /// its first two characters (e.g. "240101_NB123" -> "2024/").
     pub year_subdirectory: bool,
 }
 
@@ -44,9 +54,6 @@ struct UnvalidatedConfig {
     flockdir: PathBuf,
     lock_file_name: String,
     logdir: PathBuf,
-    server_user: String,
-    server_port: u16,
-    server_host: String,
     source: PathBuf,
     #[serde(default)]
     category: Vec<UnvalidatedCategory>,
@@ -55,12 +62,26 @@ struct UnvalidatedConfig {
 #[derive(Debug, Deserialize)]
 struct UnvalidatedCategory {
     regex: String,
-    landing_zone: PathBuf,
+    destination: UnvalidatedDestination,
     #[serde(default)]
     exclude: Vec<String>,
     completion_file_globs: Vec<String>,
     #[serde(default)]
     year_subdirectory: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
+enum UnvalidatedDestination {
+    Local {
+        path: PathBuf,
+    },
+    Remote {
+        user: String,
+        host: String,
+        port: u16,
+        path: PathBuf,
+    },
 }
 
 #[derive(Debug, Error)]
@@ -86,6 +107,18 @@ pub enum ConfigError {
     DuplicatePath {
         first: &'static str,
         second: &'static str,
+        path: PathBuf,
+    },
+    #[error(
+        "config remote destinations `{first}` and `{second}` must not point to the same location: {user}@{host}:{path}",
+        path = path.display()
+    )]
+    DuplicateRemoteDestination {
+        first: &'static str,
+        second: &'static str,
+        user: String,
+        host: String,
+        port: u16,
         path: PathBuf,
     },
     #[error("config must contain at least one [[category]]")]
@@ -124,41 +157,79 @@ impl Config {
             source,
         })?;
 
-        let mut config = Self::from_yaml_str(&contents)?;
+        Self::from_yaml_str(&contents)
+    }
+
+    fn from_yaml_str(contents: &str) -> Result<Self, ConfigError> {
+        let mut config = Self::parse_yaml_str_uncanonicalized(contents)?;
         config.canonicalize_paths()?;
         Ok(config)
     }
 
-    // Note: This doesn't canonicalize paths!
-    fn from_yaml_str(contents: &str) -> Result<Self, ConfigError> {
+    fn parse_yaml_str_uncanonicalized(contents: &str) -> Result<Self, ConfigError> {
         let config: UnvalidatedConfig =
             serde_yaml::from_str(contents).map_err(ConfigError::Parse)?;
         config.validate()
     }
 
-    /// Canonicalize all path fields via the filesystem (resolving symlinks,
-    /// `.`, and `..`), then check that no two fields resolve to the same
-    /// directory.
+    /// Canonicalize all local path fields via the filesystem (resolving
+    /// symlinks, `.`, and `..`), then check that no two local fields resolve
+    /// to the same directory. Remote destination paths are validated
+    /// syntactically and are never canonicalized locally.
     fn canonicalize_paths(&mut self) -> Result<(), ConfigError> {
         self.flockdir = canonicalize_field("flockdir", &self.flockdir)?;
         self.logdir = canonicalize_field("logdir", &self.logdir)?;
         self.source = canonicalize_field("source", &self.source)?;
 
         for cat in &mut self.categories {
-            cat.landing_zone = canonicalize_field("category.landing_zone", &cat.landing_zone)?;
+            if let Destination::Local { path } = &mut cat.destination {
+                *path = canonicalize_field("category.destination.path", path)?;
+            }
         }
 
-        let mut paths: Vec<(&'static str, &Path)> = vec![
+        let mut local_paths: Vec<(&'static str, &Path)> = vec![
             ("source", &self.source),
             ("flockdir", &self.flockdir),
             ("logdir", &self.logdir),
         ];
         for cat in &self.categories {
-            paths.push(("category.landing_zone", &cat.landing_zone));
+            if let Destination::Local { path } = &cat.destination {
+                local_paths.push(("category.destination.path", path));
+            }
         }
-        validate_all_paths_distinct(&paths)?;
+        validate_all_paths_distinct(&local_paths)?;
+        validate_all_remote_destinations_distinct(&self.categories)?;
 
         Ok(())
+    }
+}
+
+impl Destination {
+    pub fn display(&self) -> String {
+        match self {
+            Self::Local { path } => path.display().to_string(),
+            Self::Remote(remote) => remote.display(),
+        }
+    }
+
+    pub fn with_appended_relative_path(&self, relative: &Path) -> Self {
+        match self {
+            Self::Local { path } => Self::Local {
+                path: path.join(relative),
+            },
+            Self::Remote(remote) => Self::Remote(RemoteDestination {
+                user: remote.user.clone(),
+                host: remote.host.clone(),
+                port: remote.port,
+                path: remote.path.join(relative),
+            }),
+        }
+    }
+}
+
+impl RemoteDestination {
+    pub fn display(&self) -> String {
+        format!("{}@{}:{}", self.user, self.host, self.path.display())
     }
 }
 
@@ -175,15 +246,6 @@ impl UnvalidatedConfig {
         validate_absolute_path("flockdir", &self.flockdir)?;
         validate_base_name("lock_file_name", &self.lock_file_name)?;
         validate_absolute_path("logdir", &self.logdir)?;
-        validate_non_empty("server_user", &self.server_user)?;
-        validate_non_empty("server_host", &self.server_host)?;
-
-        if self.server_port == 0 {
-            return Err(ConfigError::ZeroPort {
-                field: "server_port",
-            });
-        }
-
         validate_absolute_path("source", &self.source)?;
 
         if self.category.is_empty() {
@@ -199,9 +261,6 @@ impl UnvalidatedConfig {
             flockdir: self.flockdir,
             lock_file_name: self.lock_file_name,
             logdir: self.logdir,
-            server_user: self.server_user,
-            server_port: self.server_port,
-            server_host: self.server_host,
             source: self.source,
             categories,
         })
@@ -210,12 +269,12 @@ impl UnvalidatedConfig {
 
 impl UnvalidatedCategory {
     fn validate(self) -> Result<Category, ConfigError> {
-        validate_absolute_path("category.landing_zone", &self.landing_zone)?;
-
         let regex = Regex::new(&self.regex).map_err(|source| ConfigError::InvalidRegex {
             field: "category.regex",
             source,
         })?;
+
+        let destination = self.destination.validate()?;
 
         let completion_file_globs = validate_globs(
             "category.completion_file_globs",
@@ -224,11 +283,43 @@ impl UnvalidatedCategory {
 
         Ok(Category {
             regex,
-            landing_zone: self.landing_zone,
+            destination,
             exclude: self.exclude,
             completion_file_globs,
             year_subdirectory: self.year_subdirectory,
         })
+    }
+}
+
+impl UnvalidatedDestination {
+    fn validate(self) -> Result<Destination, ConfigError> {
+        match self {
+            Self::Local { path } => {
+                validate_absolute_path("category.destination.path", &path)?;
+                Ok(Destination::Local { path })
+            }
+            Self::Remote {
+                user,
+                host,
+                port,
+                path,
+            } => {
+                validate_non_empty("category.destination.user", &user)?;
+                validate_non_empty("category.destination.host", &host)?;
+                if port == 0 {
+                    return Err(ConfigError::ZeroPort {
+                        field: "category.destination.port",
+                    });
+                }
+                validate_absolute_path("category.destination.path", &path)?;
+                Ok(Destination::Remote(RemoteDestination {
+                    user,
+                    host,
+                    port,
+                    path,
+                }))
+            }
+        }
     }
 }
 
@@ -292,58 +383,89 @@ fn validate_all_paths_distinct(paths: &[(&'static str, &Path)]) -> Result<(), Co
     Ok(())
 }
 
+fn validate_all_remote_destinations_distinct(categories: &[Category]) -> Result<(), ConfigError> {
+    for i in 0..categories.len() {
+        let Destination::Remote(first) = &categories[i].destination else {
+            continue;
+        };
+
+        for second_category in categories.iter().skip(i + 1) {
+            let Destination::Remote(second) = &second_category.destination else {
+                continue;
+            };
+
+            if first == second {
+                return Err(ConfigError::DuplicateRemoteDestination {
+                    first: "category.destination",
+                    second: "category.destination",
+                    user: first.user.clone(),
+                    host: first.host.clone(),
+                    port: first.port,
+                    path: first.path.clone(),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
 
-    use super::{Config, ConfigError};
+    use super::{Config, ConfigError, Destination, RemoteDestination};
 
     const EXAMPLE_CONFIG: &str = include_str!("../examples/config.yaml");
     const NEXTSEQ_EXAMPLE: &str = r#"
 flockdir: "/var/lib/sequencer/flock"
 lock_file_name: "sequencer-sync.lock"
 logdir: "/var/lib/sequencer/log"
-server_user: "sequencer-sync"
-server_port: 22
-server_host: "sequencer.example.org"
 source: "/data/nextseq"
 
 category:
   - regex: "^\\d{6}_"
-    landing_zone: "/var/lib/sequencer/landing-zone"
+    destination:
+      type: local
+      path: "/var/lib/sequencer/landing-zone"
     completion_file_globs:
       - "PrimaryAnalysisMetrics/PrimaryAnalysisMetrics.csv"
 "#;
 
     #[test]
     fn parses_example_config() {
-        let config = Config::from_yaml_str(EXAMPLE_CONFIG).expect("nanopore config should parse");
+        let config = Config::parse_yaml_str_uncanonicalized(EXAMPLE_CONFIG)
+            .expect("nanopore config should parse");
 
         assert_eq!(config.flockdir, PathBuf::from("/var/lib/sequencer/flock"));
         assert_eq!(config.lock_file_name, "sequencer-sync.lock");
         assert_eq!(config.logdir, PathBuf::from("/var/lib/sequencer/log"));
-        assert_eq!(config.server_user, "sequencer-sync");
-        assert_eq!(config.server_port, 22);
-        assert_eq!(config.server_host, "sequencer.example.org");
         assert_eq!(config.source, PathBuf::from("/data/nanopore"));
 
         assert_eq!(config.categories.len(), 2);
         assert!(config.categories[0].regex.is_match("ONT_WGS_run1"));
         assert!(!config.categories[0].regex.is_match("ONT_raw_run2"));
         assert_eq!(
-            config.categories[0].landing_zone,
-            PathBuf::from("/var/lib/sequencer/landing-zone-core")
+            config.categories[0].destination,
+            Destination::Local {
+                path: PathBuf::from("/var/lib/sequencer/landing-zone-core"),
+            }
         );
         assert!(config.categories[1].regex.is_match("ONT_raw_run2"));
         assert_eq!(
-            config.categories[1].landing_zone,
-            PathBuf::from("/var/lib/sequencer/landing-zone-other")
+            config.categories[1].destination,
+            Destination::Remote(RemoteDestination {
+                user: "sequencer-sync".to_string(),
+                host: "sequencer.example.org".to_string(),
+                port: 22,
+                path: PathBuf::from("/srv/sequencer/landing-zone-other"),
+            })
         );
     }
 
     #[test]
     fn parses_nextseq_example_config() {
-        let config = Config::from_yaml_str(NEXTSEQ_EXAMPLE).expect("nextseq config should parse");
+        let config = Config::parse_yaml_str_uncanonicalized(NEXTSEQ_EXAMPLE)
+            .expect("nextseq config should parse");
 
         assert_eq!(config.flockdir, PathBuf::from("/var/lib/sequencer/flock"));
         assert_eq!(config.logdir, PathBuf::from("/var/lib/sequencer/log"));
@@ -351,21 +473,54 @@ category:
         assert_eq!(config.categories.len(), 1);
         assert!(config.categories[0].regex.is_match("240101_"));
         assert_eq!(
-            config.categories[0].landing_zone,
-            PathBuf::from("/var/lib/sequencer/landing-zone")
+            config.categories[0].destination,
+            Destination::Local {
+                path: PathBuf::from("/var/lib/sequencer/landing-zone"),
+            }
+        );
+    }
+
+    #[test]
+    fn parses_remote_destination() {
+        let config = Config::parse_yaml_str_uncanonicalized(
+            r#"
+flockdir: "/var/lib/sequencer/flock"
+lock_file_name: "sequencer-sync.lock"
+logdir: "/var/lib/sequencer/log"
+source: "/data/nanopore"
+
+category:
+  - regex: "^ONT_"
+    destination:
+      type: remote
+      user: "alice"
+      host: "example.org"
+      port: 2222
+      path: "/incoming/ont"
+    completion_file_globs:
+      - "report*.html"
+"#,
+        )
+        .expect("remote config should parse");
+
+        assert_eq!(
+            config.categories[0].destination,
+            Destination::Remote(RemoteDestination {
+                user: "alice".to_string(),
+                host: "example.org".to_string(),
+                port: 2222,
+                path: PathBuf::from("/incoming/ont"),
+            })
         );
     }
 
     #[test]
     fn rejects_config_with_no_categories() {
-        let error = Config::from_yaml_str(
+        let error = Config::parse_yaml_str_uncanonicalized(
             r#"
 flockdir: "/var/lib/sequencer/flock"
 lock_file_name: "sequencer-sync.lock"
 logdir: "/var/lib/sequencer/log"
-server_user: "sequencer-sync"
-server_port: 22
-server_host: "sequencer.example.org"
 source: "/data/sequencer"
 "#,
         )
@@ -376,19 +531,18 @@ source: "/data/sequencer"
 
     #[test]
     fn rejects_relative_source_path() {
-        let error = Config::from_yaml_str(
+        let error = Config::parse_yaml_str_uncanonicalized(
             r#"
 flockdir: "/var/lib/sequencer/flock"
 lock_file_name: "sequencer-sync.lock"
 logdir: "/var/lib/sequencer/log"
-server_user: "sequencer-sync"
-server_port: 22
-server_host: "sequencer.example.org"
 source: "relative/data"
 
 category:
   - regex: "^\\d{6}_"
-    landing_zone: "/var/lib/sequencer/landing-zone"
+    destination:
+      type: local
+      path: "/var/lib/sequencer/landing-zone"
     completion_file_globs:
       - "PrimaryAnalysisMetrics/PrimaryAnalysisMetrics.csv"
 "#,
@@ -405,164 +559,125 @@ category:
     }
 
     #[test]
-    fn rejects_empty_server_user() {
-        let error = Config::from_yaml_str(
+    fn rejects_empty_remote_user() {
+        let error = Config::parse_yaml_str_uncanonicalized(
             r#"
 flockdir: "/var/lib/sequencer/flock"
 lock_file_name: "sequencer-sync.lock"
 logdir: "/var/lib/sequencer/log"
-server_user: "   "
-server_port: 22
-server_host: "sequencer.example.org"
 source: "/data/sequencer"
 
 category:
   - regex: "^\\d{6}_"
-    landing_zone: "/var/lib/sequencer/landing-zone"
+    destination:
+      type: remote
+      user: "   "
+      host: "sequencer.example.org"
+      port: 22
+      path: "/landing"
     completion_file_globs:
       - "PrimaryAnalysisMetrics/PrimaryAnalysisMetrics.csv"
 "#,
         )
-        .expect_err("empty server_user should fail validation");
+        .expect_err("empty remote user should fail validation");
 
         assert!(matches!(
             error,
             ConfigError::EmptyField {
-                field: "server_user"
+                field: "category.destination.user"
             }
         ));
     }
 
     #[test]
-    fn classify_matches_first_regex() {
-        let config = Config::from_yaml_str(
+    fn rejects_missing_remote_port() {
+        let error = Config::parse_yaml_str_uncanonicalized(
             r#"
 flockdir: "/var/lib/sequencer/flock"
 lock_file_name: "sequencer-sync.lock"
 logdir: "/var/lib/sequencer/log"
-server_user: "sequencer-sync"
-server_port: 22
-server_host: "sequencer.example.org"
+source: "/data/sequencer"
+
+category:
+  - regex: "^\\d{6}_"
+    destination:
+      type: remote
+      user: "alice"
+      host: "sequencer.example.org"
+      path: "/landing"
+    completion_file_globs:
+      - "PrimaryAnalysisMetrics/PrimaryAnalysisMetrics.csv"
+"#,
+        )
+        .expect_err("missing remote port should fail validation");
+
+        assert!(matches!(error, ConfigError::Parse(_)));
+    }
+
+    #[test]
+    fn classify_matches_first_regex() {
+        let config = Config::parse_yaml_str_uncanonicalized(
+            r#"
+flockdir: "/var/lib/sequencer/flock"
+lock_file_name: "sequencer-sync.lock"
+logdir: "/var/lib/sequencer/log"
 source: "/data/nanopore"
 
 category:
   - regex: "^ONT_WGS_"
-    landing_zone: "/landing/core"
+    destination:
+      type: local
+      path: "/landing/core"
     completion_file_globs:
       - "report*.html"
 
   - regex: "^ONT_"
-    landing_zone: "/landing/other"
+    destination:
+      type: local
+      path: "/landing/other"
     completion_file_globs:
       - "report*.html"
 "#,
         )
         .unwrap();
 
-        // ONT_WGS_ matches first category
         let matched = config
             .categories
             .iter()
             .find(|c| c.regex.is_match("ONT_WGS_run1"));
         assert_eq!(
-            matched.unwrap().landing_zone,
-            PathBuf::from("/landing/core")
+            matched.unwrap().destination,
+            Destination::Local {
+                path: PathBuf::from("/landing/core"),
+            }
         );
 
-        // ONT_raw_ matches second category (first doesn't match)
         let matched = config
             .categories
             .iter()
             .find(|c| c.regex.is_match("ONT_raw_run2"));
         assert_eq!(
-            matched.unwrap().landing_zone,
-            PathBuf::from("/landing/other")
+            matched.unwrap().destination,
+            Destination::Local {
+                path: PathBuf::from("/landing/other"),
+            }
         );
     }
 
     #[test]
-    fn classify_first_match_wins() {
-        let config = Config::from_yaml_str(
-            r#"
-flockdir: "/var/lib/sequencer/flock"
-lock_file_name: "sequencer-sync.lock"
-logdir: "/var/lib/sequencer/log"
-server_user: "sequencer-sync"
-server_port: 22
-server_host: "sequencer.example.org"
-source: "/data/nanopore"
-
-category:
-  - regex: "^ONT_WGS_"
-    landing_zone: "/landing/core"
-    completion_file_globs:
-      - "report*.html"
-
-  - regex: "^ONT_"
-    landing_zone: "/landing/other"
-    completion_file_globs:
-      - "report*.html"
-"#,
-        )
-        .unwrap();
-
-        // ONT_WGS_run1 matches both regexes but first-match wins
-        let matched = config
-            .categories
-            .iter()
-            .find(|c| c.regex.is_match("ONT_WGS_run1"))
-            .unwrap();
-        assert_eq!(matched.landing_zone, PathBuf::from("/landing/core"));
-    }
-
-    #[test]
-    fn classify_returns_none_for_unmatched() {
-        let config = Config::from_yaml_str(
-            r#"
-flockdir: "/var/lib/sequencer/flock"
-lock_file_name: "sequencer-sync.lock"
-logdir: "/var/lib/sequencer/log"
-server_user: "sequencer-sync"
-server_port: 22
-server_host: "sequencer.example.org"
-source: "/data/nanopore"
-
-category:
-  - regex: "^ONT_WGS_"
-    landing_zone: "/landing/core"
-    completion_file_globs:
-      - "report*.html"
-
-  - regex: "^ONT_"
-    landing_zone: "/landing/other"
-    completion_file_globs:
-      - "report*.html"
-"#,
-        )
-        .unwrap();
-
-        let matched = config
-            .categories
-            .iter()
-            .find(|c| c.regex.is_match("ILLUMINA_run1"));
-        assert!(matched.is_none());
-    }
-
-    #[test]
     fn rejects_empty_completion_glob_list() {
-        let error = Config::from_yaml_str(
+        let error = Config::parse_yaml_str_uncanonicalized(
             r#"
 flockdir: "/var/lib/sequencer/flock"
 lock_file_name: "sequencer-sync.lock"
 logdir: "/var/lib/sequencer/log"
-server_user: "sequencer-sync"
-server_port: 22
-server_host: "sequencer.example.org"
 source: "/data/nextseq"
 
 category:
   - regex: "^\\d{6}_"
-    landing_zone: "/var/lib/sequencer/landing-zone"
+    destination:
+      type: local
+      path: "/var/lib/sequencer/landing-zone"
     completion_file_globs: []
 "#,
         )

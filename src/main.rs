@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
@@ -6,7 +7,7 @@ use std::process::ExitCode;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use clap::{Args, Parser, Subcommand};
-use config::{Config, ConfigError};
+use config::{Config, ConfigError, Destination, RemoteDestination};
 use fs2::FileExt;
 use log::debug;
 use run_log::RunLog;
@@ -106,7 +107,7 @@ fn setup(args: SetupArgs) -> Result<(), AppError> {
 // classified a run as e.g. project/operations/something else.
 struct TransferTarget {
     regex_string: String,
-    destination: PathBuf,
+    destination: Destination,
     exclude: Vec<String>,
     completion_file_globs: Vec<glob::Pattern>,
 }
@@ -182,11 +183,10 @@ fn run_command(args: RunArgs) -> Result<(), AppError> {
 }
 
 fn validate_environment(config: &Config, skip_ssh_check: bool) -> Result<(), AppError> {
-    if !skip_ssh_check {
-        check_ssh_access(config)?;
-    } else {
-        debug!("SSH check skipped due to command line flag.")
-    }
+    // Different destinations can share same endpoint (username, port, host).
+    // Only check each once
+    let mut checked_ssh_endpoints = HashSet::new();
+
     debug!(
         "Checking that source directory is readable: {}",
         config.source.display()
@@ -194,11 +194,26 @@ fn validate_environment(config: &Config, skip_ssh_check: bool) -> Result<(), App
     check_readable_directory(&config.source, "source")?;
     for (category_index, cat) in config.categories.iter().enumerate() {
         debug!(
-            "Checking writability of category {} landing zone: {}",
+            "Checking category {} destination: {}",
             category_index + 1,
-            cat.landing_zone.display()
+            cat.destination.display()
         );
-        check_writable_directory(&cat.landing_zone, "category.landing_zone")?;
+        match &cat.destination {
+            Destination::Local { path } => {
+                check_writable_directory(path, "category.destination.path")?;
+            }
+            Destination::Remote(remote) => {
+                if skip_ssh_check {
+                    debug!("SSH checks skipped due to command line flag.");
+                } else {
+                    let endpoint = (remote.user.clone(), remote.host.clone(), remote.port);
+                    if checked_ssh_endpoints.insert(endpoint) {
+                        check_ssh_access(remote)?;
+                    }
+                    check_remote_writable_directory(remote)?;
+                }
+            }
+        }
     }
     debug!(
         "Checking writability of flockdir: {}",
@@ -393,9 +408,10 @@ fn classify(
                     category_regex: cat.regex.to_string(),
                 });
             }
-            cat.landing_zone.join(format!("20{}", &dir_name[..2]))
+            cat.destination
+                .with_appended_relative_path(Path::new(&format!("20{}", &dir_name[..2])))
         } else {
-            cat.landing_zone.clone()
+            cat.destination.clone()
         };
         return Ok(Some(TransferTarget {
             regex_string: cat.regex.as_str().to_owned(),
@@ -453,19 +469,17 @@ fn transfer_new_directories(
         let dir_name = entry.file_name();
         let dir_name = dir_name.to_string_lossy();
 
-        let transferred_dir = target.destination.join(entry.file_name());
+        let transferred_dir = target
+            .destination
+            .with_appended_relative_path(Path::new(dir_name.as_ref()));
+        let destination_display = transferred_dir.display();
 
         if args.dry_run {
             print_dry_run(&entry.path(), &transferred_dir, &target.exclude);
             continue;
         }
 
-        fs::create_dir_all(&transferred_dir).map_err(|source| AppError::CreateTransferDir {
-            path: transferred_dir.clone(),
-            source,
-        })?;
-
-        let destination_display = transferred_dir.display();
+        prepare_transfer_destination(&transferred_dir)?;
         let rsync_result = rsync_directory(&entry.path(), &transferred_dir, &target.exclude);
 
         let key = transfer_log::relative_directory_key(source, &entry.path())
@@ -535,23 +549,45 @@ fn transfer_reason_label(reason: TransferReason) -> &'static str {
 // file to see if the transfer to the landing zone was complete.
 const TRANSFER_MARKER_FILE_NAME: &str = "transfer_successful.txt";
 
-fn touch_transfer_marker(transferred_dir: &Path) -> Result<(), AppError> {
-    let marker = transferred_dir.join(TRANSFER_MARKER_FILE_NAME);
-    File::create(&marker).map_err(|source| AppError::WriteTransferMarker {
-        path: marker,
-        source,
-    })?;
-    Ok(())
+fn touch_transfer_marker(transferred_dir: &Destination) -> Result<(), AppError> {
+    match transferred_dir {
+        Destination::Local { path } => {
+            let marker = path.join(TRANSFER_MARKER_FILE_NAME);
+            File::create(&marker).map_err(|source| AppError::WriteTransferMarker {
+                path: marker.display().to_string(),
+                source,
+            })?;
+            Ok(())
+        }
+        Destination::Remote(remote) => {
+            let marker = remote.path.join(TRANSFER_MARKER_FILE_NAME);
+            run_ssh_command(
+                remote,
+                &format!(
+                    "touch -- {}",
+                    shell_quote(marker.to_string_lossy().as_ref())
+                ),
+            )
+            .map_err(|source| AppError::WriteRemoteTransferMarker {
+                destination: remote.display(),
+                source,
+            })
+        }
+    }
 }
 
-fn print_dry_run(source: &Path, destination: &Path, exclude: &[String]) {
+fn print_dry_run(source: &Path, destination: &Destination, exclude: &[String]) {
     println!("{} -> {}", source.display(), destination.display());
     for pattern in exclude {
         println!("  exclude: {pattern}");
     }
 }
 
-fn rsync_directory(source: &Path, destination: &Path, exclude: &[String]) -> Result<(), AppError> {
+fn rsync_directory(
+    source: &Path,
+    destination: &Destination,
+    exclude: &[String],
+) -> Result<(), AppError> {
     debug!(
         "Running rsync from {} to {} with exclude {}",
         source.display(),
@@ -560,14 +596,18 @@ fn rsync_directory(source: &Path, destination: &Path, exclude: &[String]) -> Res
     );
     let mut cmd = Command::new("rsync");
     cmd.arg("-a");
+    if let Destination::Remote(remote) = destination {
+        cmd.arg("-e")
+            .arg(format!("ssh -o BatchMode=yes -p {}", remote.port));
+    }
     for pattern in exclude {
         cmd.arg("--exclude").arg(pattern);
     }
     let source_contents = path_with_trailing_separator(source);
-    let destination_dir = path_with_trailing_separator(destination);
+    let destination_dir = rsync_destination(destination);
     let output = cmd
         .arg(source_contents)
-        .arg(destination_dir)
+        .arg(&destination_dir)
         .output()
         .map_err(|source| AppError::SpawnRsync { source })?;
 
@@ -587,52 +627,92 @@ fn rsync_directory(source: &Path, destination: &Path, exclude: &[String]) -> Res
         );
         Err(AppError::RsyncFailed {
             source_path: source.to_path_buf(),
-            destination: destination.to_path_buf(),
+            destination: destination.display(),
             exit_code: output.status.code(),
         })
     }
 }
 
-fn path_with_trailing_separator(path: &Path) -> OsString {
-    let mut path_with_separator = path.as_os_str().to_os_string();
-    let path_str = path.as_os_str().to_string_lossy();
-    if !path_str.ends_with(std::path::MAIN_SEPARATOR) {
-        path_with_separator.push(std::path::MAIN_SEPARATOR_STR);
-    }
+fn path_with_trailing_separator(path: &Path) -> PathBuf {
+    let mut path_with_separator = path.to_path_buf();
+    path_with_separator.push("");
     path_with_separator
+}
+
+fn rsync_destination(destination: &Destination) -> OsString {
+    match destination {
+        Destination::Local { path } => path_with_trailing_separator(path).into_os_string(),
+        Destination::Remote(remote) => {
+            let destination_with_separator = path_with_trailing_separator(&remote.path);
+            OsString::from(format!(
+                "{}@{}:{}",
+                remote.user,
+                remote.host,
+                destination_with_separator.display()
+            ))
+        }
+    }
 }
 
 fn load_config(config_path: &Path) -> Result<Config, AppError> {
     Config::from_path(config_path).map_err(|source| AppError::LoadConfig {
         path: config_path.to_path_buf(),
+        source: Box::new(source),
+    })
+}
+
+fn check_ssh_access(remote: &RemoteDestination) -> Result<(), AppError> {
+    debug!(
+        "Checking SSH access. User name: {} port: {} domain name: {}",
+        remote.user, remote.port, remote.host
+    );
+    run_ssh_command(remote, "true").map_err(|source| AppError::SshAccessDenied {
+        user: remote.user.clone(),
+        host: remote.host.clone(),
+        port: remote.port,
         source,
     })
 }
 
-fn check_ssh_access(config: &Config) -> Result<(), AppError> {
-    debug!(
-        "Checking SSH access. User name: {} port: {} domain name: {}",
-        config.server_user, config.server_port, config.server_host
-    );
-    let status = Command::new("ssh")
-        .arg("-o")
-        .arg("BatchMode=yes")
-        .arg("-p")
-        .arg(config.server_port.to_string())
-        .arg(format!("{}@{}", config.server_user, config.server_host))
-        .arg("--")
-        .arg("true")
-        .status()
-        .map_err(|source| AppError::SpawnSsh { source })?;
+fn check_remote_writable_directory(remote: &RemoteDestination) -> Result<(), AppError> {
+    let probe_path = temp_probe_path(&remote.path, "category.destination.path");
+    run_ssh_command(
+        remote,
+        &format!(
+            "mkdir -p -- {dir} && : > {probe} && rm -f -- {probe}",
+            dir = shell_quote(remote.path.to_string_lossy().as_ref()),
+            probe = shell_quote(probe_path.to_string_lossy().as_ref()),
+        ),
+    )
+    .map_err(|source| AppError::RemoteWriteDirectory {
+        destination: remote.display(),
+        source,
+    })
+}
 
-    if status.success() {
-        Ok(())
-    } else {
-        Err(AppError::SshAccessDenied {
-            user: config.server_user.clone(),
-            host: config.server_host.clone(),
-            port: config.server_port,
-        })
+// Create the target directory, which we then rsync into.
+// This is necessary, because if we transfer the directory itself, the exclude patterns
+// would be relative to the source directory's parent, which could work,
+// but would be awkward and confusing for the user
+fn prepare_transfer_destination(destination: &Destination) -> Result<(), AppError> {
+    match destination {
+        Destination::Local { path } => {
+            fs::create_dir_all(path).map_err(|source| AppError::CreateTransferDir {
+                path: path.display().to_string(),
+                source,
+            })
+        }
+        Destination::Remote(remote) => run_ssh_command(
+            remote,
+            &format!(
+                "mkdir -p -- {}",
+                shell_quote(remote.path.to_string_lossy().as_ref())
+            ),
+        )
+        .map_err(|source| AppError::CreateRemoteTransferDir {
+            destination: remote.display(),
+            source,
+        }),
     }
 }
 
@@ -774,6 +854,29 @@ fn shell_quote(value: &str) -> String {
     format!("'{escaped}'")
 }
 
+fn run_ssh_command(remote: &RemoteDestination, remote_command: &str) -> Result<(), std::io::Error> {
+    let status = Command::new("ssh")
+        .arg("-o")
+        .arg("BatchMode=yes")
+        .arg("-p")
+        .arg(remote.port.to_string())
+        .arg(format!("{}@{}", remote.user, remote.host))
+        .arg("--")
+        .arg(remote_command)
+        .status()?;
+
+    if status.success() {
+        Ok(())
+    } else {
+        Err(std::io::Error::other(format!(
+            "remote command failed with exit code {}",
+            status
+                .code()
+                .map_or_else(|| "unknown".to_string(), |code| code.to_string())
+        )))
+    }
+}
+
 struct RunLock {
     file: File,
 }
@@ -789,19 +892,17 @@ enum AppError {
     #[error("failed to load config from {}: {source}", path.display())]
     LoadConfig {
         path: PathBuf,
+        // Box in order to make AppError smaller
         #[source]
-        source: ConfigError,
+        source: Box<ConfigError>,
     },
-    #[error("failed to execute ssh: {source}")]
-    SpawnSsh {
-        #[source]
-        source: std::io::Error,
-    },
-    #[error("ssh access check failed for {user}@{host}:{port}")]
+    #[error("ssh access check failed for {user}@{host}:{port}: {source}")]
     SshAccessDenied {
         user: String,
         host: String,
         port: u16,
+        #[source]
+        source: std::io::Error,
     },
     #[error("failed to access metadata for `{field}` directory {}: {source}", path.display())]
     ReadMetadata {
@@ -844,9 +945,15 @@ enum AppError {
         #[source]
         source: std::io::Error,
     },
-    #[error("failed to create transfer directory {}: {source}", path.display())]
+    #[error("failed to create transfer directory {path}: {source}")]
     CreateTransferDir {
-        path: PathBuf,
+        path: String,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("failed to create remote transfer directory {destination}: {source}")]
+    CreateRemoteTransferDir {
+        destination: String,
         #[source]
         source: std::io::Error,
     },
@@ -871,10 +978,10 @@ enum AppError {
         #[source]
         source: std::io::Error,
     },
-    #[error("rsync failed copying {} to {}: exit code {}", source_path.display(), destination.display(), exit_code.map_or("unknown".to_string(), |c| c.to_string()))]
+    #[error("rsync failed copying {} to {}: exit code {}", source_path.display(), destination, exit_code.map_or("unknown".to_string(), |c| c.to_string()))]
     RsyncFailed {
         source_path: PathBuf,
-        destination: PathBuf,
+        destination: String,
         exit_code: Option<i32>,
     },
     #[error("failed to scan for completion file in {}: {source}", run_dir.display())]
@@ -883,9 +990,21 @@ enum AppError {
         #[source]
         source: glob::GlobError,
     },
-    #[error("failed to write transfer marker {}: {source}", path.display())]
+    #[error("failed to write transfer marker {path}: {source}")]
     WriteTransferMarker {
-        path: PathBuf,
+        path: String,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("failed to write remote transfer marker at {destination}: {source}")]
+    WriteRemoteTransferMarker {
+        destination: String,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("failed to verify remote destination writability for {destination}: {source}")]
+    RemoteWriteDirectory {
+        destination: String,
         #[source]
         source: std::io::Error,
     },
@@ -907,6 +1026,7 @@ enum AppError {
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::OsString;
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::sync::{Mutex, Once};
@@ -916,8 +1036,11 @@ mod tests {
     use log::{LevelFilter, Log, Metadata, Record};
     use regex::Regex;
 
-    use super::{classify, cron_file_path, lock_file_path, render_cron_file, run_is_complete};
-    use crate::config::Category;
+    use super::{
+        classify, cron_file_path, lock_file_path, path_with_trailing_separator, render_cron_file,
+        rsync_destination, run_is_complete,
+    };
+    use crate::config::{Category, Destination, RemoteDestination};
 
     struct TestLogger {
         messages: Mutex<Vec<String>>,
@@ -1036,7 +1159,9 @@ mod tests {
     fn classify_preserves_matching_regex_string() {
         let categories = vec![Category {
             regex: Regex::new(r"^ONT_WGS_").expect("regex should parse"),
-            landing_zone: PathBuf::from("/tmp/landing"),
+            destination: Destination::Local {
+                path: PathBuf::from("/tmp/landing"),
+            },
             exclude: Vec::new(),
             completion_file_globs: vec![Pattern::new("report*.html").expect("glob should parse")],
             year_subdirectory: false,
@@ -1047,5 +1172,32 @@ mod tests {
             .expect("directory should match category");
 
         assert_eq!(target.regex_string, "^ONT_WGS_");
+    }
+
+    #[test]
+    fn rsync_destination_formats_remote_target() {
+        let remote = Destination::Remote(RemoteDestination {
+            user: "alice".to_string(),
+            host: "example.org".to_string(),
+            port: 2222,
+            path: PathBuf::from("/incoming/data"),
+        });
+
+        assert_eq!(
+            rsync_destination(&remote),
+            OsString::from("alice@example.org:/incoming/data/")
+        );
+    }
+
+    #[test]
+    fn path_with_trailing_separator_handles_both_input_shapes() {
+        assert_eq!(
+            path_with_trailing_separator(Path::new("/tmp/data")),
+            PathBuf::from("/tmp/data/")
+        );
+        assert_eq!(
+            path_with_trailing_separator(Path::new("/tmp/data/")),
+            PathBuf::from("/tmp/data/")
+        );
     }
 }

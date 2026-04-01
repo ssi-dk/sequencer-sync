@@ -287,7 +287,7 @@ pub fn initialize_if_absent(logdir: &Path) -> Result<(), TransferLogError> {
     }
 
     let record = TransferRecord {
-        directory: PathBuf::from("_sequencer_sync_setup_"),
+        directory: PathBuf::from("dummy_example_log_entry"),
         transferred_at: Utc::now().to_rfc3339(),
         succeeded: true,
         redo: false,

@@ -7,11 +7,6 @@ lock_file_name: "sequencer-sync.lock"
 # Writeable directory for log files (transfer log, run log, cron file)
 logdir: "/var/lib/sequencer/log"
 
-# Check password-free access to ssh -p <port> <server_user>@<server_host>
-server_user: "sequencer-sync"
-server_port: 22
-server_host: "sequencer.example.org"
-
 # Search for subdirectories under the source for new sequencing runs.
 # Each run is assumed to be one directory.
 source: "/data/nanopore"
@@ -24,11 +19,14 @@ source: "/data/nanopore"
 
 category:
   - # If directory matches this regex, the run is classified
-    # as this category
+    # as this category.
+    # Regexes are searched top to bottom; first one classifies the run
     regex: "^ONT_WGS_"
 
-    # Copy to this directory
-    landing_zone: "/var/lib/sequencer/landing-zone-core"
+   # Destination: To same machine - move to this particular directory
+    destination:
+      type: local
+      path: "/var/lib/sequencer/landing-zone-core"
 
     # Passed to rsync command with --exclude
     exclude:
@@ -42,14 +40,22 @@ category:
       - "*/*/report*.html"
 
     # If this is set to true (default false), then a directory name "240101_NB123"
-    # is transferred into "<landing_zone>/2024/240101_NB123".
+    # is transferred into "<destination.path>/2024/240101_NB123".
     # The "2024/" is "20" + the first two characters of the directory name,
     # If this is set, then the directory name MUST begin with two digits.
     # Ensure regex is set to only capture dir names with two leading digits.
     year_subdirectory: false
 
   - regex: "^ONT_"
-    landing_zone: "/var/lib/sequencer/landing-zone-other"
+
+    # Destination type: Remote server you have passwordless SSH access to
+    # SSHs to sequencer-sync@sequencer.example.org:/srv/sequencer/landing-zone-other
+    destination:
+      type: remote
+      user: "sequencer-sync"
+      host: "sequencer.example.org"
+      port: 22
+      path: "/srv/sequencer/landing-zone-other"
     exclude:
       - "*_skip"
       - "pod5*"
