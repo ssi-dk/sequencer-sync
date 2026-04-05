@@ -560,18 +560,12 @@ fn touch_transfer_marker(transferred_dir: &Destination) -> Result<(), AppError> 
             Ok(())
         }
         Destination::Remote(remote) => {
-            let marker = remote.path.join(TRANSFER_MARKER_FILE_NAME);
-            run_ssh_command(
-                remote,
-                &format!(
-                    "touch -- {}",
-                    shell_quote(marker.to_string_lossy().as_ref())
-                ),
-            )
-            .map_err(|source| AppError::WriteRemoteTransferMarker {
-                destination: remote.display(),
-                source,
-            })
+            build_remote_touch_marker(remote)
+                .run_status()
+                .map_err(|source| AppError::WriteRemoteTransferMarker {
+                    destination: remote.display(),
+                    source,
+                })
         }
     }
 }
@@ -594,21 +588,9 @@ fn rsync_directory(
         destination.display(),
         exclude.join(" ")
     );
-    let mut cmd = Command::new("rsync");
-    cmd.arg("-a");
-    if let Destination::Remote(remote) = destination {
-        cmd.arg("-e")
-            .arg(format!("ssh -o BatchMode=yes -p {}", remote.port));
-    }
-    for pattern in exclude {
-        cmd.arg("--exclude").arg(pattern);
-    }
-    let source_contents = path_with_trailing_separator(source);
-    let destination_dir = rsync_destination(destination);
+    let cmd = build_rsync_command(source, destination, exclude);
     let output = cmd
-        .arg(source_contents)
-        .arg(&destination_dir)
-        .output()
+        .run_output()
         .map_err(|source| AppError::SpawnRsync { source })?;
 
     if output.status.success() {
@@ -666,28 +648,23 @@ fn check_ssh_access(remote: &RemoteDestination) -> Result<(), AppError> {
         "Checking SSH access. User name: {} port: {} domain name: {}",
         remote.user, remote.port, remote.host
     );
-    run_ssh_command(remote, "true").map_err(|source| AppError::SshAccessDenied {
-        user: remote.user.clone(),
-        host: remote.host.clone(),
-        port: remote.port,
-        source,
-    })
+    build_ssh_access_check(remote)
+        .run_status()
+        .map_err(|source| AppError::SshAccessDenied {
+            user: remote.user.clone(),
+            host: remote.host.clone(),
+            port: remote.port,
+            source,
+        })
 }
 
 fn check_remote_writable_directory(remote: &RemoteDestination) -> Result<(), AppError> {
-    let probe_path = temp_probe_path(&remote.path, "category.destination.path");
-    run_ssh_command(
-        remote,
-        &format!(
-            "mkdir -p -- {dir} && : > {probe} && rm -f -- {probe}",
-            dir = shell_quote(remote.path.to_string_lossy().as_ref()),
-            probe = shell_quote(probe_path.to_string_lossy().as_ref()),
-        ),
-    )
-    .map_err(|source| AppError::RemoteWriteDirectory {
-        destination: remote.display(),
-        source,
-    })
+    build_remote_writable_probe(remote, "category.destination.path")
+        .run_status()
+        .map_err(|source| AppError::RemoteWriteDirectory {
+            destination: remote.display(),
+            source,
+        })
 }
 
 // Create the target directory, which we then rsync into.
@@ -702,16 +679,11 @@ fn prepare_transfer_destination(destination: &Destination) -> Result<(), AppErro
                 source,
             })
         }
-        Destination::Remote(remote) => run_ssh_command(
-            remote,
-            &format!(
-                "mkdir -p -- {}",
-                shell_quote(remote.path.to_string_lossy().as_ref())
-            ),
-        )
-        .map_err(|source| AppError::CreateRemoteTransferDir {
-            destination: remote.display(),
-            source,
+        Destination::Remote(remote) => build_remote_mkdir(remote).run_status().map_err(|source| {
+            AppError::CreateRemoteTransferDir {
+                destination: remote.display(),
+                source,
+            }
         }),
     }
 }
@@ -854,28 +826,117 @@ fn shell_quote(value: &str) -> String {
     format!("'{escaped}'")
 }
 
-fn run_ssh_command(remote: &RemoteDestination, remote_command: &str) -> Result<(), std::io::Error> {
-    let status = Command::new("ssh")
-        .arg("-o")
-        .arg("BatchMode=yes")
-        .arg("-p")
-        .arg(remote.port.to_string())
-        .arg(format!("{}@{}", remote.user, remote.host))
-        .arg("--")
-        .arg(remote_command)
-        .status()?;
+/// A command ready to execute, represented as program + args for testability.
+struct ExternalCommand {
+    program: OsString,
+    args: Vec<OsString>,
+}
 
-    if status.success() {
-        Ok(())
-    } else {
-        Err(std::io::Error::other(format!(
-            "remote command failed with exit code {}",
-            status
-                .code()
-                .map_or_else(|| "unknown".to_string(), |code| code.to_string())
-        )))
+impl ExternalCommand {
+    fn run_status(&self) -> Result<(), std::io::Error> {
+        let status = Command::new(&self.program).args(&self.args).status()?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(std::io::Error::other(format!(
+                "remote command failed with exit code {}",
+                status
+                    .code()
+                    .map_or_else(|| "unknown".to_string(), |code| code.to_string())
+            )))
+        }
+    }
+
+    fn run_output(&self) -> Result<std::process::Output, std::io::Error> {
+        Command::new(&self.program).args(&self.args).output()
     }
 }
+
+// ---------------------------------------------------------------------------
+// Command builders — pure functions returning ExternalCommand
+// ---------------------------------------------------------------------------
+
+fn build_ssh_command(remote: &RemoteDestination, remote_command: &str) -> ExternalCommand {
+    ExternalCommand {
+        program: OsString::from("ssh"),
+        args: vec![
+            OsString::from("-o"),
+            OsString::from("BatchMode=yes"),
+            OsString::from("-p"),
+            OsString::from(remote.port.to_string()),
+            OsString::from(format!("{}@{}", remote.user, remote.host)),
+            OsString::from("--"),
+            OsString::from(remote_command),
+        ],
+    }
+}
+
+fn build_ssh_access_check(remote: &RemoteDestination) -> ExternalCommand {
+    build_ssh_command(remote, "true")
+}
+
+fn build_remote_writable_probe(remote: &RemoteDestination, field: &str) -> ExternalCommand {
+    let probe_path = temp_probe_path(&remote.path, field);
+    build_ssh_command(
+        remote,
+        &format!(
+            "mkdir -p -- {dir} && : > {probe} && rm -f -- {probe}",
+            dir = shell_quote(remote.path.to_string_lossy().as_ref()),
+            probe = shell_quote(probe_path.to_string_lossy().as_ref()),
+        ),
+    )
+}
+
+fn build_remote_mkdir(remote: &RemoteDestination) -> ExternalCommand {
+    build_ssh_command(
+        remote,
+        &format!(
+            "mkdir -p -- {}",
+            shell_quote(remote.path.to_string_lossy().as_ref())
+        ),
+    )
+}
+
+fn build_remote_touch_marker(remote: &RemoteDestination) -> ExternalCommand {
+    let marker = remote.path.join(TRANSFER_MARKER_FILE_NAME);
+    build_ssh_command(
+        remote,
+        &format!(
+            "touch -- {}",
+            shell_quote(marker.to_string_lossy().as_ref())
+        ),
+    )
+}
+
+fn build_rsync_command(
+    source: &Path,
+    destination: &Destination,
+    exclude: &[String],
+) -> ExternalCommand {
+    let mut args = Vec::new();
+    args.push(OsString::from("-a"));
+    if let Destination::Remote(remote) = destination {
+        args.push(OsString::from("-e"));
+        args.push(OsString::from(format!(
+            "ssh -o BatchMode=yes -p {}",
+            remote.port
+        )));
+    }
+    for pattern in exclude {
+        args.push(OsString::from("--exclude"));
+        args.push(OsString::from(pattern));
+    }
+    args.push(path_with_trailing_separator(source).into_os_string());
+    args.push(rsync_destination(destination));
+    ExternalCommand {
+        program: OsString::from("rsync"),
+        args,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Thin wrappers: builder + execution
+// ---------------------------------------------------------------------------
 
 struct RunLock {
     file: File,
@@ -1037,8 +1098,10 @@ mod tests {
     use regex::Regex;
 
     use super::{
-        classify, cron_file_path, lock_file_path, path_with_trailing_separator, render_cron_file,
-        rsync_destination, run_is_complete,
+        build_remote_mkdir, build_remote_touch_marker, build_remote_writable_probe,
+        build_rsync_command, build_ssh_access_check, classify, cron_file_path, lock_file_path,
+        path_with_trailing_separator, render_cron_file, rsync_destination, run_is_complete,
+        shell_quote,
     };
     use crate::config::{Category, Destination, RemoteDestination};
 
@@ -1199,5 +1262,298 @@ mod tests {
             path_with_trailing_separator(Path::new("/tmp/data/")),
             PathBuf::from("/tmp/data/")
         );
+    }
+
+    fn args_as_strings(cmd: &super::ExternalCommand) -> Vec<String> {
+        cmd.args
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    fn test_remote() -> RemoteDestination {
+        RemoteDestination {
+            user: "alice".to_string(),
+            host: "example.org".to_string(),
+            port: 22,
+            path: PathBuf::from("/incoming/data"),
+        }
+    }
+
+    // --- SSH access check ---
+
+    #[test]
+    fn ssh_access_check_command() {
+        let remote = test_remote();
+        let cmd = build_ssh_access_check(&remote);
+        assert_eq!(cmd.program, OsString::from("ssh"));
+        assert_eq!(
+            args_as_strings(&cmd),
+            vec![
+                "-o",
+                "BatchMode=yes",
+                "-p",
+                "22",
+                "alice@example.org",
+                "--",
+                "true"
+            ]
+        );
+    }
+
+    #[test]
+    fn ssh_access_check_non_default_port() {
+        let remote = RemoteDestination {
+            port: 2222,
+            ..test_remote()
+        };
+        let cmd = build_ssh_access_check(&remote);
+        assert_eq!(args_as_strings(&cmd)[3], "2222");
+    }
+
+    #[test]
+    fn ssh_access_check_passthrough_host() {
+        let remote = RemoteDestination {
+            user: "deploy".to_string(),
+            host: "jump+internal.host".to_string(),
+            ..test_remote()
+        };
+        let cmd = build_ssh_access_check(&remote);
+        assert_eq!(args_as_strings(&cmd)[4], "deploy@jump+internal.host");
+    }
+
+    // --- Remote mkdir (prepare_transfer_destination) ---
+
+    #[test]
+    fn remote_mkdir_command() {
+        let remote = test_remote();
+        let cmd = build_remote_mkdir(&remote);
+        let args = args_as_strings(&cmd);
+        assert_eq!(args[6], "mkdir -p -- '/incoming/data'");
+    }
+
+    #[test]
+    fn remote_mkdir_path_with_spaces() {
+        let remote = RemoteDestination {
+            path: PathBuf::from("/incoming/my data"),
+            ..test_remote()
+        };
+        let cmd = build_remote_mkdir(&remote);
+        let args = args_as_strings(&cmd);
+        assert_eq!(args[6], "mkdir -p -- '/incoming/my data'");
+    }
+
+    #[test]
+    fn remote_mkdir_path_with_shell_sensitive_chars() {
+        let remote = RemoteDestination {
+            path: PathBuf::from("/incoming/$HOME;rm -rf /"),
+            ..test_remote()
+        };
+        let cmd = build_remote_mkdir(&remote);
+        let args = args_as_strings(&cmd);
+        assert_eq!(args[6], "mkdir -p -- '/incoming/$HOME;rm -rf /'");
+    }
+
+    #[test]
+    fn remote_mkdir_path_with_single_quotes() {
+        let remote = RemoteDestination {
+            path: PathBuf::from("/incoming/it's data"),
+            ..test_remote()
+        };
+        let cmd = build_remote_mkdir(&remote);
+        let args = args_as_strings(&cmd);
+        assert_eq!(args[6], r#"mkdir -p -- '/incoming/it'\''s data'"#);
+    }
+
+    // --- Remote writable probe ---
+
+    #[test]
+    fn remote_writable_probe_command_structure() {
+        let remote = test_remote();
+        let cmd = build_remote_writable_probe(&remote, "category.destination.path");
+        let args = args_as_strings(&cmd);
+        let payload = &args[6];
+        assert!(payload.starts_with("mkdir -p -- '/incoming/data'"));
+        assert!(payload.contains("&& : >"));
+        assert!(payload.contains("&& rm -f --"));
+        assert!(payload.contains(".sequencer-sync-category.destination.path-write-probe-"));
+    }
+
+    #[test]
+    fn remote_writable_probe_quotes_path_with_single_quotes() {
+        let remote = RemoteDestination {
+            path: PathBuf::from("/incoming/it's data"),
+            ..test_remote()
+        };
+        let cmd = build_remote_writable_probe(&remote, "category.destination.path");
+        let args = args_as_strings(&cmd);
+        let payload = &args[6];
+        assert!(payload.starts_with(r#"mkdir -p -- '/incoming/it'\''s data'"#));
+    }
+
+    // --- Remote touch marker ---
+
+    #[test]
+    fn remote_touch_marker_command() {
+        let remote = test_remote();
+        let cmd = build_remote_touch_marker(&remote);
+        let args = args_as_strings(&cmd);
+        assert_eq!(args[6], "touch -- '/incoming/data/transfer_successful.txt'");
+    }
+
+    #[test]
+    fn remote_touch_marker_path_with_spaces() {
+        let remote = RemoteDestination {
+            path: PathBuf::from("/incoming/run 001"),
+            ..test_remote()
+        };
+        let cmd = build_remote_touch_marker(&remote);
+        let args = args_as_strings(&cmd);
+        assert_eq!(
+            args[6],
+            "touch -- '/incoming/run 001/transfer_successful.txt'"
+        );
+    }
+
+    #[test]
+    fn remote_touch_marker_path_with_single_quotes() {
+        let remote = RemoteDestination {
+            path: PathBuf::from("/incoming/it's a run"),
+            ..test_remote()
+        };
+        let cmd = build_remote_touch_marker(&remote);
+        let args = args_as_strings(&cmd);
+        assert_eq!(
+            args[6],
+            r#"touch -- '/incoming/it'\''s a run/transfer_successful.txt'"#
+        );
+    }
+
+    // --- Rsync command: local destination ---
+
+    #[test]
+    fn rsync_local_command() {
+        let source = Path::new("/data/nanopore/run001");
+        let dest = Destination::Local {
+            path: PathBuf::from("/landing/run001"),
+        };
+        let cmd = build_rsync_command(source, &dest, &[]);
+        assert_eq!(cmd.program, OsString::from("rsync"));
+        assert_eq!(
+            args_as_strings(&cmd),
+            vec!["-a", "/data/nanopore/run001/", "/landing/run001/"]
+        );
+    }
+
+    #[test]
+    fn rsync_local_with_excludes() {
+        let source = Path::new("/data/nanopore/run001");
+        let dest = Destination::Local {
+            path: PathBuf::from("/landing/run001"),
+        };
+        let excludes = vec!["*.tmp".to_string(), "logs/".to_string()];
+        let cmd = build_rsync_command(source, &dest, &excludes);
+        assert_eq!(
+            args_as_strings(&cmd),
+            vec![
+                "-a",
+                "--exclude",
+                "*.tmp",
+                "--exclude",
+                "logs/",
+                "/data/nanopore/run001/",
+                "/landing/run001/"
+            ]
+        );
+    }
+
+    // --- Rsync command: remote destination ---
+
+    #[test]
+    fn rsync_remote_command() {
+        let source = Path::new("/data/nanopore/run001");
+        let dest = Destination::Remote(RemoteDestination {
+            user: "alice".to_string(),
+            host: "example.org".to_string(),
+            port: 22,
+            path: PathBuf::from("/incoming/run001"),
+        });
+        let cmd = build_rsync_command(source, &dest, &[]);
+        assert_eq!(
+            args_as_strings(&cmd),
+            vec![
+                "-a",
+                "-e",
+                "ssh -o BatchMode=yes -p 22",
+                "/data/nanopore/run001/",
+                "alice@example.org:/incoming/run001/"
+            ]
+        );
+    }
+
+    #[test]
+    fn rsync_remote_non_default_port() {
+        let source = Path::new("/data/run001");
+        let dest = Destination::Remote(RemoteDestination {
+            user: "bob".to_string(),
+            host: "server.local".to_string(),
+            port: 2222,
+            path: PathBuf::from("/srv/data/run001"),
+        });
+        let cmd = build_rsync_command(source, &dest, &[]);
+        let args = args_as_strings(&cmd);
+        assert_eq!(args[2], "ssh -o BatchMode=yes -p 2222");
+    }
+
+    #[test]
+    fn rsync_remote_with_excludes() {
+        let source = Path::new("/data/run001");
+        let dest = Destination::Remote(test_remote());
+        let excludes = vec!["*.bam".to_string()];
+        let cmd = build_rsync_command(source, &dest, &excludes);
+        let args = args_as_strings(&cmd);
+        assert_eq!(args[3], "--exclude");
+        assert_eq!(args[4], "*.bam");
+    }
+
+    // --- Rsync with year-subdirectory derived path ---
+
+    #[test]
+    fn rsync_remote_year_subdirectory_path() {
+        let source = Path::new("/data/nanopore/240101_NB123");
+        let base_dest = Destination::Remote(RemoteDestination {
+            user: "alice".to_string(),
+            host: "example.org".to_string(),
+            port: 22,
+            path: PathBuf::from("/incoming"),
+        });
+        // Simulate what classify does with year_subdirectory=true
+        let year_dest = base_dest.with_appended_relative_path(Path::new("2024"));
+        let final_dest = year_dest.with_appended_relative_path(Path::new("240101_NB123"));
+        let cmd = build_rsync_command(source, &final_dest, &[]);
+        let args = args_as_strings(&cmd);
+        assert_eq!(args[4], "alice@example.org:/incoming/2024/240101_NB123/");
+    }
+
+    // --- shell_quote ---
+
+    #[test]
+    fn shell_quote_simple_value() {
+        assert_eq!(shell_quote("/tmp/data"), "'/tmp/data'");
+    }
+
+    #[test]
+    fn shell_quote_value_with_spaces() {
+        assert_eq!(shell_quote("/tmp/my data"), "'/tmp/my data'");
+    }
+
+    #[test]
+    fn shell_quote_value_with_single_quotes() {
+        assert_eq!(shell_quote("it's"), r#"'it'\''s'"#);
+    }
+
+    #[test]
+    fn shell_quote_value_with_special_chars() {
+        assert_eq!(shell_quote("$HOME;rm -rf /"), "'$HOME;rm -rf /'");
     }
 }
