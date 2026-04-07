@@ -17,10 +17,35 @@ mod config;
 mod run_log;
 mod transfer_log;
 
+fn long_version() -> &'static str {
+    let mut s = env!("CARGO_PKG_VERSION").to_owned();
+
+    match (
+        option_env!("VERGEN_GIT_SHA"),
+        option_env!("VERGEN_GIT_COMMIT_DATE"),
+    ) {
+        (Some(sha), Some(date)) => {
+            s.push_str(" commit ");
+            s.push_str(sha);
+            s.push_str(" at ");
+            s.push_str(date);
+
+            if option_env!("VERGEN_GIT_DIRTY").is_some_and(|s| s == "true") {
+                s.push_str(" (dirty)");
+            }
+        }
+        _ => s.push_str(" (commit not available at build time)"),
+    }
+    // Leak because clap demands a &'static str. This occurs once in program for a small string,
+    // so the memory usage doesn't matter.
+    Box::leak(s.into_boxed_str())
+}
+
 #[derive(Debug, Parser)]
 #[command(
-    version,
     name = "sequencer-sync",
+    version,
+    long_version = long_version(),
     about = "Copy files from sequencing run directory to a target directory"
 )]
 struct Cli {

@@ -3,6 +3,7 @@ name = "sequencer-sync"
 version = "1.0.0"
 edition = "2024"
 rust-version = "1.85"
+build = "build.rs"
 
 [dependencies]
 chrono = { version = "0.4", features = ["clock"] }
@@ -19,3 +20,6 @@ env_logger = "0.11"
 
 [dev-dependencies]
 assert_cmd = "2"
+
+[build-dependencies]
+vergen-git2 = { version = "1.0.7", features = ["build"] }
