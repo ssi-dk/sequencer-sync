@@ -18,8 +18,11 @@ mod run_log;
 mod transfer_log;
 
 #[derive(Debug, Parser)]
-#[command(name = "sequencer-sync")]
-#[command(about = "Copy files from sequencing run directory to a target directory")]
+#[command(
+    version,
+    name = "sequencer-sync",
+    about = "Copy files from sequencing run directory to a target directory"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
