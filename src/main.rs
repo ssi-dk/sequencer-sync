@@ -31,7 +31,7 @@ fn long_version() -> &'static str {
             s.push_str(date);
 
             if option_env!("VERGEN_GIT_DIRTY").is_some_and(|s| s == "true") {
-                s.push_str(" (dirty)");
+                s.push_str(" (dirty git repository)");
             }
         }
         _ => s.push_str(" (commit not available at build time)"),
@@ -766,7 +766,7 @@ fn render_cron_file(config_path: &Path, binary_path: &Path) -> String {
         shell_quote(config_path.to_string_lossy().as_ref()),
     );
 
-    format!("# Install this file into cron manually.\n*/15 * * * * {command}\n")
+    format!("# Install this file into cron manually.\n* * * * * {command}\n")
 }
 
 fn check_lock_is_available(flockdir: &Path, lock_file_name: &str) -> Result<(), AppError> {

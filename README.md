@@ -1,7 +1,8 @@
 # Sequencer-sync
 This program runs on DNA sequencers and copies selected files from sequencing runs to a "landing zone" on the same machine.
 The `landingzones` program then syncronizes the landing zone with a directory on a remote server.
-This program is run regularly by a cron job.
+
+The purpose is to be run by a cron job and thereby automate transfer of complete sequencing runs to a compute server.
 
 ## How to install / deploy
 For deployment at SSI, see the (private) repo `rit-deploy-sequencer-sync`.
@@ -14,7 +15,7 @@ For other users, e.g. non SSI users:
 When `sequencer-sync run` is invoked, it:
 
 * Loads and validates the config file
-* Acquires a file lock to prevent concurrent runs
+* Acquires a file lock to prevent concurrent runs and thereby prevents races
 * Loads the transfer log (JSONL) which tracks previously transferred directories
 * Scans the source directory for subdirectories not yet in the transfer log
 * For each new directory, matches it against the configured categories by regex
