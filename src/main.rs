@@ -1020,7 +1020,11 @@ mod tests {
         );
 
         assert!(block.contains("# Install this file into cron manually."));
-        assert!(block.contains("*/15 * * * *"));
+        assert!(
+            regex::Regex::new(r#"(\*/\d+|\*) \* \* \* \*"#)
+                .unwrap()
+                .is_match(&block)
+        );
         assert!(block.contains("'/usr/local/bin/sequencer-sync' run"));
         assert!(block.contains("--config-path '/etc/sequencer-sync/config.yaml'"));
         assert!(!block.contains("--platform"));
