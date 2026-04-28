@@ -444,7 +444,6 @@ fn validate_all_paths_distinct(paths: &[(&'static str, &Path)]) -> Result<(), Co
 #[cfg(test)]
 mod tests {
     use std::ffi::{OsStr, OsString};
-    use std::os::unix::ffi::{OsStrExt, OsStringExt};
     use std::path::PathBuf;
 
     use super::{Config, ConfigError, LandingZone};
@@ -886,14 +885,11 @@ category:
     }
 
     #[test]
-    fn landing_zone_join_run_local_preserves_non_utf8_name() {
+    fn landing_zone_join_run_local() {
         let zone = LandingZone::Local(PathBuf::from("/landing"));
-        let run_name = OsStr::from_bytes(b"ONT_\xff_run");
         assert_eq!(
-            zone.join_run(run_name),
-            LandingZone::Local(
-                PathBuf::from("/landing").join(OsString::from_vec(b"ONT_\xff_run".to_vec()))
-            )
+            zone.join_run(OsStr::new("ONT_WGS_run")),
+            LandingZone::Local(PathBuf::from("/landing/ONT_WGS_run"))
         );
     }
 

@@ -159,7 +159,7 @@ impl ScanSummary {
 // I.e. we don't want to log on noop calls since then running this program via
 // a cron job would flood the log, making it useless.
 struct ScanResult {
-    planned_transfers: Vec<(fs::DirEntry, TransferReason, TransferTarget)>,
+    planned_transfers: Vec<(fs::DirEntry, String, TransferReason, TransferTarget)>,
     incomplete_messages: Vec<String>,
     summary: ScanSummary,
 }
@@ -324,6 +324,11 @@ fn scan_directories(
         if !file_type.is_dir() {
             continue;
         }
+        let dir_name = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| AppError::NonUtf8RunDirectory { path: entry.path() })?;
+
         let key = transfer_log::relative_directory_key(source, &entry.path())
             .map_err(AppError::TransferLog)?;
 
@@ -342,9 +347,6 @@ fn scan_directories(
             }
             TransferAction::Tranfer(reason) => reason,
         };
-
-        let dir_name = entry.file_name();
-        let dir_name = dir_name.to_string_lossy();
 
         let target = match classify(&dir_name, categories)? {
             Some(t) => {
@@ -380,7 +382,7 @@ fn scan_directories(
             }
         }
 
-        planned_transfers.push((entry, reason, target));
+        planned_transfers.push((entry, dir_name, reason, target));
     }
     summary.planned = planned_transfers.len() as u32;
 
@@ -397,16 +399,18 @@ fn run_is_complete(
 ) -> Result<bool, AppError> {
     for completion_file_glob in completion_file_globs {
         let pattern = run_dir.join(completion_file_glob.as_str());
-        let pattern = pattern.to_string_lossy();
+        let pattern_str = pattern
+            .to_str()
+            .ok_or_else(|| AppError::NonUtf8CompletionGlobPath {
+                path: pattern.clone(),
+            })?;
         // The pattern was validated at config load time, so PatternError is not expected here.
-        let mut paths = glob::glob(&pattern).expect("completion file glob pattern should be valid");
+        let mut paths =
+            glob::glob(pattern_str).expect("completion file glob pattern should be valid");
         match paths.next() {
             None => {
                 return {
-                    debug!(
-                        "\tNot found: Completion glob {}",
-                        run_dir.join(completion_file_glob.as_str()).display()
-                    );
+                    debug!("\tNot found: Completion glob {}", pattern.display());
                     Ok(false)
                 };
             }
@@ -496,19 +500,18 @@ fn transfer_new_directories(
         }
     }
 
-    for (entry, reason, target) in planned_transfers {
-        let dir_name = entry.file_name();
-        let dir_name_display = dir_name.to_string_lossy();
-
-        let transferred_dir = target.destination.join_run(&dir_name);
+    for (entry, dir_name, reason, target) in planned_transfers {
+        let dir_name_os = OsStr::new(&dir_name);
 
         if args.dry_run {
+            let transferred_dir = target.destination.join_run(dir_name_os);
             print_dry_run(&entry.path(), &transferred_dir, &target.exclude);
             continue;
         }
 
-        ensure_destination_dir(&transferred_dir)?;
+        ensure_transfer_parent_dir(&target.destination)?;
 
+        let transferred_dir = target.destination.join_run(dir_name_os);
         let destination_display = transferred_dir.display();
         let rsync_result = rsync_directory(&entry.path(), &transferred_dir, &target.exclude);
 
@@ -522,7 +525,7 @@ fn transfer_new_directories(
             Ok(()) => {
                 succeeded += 1;
                 run_log.info(&format!(
-                    "Transferred {} {dir_name_display} -> {destination_display}",
+                    "Transferred {} {dir_name} -> {destination_display}",
                     transfer_reason_label(reason)
                 ));
                 if let Err(error) = touch_transfer_marker(&transferred_dir) {
@@ -534,7 +537,7 @@ fn transfer_new_directories(
             Err(error) => {
                 failed += 1;
                 run_log.error(&format!(
-                    "FAILED transfer {} {dir_name_display} -> {destination_display}: {error}",
+                    "FAILED transfer {} {dir_name} -> {destination_display}: {error}",
                     transfer_reason_label(reason)
                 ));
             }
@@ -780,10 +783,11 @@ fn check_remote_writable_directory(
     }
 }
 
-/// Ensure the destination directory already exists for both local and remote
-/// landing zones. Transfers intentionally do not create the run destination.
-fn ensure_destination_dir(destination: &LandingZone) -> Result<(), AppError> {
-    match destination {
+/// Ensure the parent directory for the transfer already exists for both local
+/// and remote landing zones. Rsync is then allowed to create or update the run
+/// destination under that parent.
+fn ensure_transfer_parent_dir(parent: &LandingZone) -> Result<(), AppError> {
+    match parent {
         LandingZone::Local(path) => ensure_directory_exists(path, "transfer destination"),
         LandingZone::Remote {
             user,
@@ -1027,7 +1031,7 @@ enum AppError {
         exit_code: Option<i32>,
         stderr: String,
     },
-    #[error("remote transfer directory {dir} does not exist on {user}@{host}:{port}: exit code {}", exit_code.map_or("unknown".to_string(), |c| c.to_string()))]
+    #[error("remote transfer parent directory {dir} does not exist on {user}@{host}:{port}: exit code {}", exit_code.map_or("unknown".to_string(), |c| c.to_string()))]
     RemoteTransferDirMissing {
         user: String,
         host: String,
@@ -1120,6 +1124,10 @@ enum AppError {
         #[source]
         source: glob::GlobError,
     },
+    #[error("run directory name must be valid UTF-8: {}", path.display())]
+    NonUtf8RunDirectory { path: PathBuf },
+    #[error("completion glob path must be valid UTF-8: {}", path.display())]
+    NonUtf8CompletionGlobPath { path: PathBuf },
     #[error("failed to write transfer marker {path}: {source}")]
     WriteTransferMarker {
         path: String,

@@ -260,23 +260,32 @@ category:
 }
 
 #[test]
-fn run_fails_missing_transfer_destination_directory() {
-    let fixture = TestFixture::new("missing-transfer-destination");
+fn run_creates_missing_transfer_destination_directory() {
+    let fixture = TestFixture::new("creates-transfer-destination");
     let config_path = fixture.setup_nanopore();
 
     cmd()
         .args(["run", "--config-path"])
         .arg(&config_path)
         .assert()
-        .failure();
+        .success();
 
-    assert!(!fixture.path("nanopore-landing-core/ONT_WGS_run1").exists());
-    assert_eq!(transfer_log_line_count(&fixture), 0);
+    assert!(
+        fixture
+            .path("nanopore-landing-core/ONT_WGS_run1/data.txt")
+            .exists()
+    );
+    assert!(
+        fixture
+            .path("nanopore-landing-other/ONT_raw_run2/data.txt")
+            .exists()
+    );
+    assert_eq!(transfer_log_line_count(&fixture), 2);
 }
 
 #[cfg(unix)]
 #[test]
-fn local_transfer_preserves_non_utf8_run_name() {
+fn run_rejects_non_utf8_run_name() {
     let fixture = TestFixture::new("non-utf8-run-name");
     fixture.mkdir("flockdir");
     fixture.mkdir("logdir");
@@ -291,7 +300,6 @@ fn local_transfer_preserves_non_utf8_run_name() {
         );
         return;
     }
-    fs::create_dir_all(fixture.path("landing").join(run_name)).unwrap();
     fs::write(run_dir.join("report_final.html"), "report").unwrap();
     fs::write(run_dir.join("data.txt"), "payload").unwrap();
 
@@ -318,14 +326,15 @@ category:
     let config_path = fixture.path("config.yaml");
     fs::write(&config_path, config).unwrap();
 
-    cmd()
+    let assert = cmd()
         .args(["run", "--config-path"])
         .arg(&config_path)
         .assert()
-        .success();
+        .failure();
 
-    let landed = fixture.path("landing").join(run_name).join("data.txt");
-    assert!(landed.exists(), "expected file at {}", landed.display());
+    let stderr = String::from_utf8_lossy(&assert.get_output().stderr);
+    assert!(stderr.contains("run directory name must be valid UTF-8"));
+    assert_eq!(transfer_log_line_count(&fixture), 0);
 }
 
 #[test]
@@ -334,6 +343,7 @@ fn nanopore_transfers_complete_runs() {
     let config_path = fixture.setup_nanopore();
     fixture.mkdir("nanopore-landing-core/ONT_WGS_run1");
     fixture.mkdir("nanopore-landing-other/ONT_raw_run2");
+    fixture.write_file("nanopore-landing-core/ONT_WGS_run1/existing.txt", "keep");
 
     cmd()
         .args(["run", "--config-path"])
@@ -345,6 +355,11 @@ fn nanopore_transfers_complete_runs() {
     assert!(
         fixture
             .path("nanopore-landing-core/ONT_WGS_run1/data.txt")
+            .exists()
+    );
+    assert!(
+        fixture
+            .path("nanopore-landing-core/ONT_WGS_run1/existing.txt")
             .exists()
     );
 
@@ -1230,7 +1245,6 @@ mod remote_e2e {
         fixture.mkdir("source");
         let remote_landing = fixture.mkdir("remote landing");
         let server_root = fixture.mkdir("server");
-        fixture.mkdir("remote landing/240101_NB 001");
         fixture.mkdir("source/240101_NB 001");
         fixture.mkdir("source/240101_NB 001/PrimaryAnalysisMetrics");
         fixture.write_file(
