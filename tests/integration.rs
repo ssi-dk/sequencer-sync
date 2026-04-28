@@ -2,6 +2,8 @@ use std::fs;
 use std::path::PathBuf;
 
 use assert_cmd::Command;
+#[cfg(unix)]
+use std::os::unix::ffi::OsStrExt;
 
 struct TestFixture {
     root: PathBuf,
@@ -44,20 +46,21 @@ impl TestFixture {
             r#"flockdir: "{flockdir}"
 lock_file_name: "sequencer-sync.lock"
 logdir: "{logdir}"
-server_user: "test"
-server_port: 22
-server_host: "localhost"
 source: "{source}"
 
 category:
   - regex: "^ONT_WGS_"
-    landing_zone: "{landing_core}"
+    landing_zone:
+      kind: local
+      path: "{landing_core}"
     exclude: []
     completion_file_globs:
       - "report*.html"
 
   - regex: "^ONT_"
-    landing_zone: "{landing_other}"
+    landing_zone:
+      kind: local
+      path: "{landing_other}"
     exclude: []
     completion_file_globs:
       - "report*.html"
@@ -78,14 +81,13 @@ category:
             r#"flockdir: "{flockdir}"
 lock_file_name: "sequencer-sync.lock"
 logdir: "{logdir}"
-server_user: "test"
-server_port: 22
-server_host: "localhost"
 source: "{source}"
 
 category:
   - regex: "^\\d{{6}}_"
-    landing_zone: "{landing}"
+    landing_zone:
+      kind: local
+      path: "{landing}"
     exclude: []
     completion_file_globs:
       - "PrimaryAnalysisMetrics/PrimaryAnalysisMetrics.csv"
@@ -222,20 +224,21 @@ fn run_fails_nonexistent_landing_zone() {
         r#"flockdir: "{flockdir}"
 lock_file_name: "sequencer-sync.lock"
 logdir: "{logdir}"
-server_user: "test"
-server_port: 22
-server_host: "localhost"
 source: "{source}"
 
 category:
   - regex: "^ONT_WGS_"
-    landing_zone: "{landing_core}"
+    landing_zone:
+      kind: local
+      path: "{landing_core}"
     exclude: []
     completion_file_globs:
       - "report*.html"
 
   - regex: "^ONT_"
-    landing_zone: "{root}/no-such-parent/nanopore-landing-other"
+    landing_zone:
+      kind: local
+      path: "{root}/no-such-parent/nanopore-landing-other"
     exclude: []
     completion_file_globs:
       - "report*.html"
@@ -257,9 +260,80 @@ category:
 }
 
 #[test]
+fn run_fails_missing_transfer_destination_directory() {
+    let fixture = TestFixture::new("missing-transfer-destination");
+    let config_path = fixture.setup_nanopore();
+
+    cmd()
+        .args(["run", "--config-path"])
+        .arg(&config_path)
+        .assert()
+        .failure();
+
+    assert!(!fixture.path("nanopore-landing-core/ONT_WGS_run1").exists());
+    assert_eq!(transfer_log_line_count(&fixture), 0);
+}
+
+#[cfg(unix)]
+#[test]
+fn local_transfer_preserves_non_utf8_run_name() {
+    let fixture = TestFixture::new("non-utf8-run-name");
+    fixture.mkdir("flockdir");
+    fixture.mkdir("logdir");
+    fixture.mkdir("source");
+    fixture.mkdir("landing");
+
+    let run_name = std::ffi::OsStr::from_bytes(b"ONT_\xff_run");
+    let run_dir = fixture.path("source").join(run_name);
+    if let Err(error) = fs::create_dir_all(&run_dir) {
+        eprintln!(
+            "skipping non-UTF-8 path transfer test: filesystem/sandbox refused test path: {error}"
+        );
+        return;
+    }
+    fs::create_dir_all(fixture.path("landing").join(run_name)).unwrap();
+    fs::write(run_dir.join("report_final.html"), "report").unwrap();
+    fs::write(run_dir.join("data.txt"), "payload").unwrap();
+
+    let config = format!(
+        r#"flockdir: "{flockdir}"
+lock_file_name: "sequencer-sync.lock"
+logdir: "{logdir}"
+source: "{source}"
+
+category:
+  - regex: "^ONT_"
+    landing_zone:
+      kind: local
+      path: "{landing}"
+    exclude: []
+    completion_file_globs:
+      - "report*.html"
+"#,
+        flockdir = fixture.path("flockdir").display(),
+        logdir = fixture.path("logdir").display(),
+        source = fixture.path("source").display(),
+        landing = fixture.path("landing").display(),
+    );
+    let config_path = fixture.path("config.yaml");
+    fs::write(&config_path, config).unwrap();
+
+    cmd()
+        .args(["run", "--config-path"])
+        .arg(&config_path)
+        .assert()
+        .success();
+
+    let landed = fixture.path("landing").join(run_name).join("data.txt");
+    assert!(landed.exists(), "expected file at {}", landed.display());
+}
+
+#[test]
 fn nanopore_transfers_complete_runs() {
     let fixture = TestFixture::new("nanopore-complete");
     let config_path = fixture.setup_nanopore();
+    fixture.mkdir("nanopore-landing-core/ONT_WGS_run1");
+    fixture.mkdir("nanopore-landing-other/ONT_raw_run2");
 
     cmd()
         .args(["run", "--config-path"])
@@ -308,6 +382,7 @@ fn nanopore_transfers_complete_runs() {
 fn nextseq_skips_incomplete_runs() {
     let fixture = TestFixture::new("nextseq-incomplete");
     let config_path = fixture.setup_nextseq();
+    fixture.mkdir("nextseq-landing/240101_NB001");
 
     cmd()
         .args(["run", "--config-path"])
@@ -340,6 +415,8 @@ fn nextseq_skips_incomplete_runs() {
 fn nextseq_ignore_incomplete_transfers_all() {
     let fixture = TestFixture::new("nextseq-ignore-incomplete");
     let config_path = fixture.setup_nextseq();
+    fixture.mkdir("nextseq-landing/240101_NB001");
+    fixture.mkdir("nextseq-landing/240202_NB002");
 
     cmd()
         .args(["run", "--config-path"])
@@ -382,14 +459,13 @@ fn nextseq_requires_all_completion_globs() {
         r#"flockdir: "{flockdir}"
 lock_file_name: "sequencer-sync.lock"
 logdir: "{logdir}"
-server_user: "test"
-server_port: 22
-server_host: "localhost"
 source: "{source}"
 
 category:
   - regex: "^\\d{{6}}_"
-    landing_zone: "{landing}"
+    landing_zone:
+      kind: local
+      path: "{landing}"
     exclude: []
     completion_file_globs:
       - "PrimaryAnalysisMetrics/PrimaryAnalysisMetrics.csv"
@@ -417,6 +493,8 @@ category:
 fn second_run_is_noop() {
     let fixture = TestFixture::new("second-noop");
     let config_path = fixture.setup_nanopore();
+    fixture.mkdir("nanopore-landing-core/ONT_WGS_run1");
+    fixture.mkdir("nanopore-landing-other/ONT_raw_run2");
 
     // First run
     cmd()
@@ -454,6 +532,7 @@ fn second_run_is_noop() {
 fn incomplete_only_run_appends_to_latest_log() {
     let fixture = TestFixture::new("incomplete-only-appends-latest");
     let config_path = fixture.setup_nextseq();
+    fixture.mkdir("nextseq-landing/240101_NB001");
 
     cmd()
         .args(["run", "--config-path"])
@@ -479,6 +558,7 @@ fn incomplete_only_run_appends_to_latest_log() {
 fn retry_failed() {
     let fixture = TestFixture::new("retry-failed");
     let config_path = fixture.setup_nextseq();
+    fixture.mkdir("nextseq-landing/240101_NB001");
 
     // Write a failed entry to the transfer log
     let log_path = transfer_log_path(&fixture);
@@ -531,6 +611,7 @@ fn retry_failed() {
 fn redo_true_retransfers_succeeded_directory() {
     let fixture = TestFixture::new("redo-true");
     let config_path = fixture.setup_nextseq();
+    fixture.mkdir("nextseq-landing/240101_NB001");
 
     cmd()
         .args(["run", "--config-path"])
@@ -646,20 +727,21 @@ fn dry_run_shows_exclude_patterns() {
         r#"flockdir: "{flockdir}"
 lock_file_name: "sequencer-sync.lock"
 logdir: "{logdir}"
-server_user: "test"
-server_port: 22
-server_host: "localhost"
 source: "{source}"
 
 category:
   - regex: "^ONT_WGS_"
-    landing_zone: "{landing_core}"
+    landing_zone:
+      kind: local
+      path: "{landing_core}"
     exclude: ["/Data", "/AutoCenter"]
     completion_file_globs:
       - "report*.html"
 
   - regex: "^ONT_"
-    landing_zone: "{landing_other}"
+    landing_zone:
+      kind: local
+      path: "{landing_other}"
     exclude: []
     completion_file_globs:
       - "report*.html"
@@ -693,6 +775,7 @@ fn rsync_excludes_patterns_relative_to_transferred_directory() {
     fixture.mkdir("nanopore-source");
     fixture.mkdir("nanopore-landing-core");
     fixture.mkdir("nanopore-landing-other");
+    fixture.mkdir("nanopore-landing-core/ONT_WGS_run1");
 
     fixture.mkdir("nanopore-source/ONT_WGS_run1");
     fixture.write_file("nanopore-source/ONT_WGS_run1/report_final.html", "report");
@@ -714,20 +797,21 @@ fn rsync_excludes_patterns_relative_to_transferred_directory() {
         r#"flockdir: "{flockdir}"
 lock_file_name: "sequencer-sync.lock"
 logdir: "{logdir}"
-server_user: "test"
-server_port: 22
-server_host: "localhost"
 source: "{source}"
 
 category:
   - regex: "^ONT_WGS_"
-    landing_zone: "{landing_core}"
+    landing_zone:
+      kind: local
+      path: "{landing_core}"
     exclude: ["/Data", "/AutoCenter"]
     completion_file_globs:
       - "report*.html"
 
   - regex: "^ONT_"
-    landing_zone: "{landing_other}"
+    landing_zone:
+      kind: local
+      path: "{landing_other}"
     exclude: []
     completion_file_globs:
       - "report*.html"
@@ -831,7 +915,10 @@ fn setup_fails_missing_landing_zone() {
 }
 
 #[test]
-fn setup_fails_duplicate_landing_zones() {
+fn setup_allows_duplicate_landing_zones() {
+    // Two categories sharing a landing zone is allowed: the flock serializes
+    // runs and `classify` is first-match-wins, so it isn't a correctness
+    // hazard, just a config style choice.
     let fixture = TestFixture::new("setup-dup-landing");
     fixture.mkdir("flockdir");
     fixture.mkdir("logdir");
@@ -842,20 +929,21 @@ fn setup_fails_duplicate_landing_zones() {
         r#"flockdir: "{flockdir}"
 lock_file_name: "sequencer-sync.lock"
 logdir: "{logdir}"
-server_user: "test"
-server_port: 22
-server_host: "localhost"
 source: "{source}"
 
 category:
   - regex: "^ONT_WGS_"
-    landing_zone: "{landing}"
+    landing_zone:
+      kind: local
+      path: "{landing}"
     exclude: []
     completion_file_globs:
       - "report*.html"
 
   - regex: "^ONT_"
-    landing_zone: "{landing}"
+    landing_zone:
+      kind: local
+      path: "{landing}"
     exclude: []
     completion_file_globs:
       - "report*.html"
@@ -873,7 +961,7 @@ category:
         .arg(&config_path)
         .args(["--skip-ssh-check"])
         .assert()
-        .failure();
+        .success();
 }
 
 #[test]
@@ -887,14 +975,13 @@ fn setup_fails_landing_zone_equals_flockdir() {
         r#"flockdir: "{shared}"
 lock_file_name: "sequencer-sync.lock"
 logdir: "{logdir}"
-server_user: "test"
-server_port: 22
-server_host: "localhost"
 source: "{source}"
 
 category:
   - regex: "^\\d{{6}}_"
-    landing_zone: "{shared}"
+    landing_zone:
+      kind: local
+      path: "{shared}"
     exclude: []
     completion_file_globs:
       - "PrimaryAnalysisMetrics/PrimaryAnalysisMetrics.csv"
@@ -912,4 +999,306 @@ category:
         .args(["--skip-ssh-check"])
         .assert()
         .failure();
+}
+
+// ---------------------------------------------------------------------------
+// Opt-in end-to-end test: rsync over SSH to a private sshd on localhost.
+//
+// Gated behind `SEQUENCER_SYNC_E2E_REMOTE=1` because it requires `sshd`,
+// `ssh-keygen`, and `ssh-keyscan` to be installed and bindable on a high
+// port. It runs a private sshd in a temp directory; it does not touch the
+// user's real `~/.ssh`. Each child process gets `HOME` set to the fixture's
+// temp dir so ssh picks up the test's identity and known_hosts.
+// ---------------------------------------------------------------------------
+
+#[cfg(unix)]
+mod remote_e2e {
+    use std::io::Write;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::{Path, PathBuf};
+    use std::process::{Child, Command as StdCommand, Stdio};
+    use std::time::{Duration, Instant};
+    use std::{fs, net};
+
+    use super::{TestFixture, cmd, read_transfer_log};
+
+    fn e2e_enabled() -> bool {
+        std::env::var("SEQUENCER_SYNC_E2E_REMOTE").as_deref() == Ok("1")
+    }
+
+    fn find_sshd() -> Option<PathBuf> {
+        for candidate in [
+            "/usr/sbin/sshd",
+            "/usr/local/sbin/sshd",
+            "/opt/homebrew/sbin/sshd",
+        ] {
+            let p = PathBuf::from(candidate);
+            if p.exists() {
+                return Some(p);
+            }
+        }
+        None
+    }
+
+    fn pick_high_port() -> u16 {
+        let listener = net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral");
+        listener.local_addr().expect("local_addr").port()
+    }
+
+    fn write_with_mode(path: &Path, contents: &str, mode: u32) {
+        fs::write(path, contents).expect("write file");
+        let mut perms = fs::metadata(path).expect("stat").permissions();
+        perms.set_mode(mode);
+        fs::set_permissions(path, perms).expect("chmod");
+    }
+
+    fn run_check(cmd: &mut StdCommand) {
+        let out = cmd.output().expect("spawn");
+        assert!(
+            out.status.success(),
+            "command {cmd:?} failed: status={:?} stdout={} stderr={}",
+            out.status,
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr),
+        );
+    }
+
+    struct PrivateSshd {
+        child: Child,
+        port: u16,
+        /// Directory containing a `ssh` shim that injects the test's identity
+        /// file and known_hosts via -o options. Prepend to PATH for child
+        /// processes so both `Command::new("ssh")` from sequencer-sync and the
+        /// `ssh` rsync spawns via `-e ssh ...` pick it up. macOS ssh ignores
+        /// `$HOME` when locating user known_hosts (it uses the passwd-entry
+        /// home), so a shim is the only portable way to redirect those paths
+        /// without touching the user's real `~/.ssh`.
+        shim_bin_dir: PathBuf,
+    }
+
+    impl Drop for PrivateSshd {
+        fn drop(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+
+    fn start_private_sshd(server_root: &Path, sshd_bin: &Path) -> PrivateSshd {
+        let identity_dir = server_root.join("identity");
+        fs::create_dir_all(&identity_dir).expect("mkdir identity");
+        let mut perms = fs::metadata(&identity_dir).unwrap().permissions();
+        perms.set_mode(0o700);
+        fs::set_permissions(&identity_dir, perms).unwrap();
+
+        let id_path = identity_dir.join("id_ed25519");
+        run_check(
+            StdCommand::new("ssh-keygen")
+                .args(["-t", "ed25519", "-N", "", "-q", "-f"])
+                .arg(&id_path),
+        );
+
+        let host_key = server_root.join("ssh_host_ed25519_key");
+        run_check(
+            StdCommand::new("ssh-keygen")
+                .args(["-t", "ed25519", "-N", "", "-q", "-f"])
+                .arg(&host_key),
+        );
+
+        let pub_key = fs::read_to_string(id_path.with_extension("pub")).expect("read pubkey");
+        let authorized_keys = server_root.join("authorized_keys");
+        write_with_mode(&authorized_keys, &pub_key, 0o600);
+
+        let pid_file = server_root.join("sshd.pid");
+        let port = pick_high_port();
+        let sshd_config = format!(
+            "Port {port}\n\
+             ListenAddress 127.0.0.1\n\
+             HostKey {host_key}\n\
+             PidFile {pid_file}\n\
+             AuthorizedKeysFile {authorized_keys}\n\
+             PasswordAuthentication no\n\
+             PubkeyAuthentication yes\n\
+             ChallengeResponseAuthentication no\n\
+             KbdInteractiveAuthentication no\n\
+             UsePAM no\n\
+             StrictModes no\n\
+             PrintMotd no\n\
+             PrintLastLog no\n\
+             PermitUserEnvironment no\n\
+             X11Forwarding no\n\
+             AllowAgentForwarding no\n\
+             AllowTcpForwarding no\n\
+             Subsystem sftp internal-sftp\n",
+            host_key = host_key.display(),
+            pid_file = pid_file.display(),
+            authorized_keys = authorized_keys.display(),
+        );
+        let sshd_config_path = server_root.join("sshd_config");
+        fs::write(&sshd_config_path, sshd_config).unwrap();
+
+        let child = StdCommand::new(sshd_bin)
+            .arg("-D")
+            .arg("-f")
+            .arg(&sshd_config_path)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn sshd");
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "sshd did not start listening on port {port} within 5s"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+
+        let known_hosts = identity_dir.join("known_hosts");
+        let scan_out = StdCommand::new("ssh-keyscan")
+            .args(["-p", &port.to_string(), "-t", "ed25519", "127.0.0.1"])
+            .output()
+            .expect("ssh-keyscan");
+        assert!(
+            scan_out.status.success() && !scan_out.stdout.is_empty(),
+            "ssh-keyscan failed: status={:?} stderr={}",
+            scan_out.status,
+            String::from_utf8_lossy(&scan_out.stderr),
+        );
+        let mut f = fs::File::create(&known_hosts).expect("create known_hosts");
+        f.write_all(&scan_out.stdout).expect("write known_hosts");
+
+        let real_ssh = which_ssh();
+        let shim_bin_dir = server_root.join("bin");
+        fs::create_dir_all(&shim_bin_dir).expect("mkdir shim bin");
+        let shim_path = shim_bin_dir.join("ssh");
+        let shim = format!(
+            "#!/bin/sh\n\
+             exec {real_ssh:?} \\\n  \
+                 -o UserKnownHostsFile={known_hosts:?} \\\n  \
+                 -o GlobalKnownHostsFile=/dev/null \\\n  \
+                 -o IdentityFile={identity:?} \\\n  \
+                 -o IdentitiesOnly=yes \\\n  \
+                 \"$@\"\n",
+            real_ssh = real_ssh.display(),
+            known_hosts = known_hosts.display(),
+            identity = id_path.display(),
+        );
+        write_with_mode(&shim_path, &shim, 0o755);
+
+        PrivateSshd {
+            child,
+            port,
+            shim_bin_dir,
+        }
+    }
+
+    fn which_ssh() -> PathBuf {
+        for candidate in [
+            "/usr/bin/ssh",
+            "/usr/local/bin/ssh",
+            "/opt/homebrew/bin/ssh",
+        ] {
+            let p = PathBuf::from(candidate);
+            if p.exists() {
+                return p;
+            }
+        }
+        panic!("could not locate ssh client binary");
+    }
+
+    #[test]
+    fn rsync_over_ssh_to_localhost() {
+        if !e2e_enabled() {
+            eprintln!("skipping remote e2e test (set SEQUENCER_SYNC_E2E_REMOTE=1 to enable)");
+            return;
+        }
+        let Some(sshd_bin) = find_sshd() else {
+            eprintln!("skipping remote e2e test: sshd binary not found");
+            return;
+        };
+        let username = std::env::var("USER")
+            .or_else(|_| std::env::var("LOGNAME"))
+            .expect("USER or LOGNAME must be set");
+
+        let fixture = TestFixture::new("remote-e2e");
+        fixture.mkdir("flockdir");
+        fixture.mkdir("logdir");
+        fixture.mkdir("source");
+        let remote_landing = fixture.mkdir("remote landing");
+        let server_root = fixture.mkdir("server");
+        fixture.mkdir("remote landing/240101_NB 001");
+        fixture.mkdir("source/240101_NB 001");
+        fixture.mkdir("source/240101_NB 001/PrimaryAnalysisMetrics");
+        fixture.write_file(
+            "source/240101_NB 001/PrimaryAnalysisMetrics/PrimaryAnalysisMetrics.csv",
+            "metrics",
+        );
+        fixture.write_file("source/240101_NB 001/data.txt", "payload");
+
+        let sshd = start_private_sshd(&server_root, &sshd_bin);
+
+        let config = format!(
+            r#"flockdir: "{flockdir}"
+lock_file_name: "sequencer-sync.lock"
+logdir: "{logdir}"
+source: "{source}"
+
+category:
+  - regex: "^\\d{{6}}_"
+    landing_zone:
+      kind: remote
+      user: "{user}"
+      host: "127.0.0.1"
+      port: {port}
+      dir: "{remote_dir}"
+    exclude: []
+    completion_file_globs:
+      - "PrimaryAnalysisMetrics/PrimaryAnalysisMetrics.csv"
+"#,
+            flockdir = fixture.path("flockdir").display(),
+            logdir = fixture.path("logdir").display(),
+            source = fixture.path("source").display(),
+            user = username,
+            port = sshd.port,
+            remote_dir = remote_landing.display(),
+        );
+        let config_path = fixture.path("config.yaml");
+        fs::write(&config_path, config).unwrap();
+
+        let path_env = match std::env::var_os("PATH") {
+            Some(existing) => {
+                let mut combined = sshd.shim_bin_dir.clone().into_os_string();
+                combined.push(":");
+                combined.push(&existing);
+                combined
+            }
+            None => sshd.shim_bin_dir.clone().into_os_string(),
+        };
+
+        cmd()
+            .env("PATH", &path_env)
+            .args(["setup", "--config-path"])
+            .arg(&config_path)
+            .assert()
+            .success();
+
+        cmd()
+            .env("PATH", &path_env)
+            .args(["run", "--config-path"])
+            .arg(&config_path)
+            .assert()
+            .success();
+
+        let landed = remote_landing.join("240101_NB 001/data.txt");
+        assert!(landed.exists(), "expected file at {}", landed.display());
+        let marker = remote_landing.join("240101_NB 001/transfer_successful.txt");
+        assert!(marker.exists(), "expected marker at {}", marker.display());
+
+        let log = read_transfer_log(&fixture);
+        assert!(log.contains("\"succeeded\":true"));
+    }
 }

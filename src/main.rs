@@ -1,12 +1,13 @@
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::process::ExitCode;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use clap::{Args, Parser, Subcommand};
-use config::{Config, ConfigError};
+use config::{Config, ConfigError, LandingZone};
 use fs2::FileExt;
 use log::debug;
 use run_log::RunLog;
@@ -134,7 +135,7 @@ fn setup(args: SetupArgs) -> Result<(), AppError> {
 // classified a run as e.g. project/operations/something else.
 struct TransferTarget {
     regex_string: String,
-    destination: PathBuf,
+    destination: LandingZone,
     exclude: Vec<String>,
     completion_file_globs: Vec<glob::Pattern>,
 }
@@ -210,11 +211,6 @@ fn run_command(args: RunArgs) -> Result<(), AppError> {
 }
 
 fn validate_environment(config: &Config, skip_ssh_check: bool) -> Result<(), AppError> {
-    if !skip_ssh_check {
-        check_ssh_access(config)?;
-    } else {
-        debug!("SSH check skipped due to command line flag.")
-    }
     debug!(
         "Checking that source directory is readable: {}",
         config.source.display()
@@ -226,7 +222,29 @@ fn validate_environment(config: &Config, skip_ssh_check: bool) -> Result<(), App
             category_index + 1,
             cat.landing_zone.display()
         );
-        check_writable_directory(&cat.landing_zone, "category.landing_zone")?;
+        match &cat.landing_zone {
+            LandingZone::Local(path) => {
+                check_writable_directory(path, "category.landing_zone.path")?;
+            }
+            LandingZone::Remote {
+                user,
+                host,
+                port,
+                dir,
+            } => {
+                if skip_ssh_check {
+                    debug!(
+                        "SSH check skipped for remote landing zone {}@{}:{}:{} due to command line flag.",
+                        user,
+                        host,
+                        port,
+                        dir.to_string_lossy()
+                    );
+                } else {
+                    check_remote_writable_directory(user, host, *port, dir.as_os_str())?;
+                }
+            }
+        }
     }
     debug!(
         "Checking writability of flockdir: {}",
@@ -334,7 +352,7 @@ fn scan_directories(
                     "Match: Run directory {} match regex {} to landing zone {}",
                     dir_name,
                     &t.regex_string,
-                    &t.destination.display()
+                    t.destination.display()
                 );
                 t
             }
@@ -421,7 +439,8 @@ fn classify(
                     category_regex: cat.regex.to_string(),
                 });
             }
-            cat.landing_zone.join(format!("20{}", &dir_name[..2]))
+            cat.landing_zone
+                .with_subdir(&format!("20{}", &dir_name[..2]))
         } else {
             cat.landing_zone.clone()
         };
@@ -479,19 +498,16 @@ fn transfer_new_directories(
 
     for (entry, reason, target) in planned_transfers {
         let dir_name = entry.file_name();
-        let dir_name = dir_name.to_string_lossy();
+        let dir_name_display = dir_name.to_string_lossy();
 
-        let transferred_dir = target.destination.join(entry.file_name());
+        let transferred_dir = target.destination.join_run(&dir_name);
 
         if args.dry_run {
             print_dry_run(&entry.path(), &transferred_dir, &target.exclude);
             continue;
         }
 
-        fs::create_dir_all(&transferred_dir).map_err(|source| AppError::CreateTransferDir {
-            path: transferred_dir.clone(),
-            source,
-        })?;
+        ensure_destination_dir(&transferred_dir)?;
 
         let destination_display = transferred_dir.display();
         let rsync_result = rsync_directory(&entry.path(), &transferred_dir, &target.exclude);
@@ -506,7 +522,7 @@ fn transfer_new_directories(
             Ok(()) => {
                 succeeded += 1;
                 run_log.info(&format!(
-                    "Transferred {} {dir_name} -> {destination_display}",
+                    "Transferred {} {dir_name_display} -> {destination_display}",
                     transfer_reason_label(reason)
                 ));
                 if let Err(error) = touch_transfer_marker(&transferred_dir) {
@@ -518,7 +534,7 @@ fn transfer_new_directories(
             Err(error) => {
                 failed += 1;
                 run_log.error(&format!(
-                    "FAILED transfer {} {dir_name} -> {destination_display}: {error}",
+                    "FAILED transfer {} {dir_name_display} -> {destination_display}: {error}",
                     transfer_reason_label(reason)
                 ));
             }
@@ -563,39 +579,71 @@ fn transfer_reason_label(reason: TransferReason) -> &'static str {
 // file to see if the transfer to the landing zone was complete.
 const TRANSFER_MARKER_FILE_NAME: &str = "transfer_successful.txt";
 
-fn touch_transfer_marker(transferred_dir: &Path) -> Result<(), AppError> {
-    let marker = transferred_dir.join(TRANSFER_MARKER_FILE_NAME);
-    File::create(&marker).map_err(|source| AppError::WriteTransferMarker {
-        path: marker,
-        source,
-    })?;
-    Ok(())
+fn touch_transfer_marker(transferred_dir: &LandingZone) -> Result<(), AppError> {
+    match transferred_dir {
+        LandingZone::Local(path) => {
+            let marker = path.join(TRANSFER_MARKER_FILE_NAME);
+            File::create(&marker).map_err(|source| AppError::WriteTransferMarker {
+                path: marker.display().to_string(),
+                source,
+            })?;
+            Ok(())
+        }
+        LandingZone::Remote {
+            user,
+            host,
+            port,
+            dir,
+        } => {
+            let marker_path = remote_join_os(dir, OsStr::new(TRANSFER_MARKER_FILE_NAME));
+            let remote_script = remote_command_with_path("touch --", &marker_path);
+            let status = Command::new("ssh")
+                .arg("-o")
+                .arg("BatchMode=yes")
+                .arg("-p")
+                .arg(port.to_string())
+                .arg(format!("{user}@{host}"))
+                .arg("--")
+                .arg(remote_script)
+                .status()
+                .map_err(|source| AppError::SpawnSsh { source })?;
+            if status.success() {
+                Ok(())
+            } else {
+                Err(AppError::WriteRemoteTransferMarker {
+                    user: user.clone(),
+                    host: host.clone(),
+                    port: *port,
+                    path: marker_path.to_string_lossy().to_string(),
+                    exit_code: status.code(),
+                })
+            }
+        }
+    }
 }
 
-fn print_dry_run(source: &Path, destination: &Path, exclude: &[String]) {
+fn print_dry_run(source: &Path, destination: &LandingZone, exclude: &[String]) {
     println!("{} -> {}", source.display(), destination.display());
     for pattern in exclude {
         println!("  exclude: {pattern}");
     }
 }
 
-fn rsync_directory(source: &Path, destination: &Path, exclude: &[String]) -> Result<(), AppError> {
+fn rsync_directory(
+    source: &Path,
+    destination: &LandingZone,
+    exclude: &[String],
+) -> Result<(), AppError> {
     debug!(
         "Running rsync from {} to {} with exclude {}",
         source.display(),
         destination.display(),
         exclude.join(" ")
     );
+    let argv = build_rsync_argv(source, destination, exclude);
     let mut cmd = Command::new("rsync");
-    cmd.arg("-a");
-    for pattern in exclude {
-        cmd.arg("--exclude").arg(pattern);
-    }
-    let source_contents = path_with_trailing_separator(source);
-    let destination_dir = path_with_trailing_separator(destination);
+    cmd.args(&argv);
     let output = cmd
-        .arg(source_contents)
-        .arg(destination_dir)
         .output()
         .map_err(|source| AppError::SpawnRsync { source })?;
 
@@ -615,9 +663,40 @@ fn rsync_directory(source: &Path, destination: &Path, exclude: &[String]) -> Res
         );
         Err(AppError::RsyncFailed {
             source_path: source.to_path_buf(),
-            destination: destination.to_path_buf(),
+            destination: destination.display(),
             exit_code: output.status.code(),
         })
+    }
+}
+
+/// Build the argv passed to rsync (excluding argv[0]). Pure so it can be
+/// unit-tested for both local and remote destinations.
+fn build_rsync_argv(source: &Path, destination: &LandingZone, exclude: &[String]) -> Vec<OsString> {
+    let mut argv: Vec<OsString> = Vec::with_capacity(4 + 2 * exclude.len());
+    argv.push(OsString::from("-a"));
+    if let LandingZone::Remote { port, .. } = destination {
+        argv.push(OsString::from("-e"));
+        argv.push(OsString::from(format!("ssh -p {port} -o BatchMode=yes")));
+    }
+    for pattern in exclude {
+        argv.push(OsString::from("--exclude"));
+        argv.push(OsString::from(pattern));
+    }
+    argv.push(path_with_trailing_separator(source));
+    argv.push(rsync_destination_arg(destination));
+    argv
+}
+
+fn rsync_destination_arg(destination: &LandingZone) -> OsString {
+    match destination {
+        LandingZone::Local(path) => path_with_trailing_separator(path),
+        LandingZone::Remote {
+            user, host, dir, ..
+        } => {
+            let mut destination = OsString::from(format!("{user}@{host}:"));
+            destination.push(shell_quote_os(&remote_path_with_trailing_slash(dir)));
+            destination
+        }
     }
 }
 
@@ -630,6 +709,14 @@ fn path_with_trailing_separator(path: &Path) -> OsString {
     path_with_separator
 }
 
+fn remote_path_with_trailing_slash(path: &OsStr) -> OsString {
+    let mut path_with_separator = path.to_os_string();
+    if !path_with_separator.as_bytes().ends_with(b"/") {
+        path_with_separator.push("/");
+    }
+    path_with_separator
+}
+
 fn load_config(config_path: &Path) -> Result<Config, AppError> {
     Config::from_path(config_path).map_err(|source| AppError::LoadConfig {
         path: config_path.to_path_buf(),
@@ -637,30 +724,96 @@ fn load_config(config_path: &Path) -> Result<Config, AppError> {
     })
 }
 
-fn check_ssh_access(config: &Config) -> Result<(), AppError> {
+/// Single SSH probe per remote landing zone: verifies passwordless SSH access,
+/// that `dir` exists on the remote host, and that we can create and remove a
+/// file inside it.
+fn check_remote_writable_directory(
+    user: &str,
+    host: &str,
+    port: u16,
+    dir: &OsStr,
+) -> Result<(), AppError> {
     debug!(
-        "Checking SSH access. User name: {} port: {} domain name: {}",
-        config.server_user, config.server_port, config.server_host
+        "Checking remote landing zone writability: {}@{}:{}:{}",
+        user,
+        host,
+        port,
+        dir.to_string_lossy()
     );
-    let status = Command::new("ssh")
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after unix epoch")
+        .as_nanos();
+    let probe_name = format!(
+        ".sequencer-sync-write-probe-{}-{timestamp}",
+        std::process::id()
+    );
+    let probe_path = remote_join_os(dir, OsStr::new(&probe_name));
+    let remote_script = format!(
+        "set -e; test -d {dir} && touch {probe} && rm {probe}",
+        dir = shell_quote_os(dir).to_string_lossy(),
+        probe = shell_quote_os(&probe_path).to_string_lossy(),
+    );
+    let output = Command::new("ssh")
         .arg("-o")
         .arg("BatchMode=yes")
         .arg("-p")
-        .arg(config.server_port.to_string())
-        .arg(format!("{}@{}", config.server_user, config.server_host))
+        .arg(port.to_string())
+        .arg(format!("{user}@{host}"))
         .arg("--")
-        .arg("true")
-        .status()
+        .arg(&remote_script)
+        .output()
         .map_err(|source| AppError::SpawnSsh { source })?;
 
-    if status.success() {
+    if output.status.success() {
         Ok(())
     } else {
-        Err(AppError::SshAccessDenied {
-            user: config.server_user.clone(),
-            host: config.server_host.clone(),
-            port: config.server_port,
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        Err(AppError::RemoteWritabilityCheckFailed {
+            user: user.to_string(),
+            host: host.to_string(),
+            port,
+            dir: dir.to_string_lossy().to_string(),
+            exit_code: output.status.code(),
+            stderr,
         })
+    }
+}
+
+/// Ensure the destination directory already exists for both local and remote
+/// landing zones. Transfers intentionally do not create the run destination.
+fn ensure_destination_dir(destination: &LandingZone) -> Result<(), AppError> {
+    match destination {
+        LandingZone::Local(path) => ensure_directory_exists(path, "transfer destination"),
+        LandingZone::Remote {
+            user,
+            host,
+            port,
+            dir,
+        } => {
+            let remote_script = remote_command_with_path("test -d", dir);
+            let status = Command::new("ssh")
+                .arg("-o")
+                .arg("BatchMode=yes")
+                .arg("-p")
+                .arg(port.to_string())
+                .arg(format!("{user}@{host}"))
+                .arg("--")
+                .arg(remote_script)
+                .status()
+                .map_err(|source| AppError::SpawnSsh { source })?;
+            if status.success() {
+                Ok(())
+            } else {
+                Err(AppError::RemoteTransferDirMissing {
+                    user: user.clone(),
+                    host: host.clone(),
+                    port: *port,
+                    dir: dir.to_string_lossy().to_string(),
+                    exit_code: status.code(),
+                })
+            }
+        }
     }
 }
 
@@ -802,6 +955,42 @@ fn shell_quote(value: &str) -> String {
     format!("'{escaped}'")
 }
 
+fn shell_quote_os(value: &OsStr) -> OsString {
+    let mut quoted = Vec::with_capacity(value.as_bytes().len() + 2);
+    quoted.push(b'\'');
+    for byte in value.as_bytes() {
+        if *byte == b'\'' {
+            quoted.extend_from_slice(br#"'\''"#);
+        } else {
+            quoted.push(*byte);
+        }
+    }
+    quoted.push(b'\'');
+    OsString::from_vec(quoted)
+}
+
+fn remote_join_os(base: &OsStr, child: &OsStr) -> OsString {
+    let mut joined = trim_remote_trailing_slashes(base);
+    joined.push("/");
+    joined.push(child);
+    joined
+}
+
+fn trim_remote_trailing_slashes(path: &OsStr) -> OsString {
+    let mut bytes = path.as_bytes().to_vec();
+    while bytes.ends_with(b"/") && bytes.len() > 1 {
+        bytes.pop();
+    }
+    OsString::from_vec(bytes)
+}
+
+fn remote_command_with_path(command_prefix: &str, path: &OsStr) -> OsString {
+    let mut command = OsString::from(command_prefix);
+    command.push(" ");
+    command.push(shell_quote_os(path));
+    command
+}
+
 struct RunLock {
     file: File,
 }
@@ -825,11 +1014,37 @@ enum AppError {
         #[source]
         source: std::io::Error,
     },
-    #[error("ssh access check failed for {user}@{host}:{port}")]
-    SshAccessDenied {
+    #[error(
+        "remote landing zone check failed for {user}@{host}:{port}:{dir}{}{}",
+        exit_code.map(|c| format!(" (exit code {c})")).unwrap_or_default(),
+        if stderr.is_empty() { String::new() } else { format!(": {stderr}") }
+    )]
+    RemoteWritabilityCheckFailed {
         user: String,
         host: String,
         port: u16,
+        dir: String,
+        exit_code: Option<i32>,
+        stderr: String,
+    },
+    #[error("remote transfer directory {dir} does not exist on {user}@{host}:{port}: exit code {}", exit_code.map_or("unknown".to_string(), |c| c.to_string()))]
+    RemoteTransferDirMissing {
+        user: String,
+        host: String,
+        port: u16,
+        dir: String,
+        exit_code: Option<i32>,
+    },
+    #[error(
+        "failed to write remote transfer marker {path} on {user}@{host}:{port}: exit code {}",
+        exit_code.map_or("unknown".to_string(), |c| c.to_string())
+    )]
+    WriteRemoteTransferMarker {
+        user: String,
+        host: String,
+        port: u16,
+        path: String,
+        exit_code: Option<i32>,
     },
     #[error("failed to access metadata for `{field}` directory {}: {source}", path.display())]
     ReadMetadata {
@@ -872,12 +1087,6 @@ enum AppError {
         #[source]
         source: std::io::Error,
     },
-    #[error("failed to create transfer directory {}: {source}", path.display())]
-    CreateTransferDir {
-        path: PathBuf,
-        #[source]
-        source: std::io::Error,
-    },
     #[error(transparent)]
     TransferLog(#[from] transfer_log::TransferLogError),
     #[error("failed to open run lock file {}: {source}", path.display())]
@@ -899,10 +1108,10 @@ enum AppError {
         #[source]
         source: std::io::Error,
     },
-    #[error("rsync failed copying {} to {}: exit code {}", source_path.display(), destination.display(), exit_code.map_or("unknown".to_string(), |c| c.to_string()))]
+    #[error("rsync failed copying {} to {destination}: exit code {}", source_path.display(), exit_code.map_or("unknown".to_string(), |c| c.to_string()))]
     RsyncFailed {
         source_path: PathBuf,
-        destination: PathBuf,
+        destination: String,
         exit_code: Option<i32>,
     },
     #[error("failed to scan for completion file in {}: {source}", run_dir.display())]
@@ -911,9 +1120,9 @@ enum AppError {
         #[source]
         source: glob::GlobError,
     },
-    #[error("failed to write transfer marker {}: {source}", path.display())]
+    #[error("failed to write transfer marker {path}: {source}")]
     WriteTransferMarker {
-        path: PathBuf,
+        path: String,
         #[source]
         source: std::io::Error,
     },
@@ -944,8 +1153,14 @@ mod tests {
     use log::{LevelFilter, Log, Metadata, Record};
     use regex::Regex;
 
-    use super::{classify, cron_file_path, lock_file_path, render_cron_file, run_is_complete};
-    use crate::config::Category;
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+
+    use super::{
+        build_rsync_argv, classify, cron_file_path, lock_file_path, render_cron_file,
+        run_is_complete, shell_quote_os,
+    };
+    use crate::config::{Category, LandingZone};
 
     struct TestLogger {
         messages: Mutex<Vec<String>>,
@@ -1068,7 +1283,7 @@ mod tests {
     fn classify_preserves_matching_regex_string() {
         let categories = vec![Category {
             regex: Regex::new(r"^ONT_WGS_").expect("regex should parse"),
-            landing_zone: PathBuf::from("/tmp/landing"),
+            landing_zone: LandingZone::Local(PathBuf::from("/tmp/landing")),
             exclude: Vec::new(),
             completion_file_globs: vec![Pattern::new("report*.html").expect("glob should parse")],
             year_subdirectory: false,
@@ -1079,5 +1294,92 @@ mod tests {
             .expect("directory should match category");
 
         assert_eq!(target.regex_string, "^ONT_WGS_");
+    }
+
+    #[test]
+    fn build_rsync_argv_local() {
+        let argv = build_rsync_argv(
+            Path::new("/src/run1"),
+            &LandingZone::Local(PathBuf::from("/landing/run1")),
+            &["pod5*".to_string(), "/Data".to_string()],
+        );
+
+        let expected: Vec<OsString> = vec![
+            OsString::from("-a"),
+            OsString::from("--exclude"),
+            OsString::from("pod5*"),
+            OsString::from("--exclude"),
+            OsString::from("/Data"),
+            OsString::from("/src/run1/"),
+            OsString::from("/landing/run1/"),
+        ];
+        assert_eq!(argv, expected);
+    }
+
+    #[test]
+    fn build_rsync_argv_remote() {
+        let argv = build_rsync_argv(
+            Path::new("/src/run1"),
+            &LandingZone::Remote {
+                user: "syncer".to_string(),
+                host: "remote.example.org".to_string(),
+                port: 2222,
+                dir: OsString::from("/data/landing/run1"),
+            },
+            &["pod5*".to_string()],
+        );
+
+        let expected: Vec<OsString> = vec![
+            OsString::from("-a"),
+            OsString::from("-e"),
+            OsString::from("ssh -p 2222 -o BatchMode=yes"),
+            OsString::from("--exclude"),
+            OsString::from("pod5*"),
+            OsString::from("/src/run1/"),
+            OsString::from("syncer@remote.example.org:'/data/landing/run1/'"),
+        ];
+        assert_eq!(argv, expected);
+    }
+
+    #[test]
+    fn build_rsync_argv_remote_strips_trailing_slash_in_dir() {
+        let argv = build_rsync_argv(
+            Path::new("/src/run1"),
+            &LandingZone::Remote {
+                user: "u".to_string(),
+                host: "h".to_string(),
+                port: 22,
+                dir: OsString::from("/data/landing/"),
+            },
+            &[],
+        );
+
+        // The destination must end with exactly one trailing slash.
+        let last = argv.last().unwrap().to_string_lossy().to_string();
+        assert_eq!(last, "u@h:'/data/landing/'");
+    }
+
+    #[test]
+    fn build_rsync_argv_remote_quotes_spaces_and_single_quotes() {
+        let argv = build_rsync_argv(
+            Path::new("/src/run1"),
+            &LandingZone::Remote {
+                user: "u".to_string(),
+                host: "h".to_string(),
+                port: 22,
+                dir: OsString::from("/data/landing zone/ONT_'run"),
+            },
+            &[],
+        );
+
+        let last = argv.last().unwrap().to_string_lossy().to_string();
+        assert_eq!(last, "u@h:'/data/landing zone/ONT_'\\''run/'");
+    }
+
+    #[test]
+    fn shell_quote_os_preserves_non_utf8_bytes() {
+        let value = OsString::from_vec(b"/data/ONT_\xff_run".to_vec());
+        let quoted = shell_quote_os(&value);
+        assert_eq!(quoted.into_vec(), b"'/data/ONT_\xff_run'".to_vec());
     }
 }

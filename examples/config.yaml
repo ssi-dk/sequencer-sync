@@ -7,28 +7,31 @@ lock_file_name: "sequencer-sync.lock"
 # Writeable directory for log files (transfer log, run log, cron file)
 logdir: "/var/lib/sequencer/log"
 
-# Check password-free access to ssh -p <port> <server_user>@<server_host>
-server_user: "sequencer-sync"
-server_port: 22
-server_host: "sequencer.example.org"
-
 # Search for subdirectories under the source for new sequencing runs.
 # Each run is assumed to be one directory.
 source: "/data/nanopore"
 
-# We might want to distinguish e.g. core facility run (copy only fastq)
+# We might want to distinguish e.g. core facility runs (copy only fastq)
 # versus project runs (copy also raw data).
 # These are distinct categories. Each sequencing run (directory) is
 # classified as a category based on whether its directory name matches
 # the regex. Categories are checked top from bottom; first match classifies.
+#
+# Each category's `landing_zone` is either `kind: local` (a directory on
+# this machine, copied to with rsync) or `kind: remote` (an SSH-reachable
+# directory on another host, copied to with rsync over SSH). For remote
+# landing zones, passwordless SSH (e.g. via an authorized public key) must
+# be configured for `<user>@<host>` on `<port>` before `setup` will succeed.
 
 category:
   - # If directory matches this regex, the run is classified
     # as this category
     regex: "^ONT_WGS_"
 
-    # Copy to this directory
-    landing_zone: "/var/lib/sequencer/landing-zone-core"
+    # Local landing zone on this machine.
+    landing_zone:
+      kind: local
+      path: "/var/lib/sequencer/landing-zone-core"
 
     # Passed to rsync command with --exclude
     exclude:
@@ -49,7 +52,17 @@ category:
     year_subdirectory: false
 
   - regex: "^ONT_"
-    landing_zone: "/var/lib/sequencer/landing-zone-other"
+
+    # Remote landing zone reachable over SSH. The combination of user, host
+    # and port must allow passwordless ssh from this machine; `dir` is an
+    # absolute POSIX path on the remote host and must be writable by `user`.
+    landing_zone:
+      kind: remote
+      user: "sequencer-sync"
+      host: "sequencer.example.org"
+      port: 22
+      dir: "/var/lib/sequencer/landing-zone-other"
+
     exclude:
       - "*_skip"
       - "pod5*"
