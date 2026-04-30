@@ -6,23 +6,46 @@ use regex::Regex;
 use serde::Deserialize;
 use thiserror::Error;
 
+#[derive(Clone, Debug)]
+struct CanonicalizedPath(PathBuf);
+
+impl CanonicalizedPath {
+    fn from_absolute(path: &Path, field: &'static str) -> Result<Self, ConfigError> {
+        if !path.is_absolute() {
+            return Err(ConfigError::PathNotAbsolute {
+                field,
+                path: path.to_path_buf(),
+            })
+        }
+        Self::new(path, field)
+    }
+
+    fn new(path: &Path, field: &'static str) -> Result<Self, ConfigError> {
+        let pathbuf = fs::canonicalize(&path).map_err(|source| ConfigError::CanonicalizePath {
+            field,
+            path: path.to_path_buf(),
+            source,
+        })?;
+        Ok(CanonicalizedPath(pathbuf))
+    }
+}
+
 #[derive(Debug)]
 pub struct Config {
-    /// Canonicalized absolute path. Directory for the file lock.
-    pub flockdir: PathBuf,
+    /// Directory for the file lock.
+    pub flockdir: CanonicalizedPath,
     /// Base name of the lock file inside `flockdir`.
     pub lock_file_name: String,
-    /// Canonicalized absolute path. Directory for log files (transfer log, run
-    /// log, cron file).
-    pub logdir: PathBuf,
+    /// Directory for log files (transfer log, runlog, cron file).
+    pub logdir: CanonicalizedPath,
 
     // You must have ssh access to this server with this port, user name.
     pub server_user: String,
     pub server_port: u16,
     pub server_host: String,
+    pub source: CanonicalizedPath,
 
-    /// Canonicalized absolute path.
-    pub source: PathBuf,
+    /// Always at least one Category
     pub categories: Vec<Category>,
 }
 
@@ -30,7 +53,7 @@ pub struct Config {
 pub struct Category {
     pub regex: Regex,
     /// Canonicalized absolute path.
-    pub landing_zone: PathBuf,
+    pub landing_zone: CanonicalizedPath,
     pub exclude: Vec<String>,
     pub completion_file_globs: Vec<Pattern>,
     /// When true, place runs into a year-based subdirectory under the landing
@@ -117,6 +140,11 @@ pub enum ConfigError {
     },
 }
 
+struct NamedPath<'path> {
+    name: &'static str,
+    path: &'path Path,
+}
+
 impl Config {
     pub fn from_path(path: &Path) -> Result<Self, ConfigError> {
         let contents = fs::read_to_string(path).map_err(|source| ConfigError::Read {
@@ -146,31 +174,37 @@ impl Config {
             cat.landing_zone = canonicalize_field("category.landing_zone", &cat.landing_zone)?;
         }
 
-        let mut paths: Vec<(&'static str, &Path)> = vec![
-            ("source", &self.source),
-            ("flockdir", &self.flockdir),
-            ("logdir", &self.logdir),
+        let mut named_paths: Vec<NamedPath> = vec![
+            NamedPath {
+                name: "source",
+                path: &self.source,
+            },
+            NamedPath {
+                name: "flockdir",
+                path: &self.flockdir,
+            },
+            NamedPath {
+                name: "logdir",
+                path: &self.logdir,
+            },
         ];
         for cat in &self.categories {
-            paths.push(("category.landing_zone", &cat.landing_zone));
+            named_paths.push(NamedPath {
+                name: "category.landing_zone",
+                path: &cat.landing_zone,
+            });
         }
-        validate_all_paths_distinct(&paths)?;
+        validate_all_paths_distinct(&named_paths)?;
 
         Ok(())
     }
 }
 
-fn canonicalize_field(field: &'static str, path: &Path) -> Result<PathBuf, ConfigError> {
-    fs::canonicalize(path).map_err(|source| ConfigError::CanonicalizePath {
-        field,
-        path: path.to_path_buf(),
-        source,
-    })
-}
-
 impl UnvalidatedConfig {
     fn validate(self) -> Result<Config, ConfigError> {
         validate_absolute_path("flockdir", &self.flockdir)?;
+        let flockdir = CanonicalizedPath::new()
+
         validate_base_name("lock_file_name", &self.lock_file_name)?;
         validate_absolute_path("logdir", &self.logdir)?;
         validate_non_empty("server_user", &self.server_user)?;
@@ -275,14 +309,14 @@ fn validate_globs(field: &'static str, patterns: &[String]) -> Result<Vec<Patter
         .collect()
 }
 
-fn validate_all_paths_distinct(paths: &[(&'static str, &Path)]) -> Result<(), ConfigError> {
+fn validate_all_paths_distinct(paths: &[NamedPath]) -> Result<(), ConfigError> {
     for i in 0..paths.len() {
         for j in (i + 1)..paths.len() {
-            if paths[i].1 == paths[j].1 {
+            if paths[i].path == paths[j].path {
                 return Err(ConfigError::DuplicatePath {
-                    first: paths[i].0,
-                    second: paths[j].0,
-                    path: paths[i].1.to_path_buf(),
+                    first: paths[i].name,
+                    second: paths[j].name,
+                    path: paths[i].path.to_owned(),
                 });
             }
         }
