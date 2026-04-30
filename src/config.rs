@@ -123,17 +123,15 @@ impl Config {
             path: path.to_path_buf(),
             source,
         })?;
-
-        let mut config = Self::from_yaml_str(&contents)?;
-        config.canonicalize_paths()?;
-        Ok(config)
+        Self::from_yaml_str(&contents)
     }
 
-    // Note: This doesn't canonicalize paths!
     fn from_yaml_str(contents: &str) -> Result<Self, ConfigError> {
         let config: UnvalidatedConfig =
             serde_yaml::from_str(contents).map_err(ConfigError::Parse)?;
-        config.validate()
+        let mut config = config.validate()?;
+        config.canonicalize_paths()?;
+        Ok(config)
     }
 
     /// Canonicalize all path fields via the filesystem (resolving symlinks,
@@ -294,9 +292,10 @@ fn validate_all_paths_distinct(paths: &[(&'static str, &Path)]) -> Result<(), Co
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
     use std::path::PathBuf;
 
-    use super::{Config, ConfigError};
+    use super::{Config, ConfigError, UnvalidatedConfig};
 
     const EXAMPLE_CONFIG: &str = include_str!("../examples/config.yaml");
     const NEXTSEQ_EXAMPLE: &str = r#"
@@ -315,9 +314,115 @@ category:
       - "PrimaryAnalysisMetrics/PrimaryAnalysisMetrics.csv"
 "#;
 
+    struct TestFixture {
+        root: PathBuf,
+    }
+
+    impl TestFixture {
+        fn new(name: &str) -> Self {
+            let root = std::env::temp_dir().join(format!(
+                "sequencer-sync-config-{name}-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            fs::create_dir_all(&root).unwrap();
+            Self { root }
+        }
+
+        fn path(&self, relative: &str) -> PathBuf {
+            self.root.join(relative)
+        }
+
+        fn mkdir(&self, relative: &str) -> PathBuf {
+            let path = self.path(relative);
+            fs::create_dir_all(&path).unwrap();
+            path
+        }
+
+        fn canonical(&self, relative: &str) -> PathBuf {
+            fs::canonicalize(self.path(relative)).unwrap()
+        }
+
+        fn write_config(&self, contents: &str) -> PathBuf {
+            let path = self.path("config.yaml");
+            fs::write(&path, contents).unwrap();
+            path
+        }
+
+        fn create_common_dirs(&self) {
+            self.mkdir("flockdir");
+            self.mkdir("logdir");
+            self.mkdir("source");
+            self.mkdir("landing-core");
+            self.mkdir("landing-other");
+        }
+
+        fn nanopore_config(&self) -> String {
+            format!(
+                r#"flockdir: "{flockdir}"
+lock_file_name: "sequencer-sync.lock"
+logdir: "{logdir}"
+server_user: "sequencer-sync"
+server_port: 22
+server_host: "sequencer.example.org"
+source: "{source}"
+
+category:
+  - regex: "^ONT_WGS_"
+    landing_zone: "{landing_core}"
+    completion_file_globs:
+      - "report*.html"
+
+  - regex: "^ONT_"
+    landing_zone: "{landing_other}"
+    completion_file_globs:
+      - "report*.html"
+"#,
+                flockdir = self.path("flockdir").display(),
+                logdir = self.path("logdir").display(),
+                source = self.path("source").display(),
+                landing_core = self.path("landing-core").display(),
+                landing_other = self.path("landing-other").display(),
+            )
+        }
+
+        fn nextseq_config(&self) -> String {
+            format!(
+                r#"flockdir: "{flockdir}"
+lock_file_name: "sequencer-sync.lock"
+logdir: "{logdir}"
+server_user: "sequencer-sync"
+server_port: 22
+server_host: "sequencer.example.org"
+source: "{source}"
+
+category:
+  - regex: "^\\d{{6}}_"
+    landing_zone: "{landing}"
+    completion_file_globs:
+      - "PrimaryAnalysisMetrics/PrimaryAnalysisMetrics.csv"
+"#,
+                flockdir = self.path("flockdir").display(),
+                logdir = self.path("logdir").display(),
+                source = self.path("source").display(),
+                landing = self.path("landing-core").display(),
+            )
+        }
+    }
+
+    impl Drop for TestFixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
     #[test]
     fn parses_example_config() {
-        let config = Config::from_yaml_str(EXAMPLE_CONFIG).expect("nanopore config should parse");
+        let config: UnvalidatedConfig =
+            serde_yaml::from_str(EXAMPLE_CONFIG).expect("nanopore config should parse as YAML");
 
         assert_eq!(config.flockdir, PathBuf::from("/var/lib/sequencer/flock"));
         assert_eq!(config.lock_file_name, "sequencer-sync.lock");
@@ -327,31 +432,47 @@ category:
         assert_eq!(config.server_host, "sequencer.example.org");
         assert_eq!(config.source, PathBuf::from("/data/nanopore"));
 
-        assert_eq!(config.categories.len(), 2);
-        assert!(config.categories[0].regex.is_match("ONT_WGS_run1"));
-        assert!(!config.categories[0].regex.is_match("ONT_raw_run2"));
+        assert_eq!(config.category.len(), 2);
+        assert_eq!(config.category[0].regex, "^ONT_WGS_");
         assert_eq!(
-            config.categories[0].landing_zone,
+            config.category[0].landing_zone,
             PathBuf::from("/var/lib/sequencer/landing-zone-core")
         );
-        assert!(config.categories[1].regex.is_match("ONT_raw_run2"));
         assert_eq!(
-            config.categories[1].landing_zone,
+            config.category[1].landing_zone,
             PathBuf::from("/var/lib/sequencer/landing-zone-other")
         );
     }
 
     #[test]
     fn parses_nextseq_example_config() {
-        let config = Config::from_yaml_str(NEXTSEQ_EXAMPLE).expect("nextseq config should parse");
+        let fixture = TestFixture::new("nextseq");
+        fixture.create_common_dirs();
+        let config_path = fixture.write_config(&fixture.nextseq_config());
+        let config = Config::from_path(&config_path).expect("nextseq config should parse");
 
-        assert_eq!(config.flockdir, PathBuf::from("/var/lib/sequencer/flock"));
-        assert_eq!(config.logdir, PathBuf::from("/var/lib/sequencer/log"));
-        assert_eq!(config.source, PathBuf::from("/data/nextseq"));
+        assert_eq!(config.flockdir, fixture.canonical("flockdir"));
+        assert_eq!(config.logdir, fixture.canonical("logdir"));
+        assert_eq!(config.source, fixture.canonical("source"));
         assert_eq!(config.categories.len(), 1);
         assert!(config.categories[0].regex.is_match("240101_"));
         assert_eq!(
             config.categories[0].landing_zone,
+            fixture.canonical("landing-core")
+        );
+    }
+
+    #[test]
+    fn parses_nextseq_example_yaml() {
+        let config: UnvalidatedConfig =
+            serde_yaml::from_str(NEXTSEQ_EXAMPLE).expect("nextseq config should parse as YAML");
+
+        assert_eq!(config.flockdir, PathBuf::from("/var/lib/sequencer/flock"));
+        assert_eq!(config.logdir, PathBuf::from("/var/lib/sequencer/log"));
+        assert_eq!(config.source, PathBuf::from("/data/nextseq"));
+        assert_eq!(config.category.len(), 1);
+        assert_eq!(
+            config.category[0].landing_zone,
             PathBuf::from("/var/lib/sequencer/landing-zone")
         );
     }
@@ -435,29 +556,10 @@ category:
 
     #[test]
     fn classify_matches_first_regex() {
-        let config = Config::from_yaml_str(
-            r#"
-flockdir: "/var/lib/sequencer/flock"
-lock_file_name: "sequencer-sync.lock"
-logdir: "/var/lib/sequencer/log"
-server_user: "sequencer-sync"
-server_port: 22
-server_host: "sequencer.example.org"
-source: "/data/nanopore"
-
-category:
-  - regex: "^ONT_WGS_"
-    landing_zone: "/landing/core"
-    completion_file_globs:
-      - "report*.html"
-
-  - regex: "^ONT_"
-    landing_zone: "/landing/other"
-    completion_file_globs:
-      - "report*.html"
-"#,
-        )
-        .unwrap();
+        let fixture = TestFixture::new("classify-first-regex");
+        fixture.create_common_dirs();
+        let config_path = fixture.write_config(&fixture.nanopore_config());
+        let config = Config::from_path(&config_path).unwrap();
 
         // ONT_WGS_ matches first category
         let matched = config
@@ -466,7 +568,7 @@ category:
             .find(|c| c.regex.is_match("ONT_WGS_run1"));
         assert_eq!(
             matched.unwrap().landing_zone,
-            PathBuf::from("/landing/core")
+            fixture.canonical("landing-core")
         );
 
         // ONT_raw_ matches second category (first doesn't match)
@@ -476,35 +578,16 @@ category:
             .find(|c| c.regex.is_match("ONT_raw_run2"));
         assert_eq!(
             matched.unwrap().landing_zone,
-            PathBuf::from("/landing/other")
+            fixture.canonical("landing-other")
         );
     }
 
     #[test]
     fn classify_first_match_wins() {
-        let config = Config::from_yaml_str(
-            r#"
-flockdir: "/var/lib/sequencer/flock"
-lock_file_name: "sequencer-sync.lock"
-logdir: "/var/lib/sequencer/log"
-server_user: "sequencer-sync"
-server_port: 22
-server_host: "sequencer.example.org"
-source: "/data/nanopore"
-
-category:
-  - regex: "^ONT_WGS_"
-    landing_zone: "/landing/core"
-    completion_file_globs:
-      - "report*.html"
-
-  - regex: "^ONT_"
-    landing_zone: "/landing/other"
-    completion_file_globs:
-      - "report*.html"
-"#,
-        )
-        .unwrap();
+        let fixture = TestFixture::new("classify-first-match-wins");
+        fixture.create_common_dirs();
+        let config_path = fixture.write_config(&fixture.nanopore_config());
+        let config = Config::from_path(&config_path).unwrap();
 
         // ONT_WGS_run1 matches both regexes but first-match wins
         let matched = config
@@ -512,34 +595,15 @@ category:
             .iter()
             .find(|c| c.regex.is_match("ONT_WGS_run1"))
             .unwrap();
-        assert_eq!(matched.landing_zone, PathBuf::from("/landing/core"));
+        assert_eq!(matched.landing_zone, fixture.canonical("landing-core"));
     }
 
     #[test]
     fn classify_returns_none_for_unmatched() {
-        let config = Config::from_yaml_str(
-            r#"
-flockdir: "/var/lib/sequencer/flock"
-lock_file_name: "sequencer-sync.lock"
-logdir: "/var/lib/sequencer/log"
-server_user: "sequencer-sync"
-server_port: 22
-server_host: "sequencer.example.org"
-source: "/data/nanopore"
-
-category:
-  - regex: "^ONT_WGS_"
-    landing_zone: "/landing/core"
-    completion_file_globs:
-      - "report*.html"
-
-  - regex: "^ONT_"
-    landing_zone: "/landing/other"
-    completion_file_globs:
-      - "report*.html"
-"#,
-        )
-        .unwrap();
+        let fixture = TestFixture::new("classify-unmatched");
+        fixture.create_common_dirs();
+        let config_path = fixture.write_config(&fixture.nanopore_config());
+        let config = Config::from_path(&config_path).unwrap();
 
         let matched = config
             .categories
