@@ -133,7 +133,8 @@ fn setup(args: SetupArgs) -> Result<(), AppError> {
 // A TransferTarget stores information about source and destination once we have
 // classified a run as e.g. project/operations/something else.
 struct TransferTarget {
-    regex_string: String,
+    // Zero-based index of which category
+    category_index: usize,
     destination: PathBuf,
     exclude: Vec<String>,
     completion_file_globs: Vec<glob::Pattern>,
@@ -286,8 +287,8 @@ fn scan_directories(
 
     if log::max_level() >= log::LevelFilter::Debug {
         debug!("Checking for following regex");
-        for cat in categories {
-            debug!("\t{}", cat.regex.as_str());
+        for (cat_index, cat) in categories.iter().enumerate() {
+            debug!("\t{}: {}", cat_index + 1, cat.regex.as_str());
         }
     }
 
@@ -307,11 +308,11 @@ fn scan_directories(
             continue;
         }
         let dir_name = entry.file_name();
+
+        debug!("Classifying {}", entry.path().display());
+
         let Some(dir_name) = dir_name.to_str() else {
-            warn!(
-                "Skipping directory with non-UTF-8 name because glob matching requires UTF-8: {}",
-                entry.path().display()
-            );
+            warn!("\tSkipping directory with non-UTF-8 name; glob matching requires UTF-8");
             continue;
         };
 
@@ -321,14 +322,11 @@ fn scan_directories(
         let action = transfer_log.transfer_action(&key, retry_failed);
         let reason: TransferReason = match action {
             TransferAction::Skip(SkipReason::AlreadyTranferred) => {
-                debug!("Skipping already-transferred directory: {}", key.display());
+                debug!("\tDirectory already transferred; skipping");
                 continue;
             }
             TransferAction::Skip(SkipReason::FailedNoRetry) => {
-                debug!(
-                    "Skipping directory where transfer previously failed (--retry-failed not set): {}",
-                    key.display()
-                );
+                debug!("\tTransfer previously failed; skipping (--retry-failed not set)");
                 continue;
             }
             TransferAction::Tranfer(reason) => reason,
@@ -337,15 +335,14 @@ fn scan_directories(
         let target = match classify(&entry.path(), categories)? {
             Some(t) => {
                 debug!(
-                    "Match: Run directory {} match regex {} to landing zone {}",
-                    dir_name,
-                    &t.regex_string,
+                    "\tClassified: Category {} with landing zone {}",
+                    &t.category_index + 1,
                     &t.destination.display()
                 );
                 t
             }
             None => {
-                debug!("No category match: {}", dir_name);
+                debug!("\tNo classification");
                 continue;
             }
         };
@@ -353,16 +350,10 @@ fn scan_directories(
         let is_complete = run_is_complete(&entry.path(), &target.completion_file_globs)?;
         if !is_complete {
             if transfer_incomplete {
-                debug!(
-                    "Transferring incomplete run due to --transfer-incomplete flag: {}",
-                    &entry.path().display()
-                );
+                debug!("\tTransferring incomplete run due to --transfer-incomplete flag");
             } else {
                 summary.incomplete_skipped += 1;
-                debug!(
-                    "Completion file(s) not found; skipping {}",
-                    &entry.path().display()
-                );
+                debug!("\tCompletion file(s) not found; skipping");
                 incomplete_messages.push(format!("Skipped incomplete directory {dir_name}"));
                 continue;
             }
@@ -421,26 +412,28 @@ fn classify(
     let dir_name = run_dir
         .file_name()
         .and_then(|name| name.to_str())
-        .expect("scan_directories should skip non-UTF-8 run directory names");
+        .expect("Unreachable: scan_directories should skip non-UTF-8 run directory names");
 
-    for cat in categories {
+    for (category_index, cat) in categories.iter().enumerate() {
         if !cat.regex.is_match(dir_name) {
             continue;
+        } else {
+            debug!("\tRegex match to category {}", category_index + 1,)
         }
 
         if let Some(classification_glob) = &cat.classification_glob {
+            let full_path = run_dir.join(classification_glob.as_str());
+            let class_glob_display = full_path.display();
             if !glob_has_match(run_dir, classification_glob).map_err(|source| {
                 AppError::ClassificationFileScan {
                     run_dir: run_dir.to_path_buf(),
                     source,
                 }
             })? {
-                debug!(
-                    "Classification glob did not match for {}: {}",
-                    run_dir.display(),
-                    run_dir.join(classification_glob.as_str()).display()
-                );
+                debug!("\tClassification glob did not match: {class_glob_display}",);
                 continue;
+            } else {
+                debug!("\tMatched classification glob: {class_glob_display}")
             }
         }
 
@@ -458,7 +451,7 @@ fn classify(
             cat.landing_zone.clone()
         };
         return Ok(Some(TransferTarget {
-            regex_string: cat.regex.as_str().to_owned(),
+            category_index,
             destination,
             exclude: cat.exclude.clone(),
             completion_file_globs: cat.completion_file_globs.clone(),
@@ -1143,18 +1136,6 @@ mod tests {
         }));
 
         cleanup_temp_dir(&tempdir);
-    }
-
-    #[test]
-    fn classify_preserves_matching_regex_string() {
-        let run_dir = Path::new("/tmp/ONT_WGS_run1");
-        let categories = vec![test_category(r"^ONT_WGS_", None, "/tmp/landing")];
-
-        let target = classify(run_dir, &categories)
-            .expect("classification should succeed")
-            .expect("directory should match category");
-
-        assert_eq!(target.regex_string, "^ONT_WGS_");
     }
 
     #[test]
