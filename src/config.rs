@@ -29,6 +29,7 @@ pub struct Config {
 #[derive(Debug)]
 pub struct Category {
     pub regex: Regex,
+    pub classification_glob: Option<Pattern>,
     /// Canonicalized absolute path.
     pub landing_zone: PathBuf,
     pub exclude: Vec<String>,
@@ -55,6 +56,7 @@ struct UnvalidatedConfig {
 #[derive(Debug, Deserialize)]
 struct UnvalidatedCategory {
     regex: String,
+    classification_glob: Option<String>,
     landing_zone: PathBuf,
     #[serde(default)]
     exclude: Vec<String>,
@@ -217,6 +219,12 @@ impl UnvalidatedCategory {
             source,
         })?;
 
+        let classification_glob = self
+            .classification_glob
+            .as_deref()
+            .map(|pattern| validate_glob("category.classification_glob", pattern))
+            .transpose()?;
+
         let completion_file_globs = validate_globs(
             "category.completion_file_globs",
             &self.completion_file_globs,
@@ -224,6 +232,7 @@ impl UnvalidatedCategory {
 
         Ok(Category {
             regex,
+            classification_glob,
             landing_zone: self.landing_zone,
             exclude: self.exclude,
             completion_file_globs,
@@ -329,7 +338,14 @@ category:
 
         assert_eq!(config.categories.len(), 2);
         assert!(config.categories[0].regex.is_match("ONT_WGS_run1"));
-        assert!(!config.categories[0].regex.is_match("ONT_raw_run2"));
+        assert!(config.categories[0].regex.is_match("ONT_raw_run2"));
+        assert!(
+            config.categories[0]
+                .classification_glob
+                .as_ref()
+                .expect("example core category should have classification glob")
+                .matches("metadata/core_facility.txt")
+        );
         assert_eq!(
             config.categories[0].landing_zone,
             PathBuf::from("/var/lib/sequencer/landing-zone-core")
@@ -350,6 +366,7 @@ category:
         assert_eq!(config.source, PathBuf::from("/data/nextseq"));
         assert_eq!(config.categories.len(), 1);
         assert!(config.categories[0].regex.is_match("240101_"));
+        assert!(config.categories[0].classification_glob.is_none());
         assert_eq!(
             config.categories[0].landing_zone,
             PathBuf::from("/var/lib/sequencer/landing-zone")
@@ -572,6 +589,67 @@ category:
             error,
             ConfigError::EmptyGlobList {
                 field: "category.completion_file_globs"
+            }
+        ));
+    }
+
+    #[test]
+    fn parses_classification_glob() {
+        let config = Config::from_yaml_str(
+            r#"
+flockdir: "/var/lib/sequencer/flock"
+lock_file_name: "sequencer-sync.lock"
+logdir: "/var/lib/sequencer/log"
+server_user: "sequencer-sync"
+server_port: 22
+server_host: "sequencer.example.org"
+source: "/data/nextseq"
+
+category:
+  - regex: "^\\d{6}_"
+    classification_glob: "Analysis/*/SampleSheet.csv"
+    landing_zone: "/var/lib/sequencer/landing-zone"
+    completion_file_globs:
+      - "PrimaryAnalysisMetrics/PrimaryAnalysisMetrics.csv"
+"#,
+        )
+        .expect("classification_glob should parse");
+
+        let classification_glob = config.categories[0]
+            .classification_glob
+            .as_ref()
+            .expect("classification glob should be present");
+        assert!(classification_glob.matches("Analysis/1/SampleSheet.csv"));
+        assert!(!classification_glob.matches("InterOp/IndexMetricsOut.bin"));
+    }
+
+    #[test]
+    fn rejects_invalid_classification_glob() {
+        let error = Config::from_yaml_str(
+            r#"
+flockdir: "/var/lib/sequencer/flock"
+lock_file_name: "sequencer-sync.lock"
+logdir: "/var/lib/sequencer/log"
+server_user: "sequencer-sync"
+server_port: 22
+server_host: "sequencer.example.org"
+source: "/data/nextseq"
+
+category:
+  - regex: "^\\d{6}_"
+    classification_glob: "["
+    landing_zone: "/var/lib/sequencer/landing-zone"
+    completion_file_globs:
+      - "PrimaryAnalysisMetrics/PrimaryAnalysisMetrics.csv"
+"#,
+        )
+        .expect_err("invalid classification_glob should fail");
+
+        assert!(matches!(
+            error,
+            ConfigError::InvalidGlob {
+                field: "category.classification_glob",
+                ..
             }
         ));
     }

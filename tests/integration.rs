@@ -305,6 +305,91 @@ fn nanopore_transfers_complete_runs() {
 }
 
 #[test]
+fn classification_glob_selects_first_matching_category_and_falls_back() {
+    let fixture = TestFixture::new("classification-glob");
+    fixture.mkdir("flockdir");
+    fixture.mkdir("logdir");
+    fixture.mkdir("nanopore-source");
+    fixture.mkdir("nanopore-landing-core");
+    fixture.mkdir("nanopore-landing-other");
+
+    fixture.mkdir("nanopore-source/ONT_run_with_marker");
+    fixture.write_file("nanopore-source/ONT_run_with_marker/core.marker", "marker");
+    fixture.write_file(
+        "nanopore-source/ONT_run_with_marker/report_final.html",
+        "report",
+    );
+    fixture.write_file("nanopore-source/ONT_run_with_marker/data.txt", "data");
+
+    fixture.mkdir("nanopore-source/ONT_run_without_marker");
+    fixture.write_file(
+        "nanopore-source/ONT_run_without_marker/report_final.html",
+        "report",
+    );
+    fixture.write_file("nanopore-source/ONT_run_without_marker/data.txt", "data");
+
+    let config = format!(
+        r#"flockdir: "{flockdir}"
+lock_file_name: "sequencer-sync.lock"
+logdir: "{logdir}"
+server_user: "test"
+server_port: 22
+server_host: "localhost"
+source: "{source}"
+
+category:
+  - regex: "^ONT_"
+    classification_glob: "core.marker"
+    landing_zone: "{landing_core}"
+    exclude: []
+    completion_file_globs:
+      - "report*.html"
+
+  - regex: "^ONT_"
+    landing_zone: "{landing_other}"
+    exclude: []
+    completion_file_globs:
+      - "report*.html"
+"#,
+        flockdir = fixture.path("flockdir").display(),
+        logdir = fixture.path("logdir").display(),
+        source = fixture.path("nanopore-source").display(),
+        landing_core = fixture.path("nanopore-landing-core").display(),
+        landing_other = fixture.path("nanopore-landing-other").display(),
+    );
+    let config_path = fixture.path("nanopore.yaml");
+    fs::write(&config_path, config).unwrap();
+
+    cmd()
+        .args(["run", "--config-path"])
+        .arg(&config_path)
+        .assert()
+        .success();
+
+    assert!(
+        fixture
+            .path("nanopore-landing-core/ONT_run_with_marker/data.txt")
+            .exists()
+    );
+    assert!(
+        !fixture
+            .path("nanopore-landing-other/ONT_run_with_marker")
+            .exists()
+    );
+    assert!(
+        fixture
+            .path("nanopore-landing-other/ONT_run_without_marker/data.txt")
+            .exists()
+    );
+    assert!(
+        !fixture
+            .path("nanopore-landing-core/ONT_run_without_marker")
+            .exists()
+    );
+    assert_eq!(transfer_log_line_count(&fixture), 2);
+}
+
+#[test]
 fn nextseq_skips_incomplete_runs() {
     let fixture = TestFixture::new("nextseq-incomplete");
     let config_path = fixture.setup_nextseq();
