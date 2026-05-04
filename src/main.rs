@@ -312,9 +312,7 @@ fn scan_directories(
         debug!("Classifying {}", entry.path().display());
 
         let Some(dir_name) = dir_name.to_str() else {
-            warn!(
-                "\tPath name is not UTF-8 formatted, this is required for glob matching; skipping"
-            );
+            warn!("\tSkipping directory with non-UTF-8 name; glob matching requires UTF-8");
             continue;
         };
 
