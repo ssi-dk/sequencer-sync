@@ -328,7 +328,7 @@ fn scan_directories(
         let dir_name = entry.file_name();
         let dir_name = dir_name.to_string_lossy();
 
-        let target = match classify(&dir_name, categories)? {
+        let target = match classify(&entry.path(), categories)? {
             Some(t) => {
                 debug!(
                     "Match: Run directory {} match regex {} to landing zone {}",
@@ -378,41 +378,71 @@ fn run_is_complete(
     completion_file_globs: &[glob::Pattern],
 ) -> Result<bool, AppError> {
     for completion_file_glob in completion_file_globs {
-        let pattern = run_dir.join(completion_file_glob.as_str());
-        let pattern = pattern.to_string_lossy();
-        // The pattern was validated at config load time, so PatternError is not expected here.
-        let mut paths = glob::glob(&pattern).expect("completion file glob pattern should be valid");
-        match paths.next() {
-            None => {
-                return {
-                    debug!(
-                        "\tNot found: Completion glob {}",
-                        run_dir.join(completion_file_glob.as_str()).display()
-                    );
-                    Ok(false)
-                };
+        if !glob_has_match(run_dir, completion_file_glob).map_err(|source| {
+            AppError::CompletionFileScan {
+                run_dir: run_dir.to_path_buf(),
+                source,
             }
-            Some(Ok(_)) => (),
-            Some(Err(source)) => {
-                return Err(AppError::CompletionFileScan {
-                    run_dir: run_dir.to_path_buf(),
-                    source,
-                });
-            }
+        })? {
+            debug!(
+                "\tNot found: Completion glob {}",
+                run_dir.join(completion_file_glob.as_str()).display()
+            );
+            return Ok(false);
         }
     }
 
     Ok(true)
 }
 
+fn glob_has_match(run_dir: &Path, pattern: &glob::Pattern) -> Result<bool, glob::GlobError> {
+    let pattern = run_dir.join(pattern.as_str());
+    let pattern = pattern.to_string_lossy();
+    // The pattern was validated at config load time, so PatternError is not expected here.
+    // TODO: Handle non-UTF8 paths (the string_lossy above will corrupt them)
+    let mut paths = glob::glob(&pattern).expect("glob pattern should be valid");
+    match paths.next() {
+        Some(Ok(_)) => Ok(true),
+        Some(Err(source)) => Err(source),
+        None => Ok(false),
+    }
+}
+
+// The caller guarantees that `run_dir`:
+// 1. is an absolute path,
+// 2. is not `/`, and
+// 3. has a final segment/file name that is valid UTF-8.
+// TODO: Remove the UTF-8 guarantee by changing category regexes to `regex::bytes::Regex`.
 fn classify(
-    dir_name: &str,
+    run_dir: &Path,
     categories: &[config::Category],
 ) -> Result<Option<TransferTarget>, AppError> {
+    let dir_name = run_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .expect("run_dir should have a UTF-8 file name");
+
     for cat in categories {
         if !cat.regex.is_match(dir_name) {
             continue;
         }
+
+        if let Some(classification_glob) = &cat.classification_glob {
+            if !glob_has_match(run_dir, classification_glob).map_err(|source| {
+                AppError::ClassificationFileScan {
+                    run_dir: run_dir.to_path_buf(),
+                    source,
+                }
+            })? {
+                debug!(
+                    "Classification glob did not match for {}: {}",
+                    dir_name,
+                    run_dir.join(classification_glob.as_str()).display()
+                );
+                continue;
+            }
+        }
+
         let destination = if cat.year_subdirectory {
             let bytes = dir_name.as_bytes();
             if bytes.len() < 2 || !bytes[0].is_ascii_digit() || !bytes[1].is_ascii_digit() {
@@ -911,6 +941,12 @@ enum AppError {
         #[source]
         source: glob::GlobError,
     },
+    #[error("failed to scan for classification file in {}: {source}", run_dir.display())]
+    ClassificationFileScan {
+        run_dir: PathBuf,
+        #[source]
+        source: glob::GlobError,
+    },
     #[error("failed to write transfer marker {}: {source}", path.display())]
     WriteTransferMarker {
         path: PathBuf,
@@ -1012,6 +1048,22 @@ mod tests {
         fs::remove_dir_all(path).expect("should remove temp dir");
     }
 
+    fn test_category(
+        regex: &str,
+        classification_glob: Option<&str>,
+        landing_zone: &str,
+    ) -> Category {
+        Category {
+            regex: Regex::new(regex).expect("regex should parse"),
+            classification_glob: classification_glob
+                .map(|pattern| Pattern::new(pattern).expect("glob should parse")),
+            landing_zone: PathBuf::from(landing_zone),
+            exclude: Vec::new(),
+            completion_file_globs: vec![Pattern::new("report*.html").expect("glob should parse")],
+            year_subdirectory: false,
+        }
+    }
+
     #[test]
     fn renders_cron_file() {
         let block = render_cron_file(
@@ -1066,18 +1118,65 @@ mod tests {
 
     #[test]
     fn classify_preserves_matching_regex_string() {
-        let categories = vec![Category {
-            regex: Regex::new(r"^ONT_WGS_").expect("regex should parse"),
-            landing_zone: PathBuf::from("/tmp/landing"),
-            exclude: Vec::new(),
-            completion_file_globs: vec![Pattern::new("report*.html").expect("glob should parse")],
-            year_subdirectory: false,
-        }];
+        let run_dir = Path::new("/tmp/ONT_WGS_run1");
+        let categories = vec![test_category(r"^ONT_WGS_", None, "/tmp/landing")];
 
-        let target = classify("ONT_WGS_run1", &categories)
+        let target = classify(run_dir, &categories)
             .expect("classification should succeed")
             .expect("directory should match category");
 
         assert_eq!(target.regex_string, "^ONT_WGS_");
+    }
+
+    #[test]
+    fn classify_uses_first_regex_match_without_classification_glob() {
+        let run_dir = Path::new("/tmp/ONT_WGS_run1");
+        let categories = vec![
+            test_category(r"^ONT_", None, "/tmp/first"),
+            test_category(r"^ONT_", None, "/tmp/second"),
+        ];
+
+        let target = classify(run_dir, &categories)
+            .expect("classification should succeed")
+            .expect("directory should match category");
+
+        assert_eq!(target.destination, PathBuf::from("/tmp/first"));
+    }
+
+    #[test]
+    fn classify_falls_through_when_classification_glob_is_missing() {
+        let tempdir = make_temp_dir();
+        let run_dir = tempdir.join("ONT_WGS_run1");
+        fs::create_dir(&run_dir).expect("should create run dir");
+        let categories = vec![
+            test_category(r"^ONT_", Some("core.marker"), "/tmp/core"),
+            test_category(r"^ONT_", None, "/tmp/fallback"),
+        ];
+
+        let target = classify(&run_dir, &categories)
+            .expect("classification should succeed")
+            .expect("directory should match fallback category");
+
+        assert_eq!(target.destination, PathBuf::from("/tmp/fallback"));
+        cleanup_temp_dir(&tempdir);
+    }
+
+    #[test]
+    fn classify_uses_first_regex_match_with_matching_classification_glob() {
+        let tempdir = make_temp_dir();
+        let run_dir = tempdir.join("ONT_WGS_run1");
+        fs::create_dir(&run_dir).expect("should create run dir");
+        fs::write(run_dir.join("core.marker"), "").expect("should write classification marker");
+        let categories = vec![
+            test_category(r"^ONT_", Some("core.marker"), "/tmp/core"),
+            test_category(r"^ONT_", None, "/tmp/fallback"),
+        ];
+
+        let target = classify(&run_dir, &categories)
+            .expect("classification should succeed")
+            .expect("directory should match glob-qualified category");
+
+        assert_eq!(target.destination, PathBuf::from("/tmp/core"));
+        cleanup_temp_dir(&tempdir);
     }
 }

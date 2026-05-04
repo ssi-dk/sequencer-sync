@@ -16,16 +16,22 @@ server_host: "sequencer.example.org"
 # Each run is assumed to be one directory.
 source: "/data/nanopore"
 
-# We might want to distinguish e.g. core facility run (copy only fastq)
-# versus project runs (copy also raw data).
-# These are distinct categories. Each sequencing run (directory) is
-# classified as a category based on whether its directory name matches
-# the regex. Categories are checked top from bottom; first match classifies.
+# We might want to distinguish e.g. core facility runs (copy only fastq)
+# versus project runs (copy also raw data), even when those runs have the same
+# directory-name pattern.
+#
+# Each sequencing run (directory) is classified by checking categories from top
+# to bottom. First the directory name must match `regex`. If
+# `classification_glob` is set, at least one file matching that glob must also
+# exist inside the run directory. If the glob does not match, later categories
+# are checked. A regex match without `classification_glob` classifies
+# immediately.
 
 category:
-  - # If directory matches this regex, the run is classified
-    # as this category
-    regex: "^ONT_WGS_"
+  - # If directory matches this regex and contains this marker, the run is
+    # classified as this category.
+    regex: "^ONT_"
+    classification_glob: "metadata/core_facility.txt"
 
     # Copy to this directory
     landing_zone: "/var/lib/sequencer/landing-zone-core"
