@@ -132,7 +132,7 @@ impl Config {
     }
 
     // Note: This doesn't canonicalize paths!
-    fn from_yaml_str(contents: &str) -> Result<Self, ConfigError> {
+    pub(crate) fn from_yaml_str(contents: &str) -> Result<Self, ConfigError> {
         let config: UnvalidatedConfig =
             serde_yaml::from_str(contents).map_err(ConfigError::Parse)?;
         config.validate()

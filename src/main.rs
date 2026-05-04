@@ -8,7 +8,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use clap::{Args, Parser, Subcommand};
 use config::{Config, ConfigError};
 use fs2::FileExt;
-use log::debug;
+use log::{debug, warn};
 use run_log::RunLog;
 use thiserror::Error;
 use transfer_log::TransferLog;
@@ -306,6 +306,15 @@ fn scan_directories(
         if !file_type.is_dir() {
             continue;
         }
+        let dir_name = entry.file_name();
+        let Some(dir_name) = dir_name.to_str() else {
+            warn!(
+                "Skipping directory with non-UTF-8 name because glob matching requires UTF-8: {}",
+                entry.path().display()
+            );
+            continue;
+        };
+
         let key = transfer_log::relative_directory_key(source, &entry.path())
             .map_err(AppError::TransferLog)?;
 
@@ -324,9 +333,6 @@ fn scan_directories(
             }
             TransferAction::Tranfer(reason) => reason,
         };
-
-        let dir_name = entry.file_name();
-        let dir_name = dir_name.to_string_lossy();
 
         let target = match classify(&entry.path(), categories)? {
             Some(t) => {
@@ -397,10 +403,10 @@ fn run_is_complete(
 
 fn glob_has_match(run_dir: &Path, pattern: &glob::Pattern) -> Result<bool, glob::GlobError> {
     let pattern = run_dir.join(pattern.as_str());
-    let pattern = pattern.to_string_lossy();
-    // The pattern was validated at config load time, so PatternError is not expected here.
-    // TODO: Handle non-UTF8 paths (the string_lossy above will corrupt them)
-    let mut paths = glob::glob(&pattern).expect("glob pattern should be valid");
+    let pattern = pattern
+        .to_str()
+        .expect("run directory and config glob should both be valid UTF-8");
+    let mut paths = glob::glob(pattern).expect("glob pattern should be valid");
     match paths.next() {
         Some(Ok(_)) => Ok(true),
         Some(Err(source)) => Err(source),
@@ -408,11 +414,6 @@ fn glob_has_match(run_dir: &Path, pattern: &glob::Pattern) -> Result<bool, glob:
     }
 }
 
-// The caller guarantees that `run_dir`:
-// 1. is an absolute path,
-// 2. is not `/`, and
-// 3. has a final segment/file name that is valid UTF-8.
-// TODO: Remove the UTF-8 guarantee by changing category regexes to `regex::bytes::Regex`.
 fn classify(
     run_dir: &Path,
     categories: &[config::Category],
@@ -420,7 +421,7 @@ fn classify(
     let dir_name = run_dir
         .file_name()
         .and_then(|name| name.to_str())
-        .expect("run_dir should have a UTF-8 file name");
+        .expect("scan_directories should skip non-UTF-8 run directory names");
 
     for cat in categories {
         if !cat.regex.is_match(dir_name) {
@@ -436,7 +437,7 @@ fn classify(
             })? {
                 debug!(
                     "Classification glob did not match for {}: {}",
-                    dir_name,
+                    run_dir.display(),
                     run_dir.join(classification_glob.as_str()).display()
                 );
                 continue;
@@ -447,11 +448,12 @@ fn classify(
             let bytes = dir_name.as_bytes();
             if bytes.len() < 2 || !bytes[0].is_ascii_digit() || !bytes[1].is_ascii_digit() {
                 return Err(AppError::YearSubdirectoryInvalidName {
-                    dir_name: dir_name.to_string(),
+                    dir_name: dir_name.to_owned(),
                     category_regex: cat.regex.to_string(),
                 });
             }
-            cat.landing_zone.join(format!("20{}", &dir_name[..2]))
+            cat.landing_zone
+                .join(format!("20{}{}", bytes[0] as char, bytes[1] as char))
         } else {
             cat.landing_zone.clone()
         };
@@ -509,7 +511,9 @@ fn transfer_new_directories(
 
     for (entry, reason, target) in planned_transfers {
         let dir_name = entry.file_name();
-        let dir_name = dir_name.to_string_lossy();
+        let dir_name_display = dir_name
+            .to_str()
+            .expect("scan_directories should skip non-UTF-8 run directory names");
 
         let transferred_dir = target.destination.join(entry.file_name());
 
@@ -536,7 +540,7 @@ fn transfer_new_directories(
             Ok(()) => {
                 succeeded += 1;
                 run_log.info(&format!(
-                    "Transferred {} {dir_name} -> {destination_display}",
+                    "Transferred {} {dir_name_display} -> {destination_display}",
                     transfer_reason_label(reason)
                 ));
                 if let Err(error) = touch_transfer_marker(&transferred_dir) {
@@ -548,7 +552,7 @@ fn transfer_new_directories(
             Err(error) => {
                 failed += 1;
                 run_log.error(&format!(
-                    "FAILED transfer {} {dir_name} -> {destination_display}: {error}",
+                    "FAILED transfer {} {dir_name_display} -> {destination_display}: {error}",
                     transfer_reason_label(reason)
                 ));
             }
@@ -653,8 +657,11 @@ fn rsync_directory(source: &Path, destination: &Path, exclude: &[String]) -> Res
 
 fn path_with_trailing_separator(path: &Path) -> OsString {
     let mut path_with_separator = path.as_os_str().to_os_string();
-    let path_str = path.as_os_str().to_string_lossy();
-    if !path_str.ends_with(std::path::MAIN_SEPARATOR) {
+    if !path
+        .to_str()
+        .expect("transferred paths should be valid UTF-8")
+        .ends_with(std::path::MAIN_SEPARATOR)
+    {
         path_with_separator.push(std::path::MAIN_SEPARATOR_STR);
     }
     path_with_separator
@@ -769,7 +776,7 @@ fn write_cron_file(logdir: &Path, config_path: &Path) -> Result<PathBuf, AppErro
         .and_then(fs::canonicalize)
         .map_err(|source| AppError::CurrentExe { source })?;
     let cron_path = cron_file_path(logdir);
-    let contents = render_cron_file(config_path, &binary_path);
+    let contents = render_cron_file(config_path, &binary_path)?;
     debug!(
         "Writing cron content to cron file at {}",
         cron_path.display()
@@ -789,14 +796,28 @@ fn lock_file_path(flockdir: &Path, lock_file_name: &str) -> PathBuf {
     flockdir.join(lock_file_name)
 }
 
-fn render_cron_file(config_path: &Path, binary_path: &Path) -> String {
+fn render_cron_file(config_path: &Path, binary_path: &Path) -> Result<String, AppError> {
+    let binary_path_str = binary_path
+        .to_str()
+        .ok_or_else(|| AppError::NonUtf8CronPath {
+            field: "current executable",
+            path: binary_path.to_path_buf(),
+        })?;
+    let config_path_str = config_path
+        .to_str()
+        .ok_or_else(|| AppError::NonUtf8CronPath {
+            field: "config path",
+            path: config_path.to_path_buf(),
+        })?;
     let command = format!(
         "{} run --config-path {}",
-        shell_quote(binary_path.to_string_lossy().as_ref()),
-        shell_quote(config_path.to_string_lossy().as_ref()),
+        shell_quote(binary_path_str),
+        shell_quote(config_path_str),
     );
 
-    format!("# Install this file into cron manually.\n* * * * * {command}\n")
+    Ok(format!(
+        "# Install this file into cron manually.\n* * * * * {command}\n"
+    ))
 }
 
 fn check_lock_is_available(flockdir: &Path, lock_file_name: &str) -> Result<(), AppError> {
@@ -960,6 +981,8 @@ enum AppError {
         #[source]
         source: std::io::Error,
     },
+    #[error("cannot render cron file because {field} is not valid UTF-8: {}", path.display())]
+    NonUtf8CronPath { field: &'static str, path: PathBuf },
     #[error(
         "directory `{dir_name}` matched category regex `{category_regex}` with year_subdirectory enabled, but name does not start with two ASCII digits"
     )]
@@ -971,6 +994,7 @@ enum AppError {
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::OsString;
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::sync::{Mutex, Once};
@@ -980,8 +1004,12 @@ mod tests {
     use log::{LevelFilter, Log, Metadata, Record};
     use regex::Regex;
 
-    use super::{classify, cron_file_path, lock_file_path, render_cron_file, run_is_complete};
+    use super::{
+        classify, cron_file_path, lock_file_path, path_with_trailing_separator, render_cron_file,
+        run_is_complete, scan_directories,
+    };
     use crate::config::Category;
+    use crate::transfer_log::TransferLog;
 
     struct TestLogger {
         messages: Mutex<Vec<String>>,
@@ -1069,7 +1097,8 @@ mod tests {
         let block = render_cron_file(
             Path::new("/etc/sequencer-sync/config.yaml"),
             Path::new("/usr/local/bin/sequencer-sync"),
-        );
+        )
+        .expect("cron file should render");
 
         assert!(block.contains("# Install this file into cron manually."));
         assert!(
@@ -1178,5 +1207,48 @@ mod tests {
 
         assert_eq!(target.destination, PathBuf::from("/tmp/core"));
         cleanup_temp_dir(&tempdir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scan_directories_warns_and_skips_non_utf8_run_dir() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        init_test_logger();
+        let tempdir = make_temp_dir();
+        let source = tempdir.join("source");
+        let logdir = tempdir.join("log");
+        fs::create_dir(&source).expect("should create source dir");
+        fs::create_dir(&logdir).expect("should create log dir");
+        let run_dir = source.join(OsString::from_vec(b"run_\xff".to_vec()));
+        if let Err(error) = fs::create_dir(&run_dir) {
+            if matches!(error.raw_os_error(), Some(1 | 92)) {
+                cleanup_temp_dir(&tempdir);
+                return;
+            }
+            panic!("should create run dir: {error}");
+        }
+        let transfer_log = TransferLog::load(&logdir).expect("missing transfer log should load");
+        let categories = vec![test_category(r"^run_", None, "/tmp/landing")];
+
+        let result = scan_directories(&source, &categories, &transfer_log, false, false)
+            .expect("scan should succeed");
+
+        assert!(result.planned_transfers.is_empty());
+        assert!(TEST_LOGGER.lines().iter().any(|line| {
+            line.contains("Skipping directory with non-UTF-8 name")
+                && line.contains("glob matching requires UTF-8")
+        }));
+        cleanup_temp_dir(&tempdir);
+    }
+
+    #[test]
+    fn path_with_trailing_separator_appends_separator() {
+        let path = Path::new("/tmp/run");
+
+        let with_separator = path_with_trailing_separator(path);
+
+        assert_eq!(with_separator, OsString::from("/tmp/run/"));
     }
 }
