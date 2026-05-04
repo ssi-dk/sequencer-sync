@@ -110,6 +110,17 @@ pub enum ConfigError {
         "config field `{field}` must be a valid file base name (no slashes, not \".\" or \"..\"): {value:?}"
     )]
     InvalidBaseName { field: &'static str, value: String },
+    #[error("Expected {label} directory to exist: '{}'", path.display())]
+    MissingDirectory { label: &'static str, path: PathBuf },
+    #[error("Expected {label} to be a directory: '{}'", path.display())]
+    NotDirectory { label: &'static str, path: PathBuf },
+    #[error("failed to inspect {label} directory '{}': {source}", path.display())]
+    ReadDirectoryMetadata {
+        label: &'static str,
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
     #[error("failed to canonicalize `{field}` path {}: {source}", path.display())]
     CanonicalizePath {
         field: &'static str,
@@ -165,11 +176,49 @@ impl Config {
 }
 
 fn canonicalize_field(field: &'static str, path: &Path) -> Result<PathBuf, ConfigError> {
+    validate_existing_directory(field, path)?;
     fs::canonicalize(path).map_err(|source| ConfigError::CanonicalizePath {
         field,
         path: path.to_path_buf(),
         source,
     })
+}
+
+fn validate_existing_directory(field: &'static str, path: &Path) -> Result<(), ConfigError> {
+    let label = directory_label(field);
+    let metadata = fs::metadata(path).map_err(|source| {
+        if source.kind() == std::io::ErrorKind::NotFound {
+            ConfigError::MissingDirectory {
+                label,
+                path: path.to_path_buf(),
+            }
+        } else {
+            ConfigError::ReadDirectoryMetadata {
+                label,
+                path: path.to_path_buf(),
+                source,
+            }
+        }
+    })?;
+
+    if metadata.is_dir() {
+        Ok(())
+    } else {
+        Err(ConfigError::NotDirectory {
+            label,
+            path: path.to_path_buf(),
+        })
+    }
+}
+
+fn directory_label(field: &'static str) -> &'static str {
+    match field {
+        "flockdir" => "lock",
+        "logdir" => "log",
+        "source" => "source",
+        "category.landing_zone" => "landing zone",
+        _ => field,
+    }
 }
 
 impl UnvalidatedConfig {
@@ -303,7 +352,10 @@ fn validate_all_paths_distinct(paths: &[(&'static str, &Path)]) -> Result<(), Co
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{Config, ConfigError};
 
@@ -323,6 +375,7 @@ category:
     completion_file_globs:
       - "PrimaryAnalysisMetrics/PrimaryAnalysisMetrics.csv"
 "#;
+    static NEXT_TEST_DIR_ID: AtomicU64 = AtomicU64::new(0);
 
     #[test]
     fn parses_example_config() {
@@ -652,5 +705,123 @@ category:
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn from_path_reports_missing_landing_zone_before_canonicalizing() {
+        let tempdir = make_temp_dir();
+        fs::create_dir(tempdir.join("flockdir")).expect("should create flockdir");
+        fs::create_dir(tempdir.join("logdir")).expect("should create logdir");
+        fs::create_dir(tempdir.join("source")).expect("should create source");
+        let missing_landing = tempdir.join("missing-landing");
+        let config_path = tempdir.join("config.yaml");
+        fs::write(
+            &config_path,
+            format!(
+                r#"
+flockdir: "{flockdir}"
+lock_file_name: "sequencer-sync.lock"
+logdir: "{logdir}"
+server_user: "sequencer-sync"
+server_port: 22
+server_host: "sequencer.example.org"
+source: "{source}"
+
+category:
+  - regex: "^run"
+    landing_zone: "{landing_zone}"
+    completion_file_globs:
+      - "complete.txt"
+"#,
+                flockdir = tempdir.join("flockdir").display(),
+                logdir = tempdir.join("logdir").display(),
+                source = tempdir.join("source").display(),
+                landing_zone = missing_landing.display(),
+            ),
+        )
+        .expect("should write config");
+
+        let error = Config::from_path(&config_path).expect_err("missing landing zone should fail");
+
+        assert!(matches!(
+            error,
+            ConfigError::MissingDirectory {
+                label: "landing zone",
+                ..
+            }
+        ));
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "Expected landing zone directory to exist: '{}'",
+                missing_landing.display()
+            )
+        );
+        cleanup_temp_dir(&tempdir);
+    }
+
+    #[test]
+    fn from_path_reports_file_where_directory_expected_before_canonicalizing() {
+        let tempdir = make_temp_dir();
+        fs::create_dir(tempdir.join("flockdir")).expect("should create flockdir");
+        fs::create_dir(tempdir.join("logdir")).expect("should create logdir");
+        fs::create_dir(tempdir.join("source")).expect("should create source");
+        let landing_file = tempdir.join("landing-file");
+        fs::write(&landing_file, "").expect("should create landing file");
+        let config_path = tempdir.join("config.yaml");
+        fs::write(
+            &config_path,
+            format!(
+                r#"
+flockdir: "{flockdir}"
+lock_file_name: "sequencer-sync.lock"
+logdir: "{logdir}"
+server_user: "sequencer-sync"
+server_port: 22
+server_host: "sequencer.example.org"
+source: "{source}"
+
+category:
+  - regex: "^run"
+    landing_zone: "{landing_zone}"
+    completion_file_globs:
+      - "complete.txt"
+"#,
+                flockdir = tempdir.join("flockdir").display(),
+                logdir = tempdir.join("logdir").display(),
+                source = tempdir.join("source").display(),
+                landing_zone = landing_file.display(),
+            ),
+        )
+        .expect("should write config");
+
+        let error = Config::from_path(&config_path).expect_err("landing file should fail");
+
+        assert!(matches!(
+            error,
+            ConfigError::NotDirectory {
+                label: "landing zone",
+                ..
+            }
+        ));
+        cleanup_temp_dir(&tempdir);
+    }
+
+    fn make_temp_dir() -> PathBuf {
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time should be after unix epoch")
+            .as_nanos();
+        let unique_id = NEXT_TEST_DIR_ID.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "sequencer-sync-config-test-{}-{timestamp}-{unique_id}",
+            std::process::id()
+        ));
+        fs::create_dir(&path).expect("should create temp dir");
+        path
+    }
+
+    fn cleanup_temp_dir(path: &Path) {
+        fs::remove_dir_all(path).expect("should remove temp dir");
     }
 }
