@@ -154,17 +154,21 @@ impl Drop for RunLog {
 mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::RunLog;
+
+    static NEXT_TEST_DIR_ID: AtomicU64 = AtomicU64::new(0);
 
     fn make_temp_dir() -> PathBuf {
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("system time should be after unix epoch")
             .as_nanos();
+        let unique_id = NEXT_TEST_DIR_ID.fetch_add(1, Ordering::Relaxed);
         let path = std::env::temp_dir().join(format!(
-            "sequencer-sync-run-log-test-{}-{timestamp}",
+            "sequencer-sync-run-log-test-{}-{timestamp}-{unique_id}",
             std::process::id()
         ));
         fs::create_dir(&path).expect("should create temp dir");
