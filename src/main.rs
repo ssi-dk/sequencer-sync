@@ -137,7 +137,7 @@ fn setup(args: SetupArgs) -> Result<(), AppError> {
     if let Some(tree_check_source) = &args.tree_check_source {
         check_run_trees(tree_check_source, &config.categories)?;
     }
-    check_lock_is_available(&config.flockdir, &config.lock_file_name)?;
+    check_lock_is_available(&config.lock_file)?;
     let _ = TransferLog::load(&config.logdir).map_err(AppError::TransferLog)?;
     transfer_log::initialize_if_absent(&config.logdir).map_err(AppError::TransferLog)?;
     eprintln!("Setup successful!");
@@ -159,7 +159,6 @@ struct TransferTarget {
     category_index: usize,
     destination: PathBuf,
     filestructure: Arc<config::FileStructure>,
-    completion_file_globs: Vec<glob::Pattern>,
 }
 
 #[derive(Default)]
@@ -190,7 +189,7 @@ fn run_command(args: RunArgs) -> Result<(), AppError> {
     let config = load_config(&args.config_path)?;
     let mut run_log = RunLog::new(&config.logdir);
 
-    let _lock = match acquire_run_lock(&config.flockdir, &config.lock_file_name)? {
+    let _lock = match acquire_run_lock(&config.lock_file)? {
         Some(lock) => lock,
         None => {
             if !args.dry_run {
@@ -252,10 +251,10 @@ fn validate_environment(config: &Config, skip_ssh_check: bool) -> Result<(), App
         check_writable_directory(&cat.landing_zone, "category.landing_zone")?;
     }
     debug!(
-        "Checking writability of flockdir: {}",
-        config.flockdir.display()
+        "Checking writability of lock file parent directory: {}",
+        lock_file_parent(&config.lock_file)?.display()
     );
-    check_writable_directory(&config.flockdir, "flockdir")?;
+    check_writable_directory(lock_file_parent(&config.lock_file)?, "lock_file parent")?;
     debug!(
         "Checking writability of logdir: {}",
         config.logdir.display()
@@ -370,7 +369,8 @@ fn scan_directories(
             }
         };
 
-        let is_complete = run_is_complete(&entry.path(), &target.completion_file_globs)?;
+        let is_complete =
+            run_is_complete(&entry.path(), &target.filestructure.completion_file_globs)?;
         if !is_complete {
             if transfer_incomplete {
                 debug!("\tTransferring incomplete run due to --transfer-incomplete flag");
@@ -477,7 +477,6 @@ fn classify(
             category_index,
             destination,
             filestructure: cat.filestructure.clone(),
-            completion_file_globs: cat.completion_file_globs.clone(),
         }));
     }
     Ok(None)
@@ -1114,10 +1113,6 @@ fn cron_file_path(logdir: &Path) -> PathBuf {
     logdir.join("sequencer-sync.cron")
 }
 
-fn lock_file_path(flockdir: &Path, lock_file_name: &str) -> PathBuf {
-    flockdir.join(lock_file_name)
-}
-
 fn render_cron_file(config_path: &Path, binary_path: &Path) -> Result<String, AppError> {
     let binary_path_str = binary_path
         .to_str()
@@ -1142,32 +1137,46 @@ fn render_cron_file(config_path: &Path, binary_path: &Path) -> Result<String, Ap
     ))
 }
 
-fn check_lock_is_available(flockdir: &Path, lock_file_name: &str) -> Result<(), AppError> {
-    let path = lock_file_path(flockdir, lock_file_name);
-    debug!("Checking availability of lock file at {}", path.display());
-    let _lock =
-        acquire_run_lock(flockdir, lock_file_name)?.ok_or(AppError::RunLockHeld { path })?;
+fn check_lock_is_available(lock_file: &Path) -> Result<(), AppError> {
+    debug!(
+        "Checking availability of lock file at {}",
+        lock_file.display()
+    );
+    let _lock = acquire_run_lock(lock_file)?.ok_or_else(|| AppError::RunLockHeld {
+        path: lock_file.to_path_buf(),
+    })?;
     Ok(())
 }
 
-fn acquire_run_lock(flockdir: &Path, lock_file_name: &str) -> Result<Option<RunLock>, AppError> {
-    let path = lock_file_path(flockdir, lock_file_name);
+fn acquire_run_lock(path: &Path) -> Result<Option<RunLock>, AppError> {
     let file = OpenOptions::new()
         .create(true)
         .read(true)
         .write(true)
         .truncate(false)
-        .open(&path)
+        .open(path)
         .map_err(|source| AppError::OpenRunLockFile {
-            path: path.clone(),
+            path: path.to_path_buf(),
             source,
         })?;
 
     match file.try_lock_exclusive() {
         Ok(()) => Ok(Some(RunLock { file })),
         Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
-        Err(source) => Err(AppError::AcquireRunLock { path, source }),
+        Err(source) => Err(AppError::AcquireRunLock {
+            path: path.to_path_buf(),
+            source,
+        }),
     }
+}
+
+fn lock_file_parent(lock_file: &Path) -> Result<&Path, AppError> {
+    lock_file
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .ok_or_else(|| AppError::MissingLockFileParent {
+            path: lock_file.to_path_buf(),
+        })
 }
 
 fn shell_quote(value: &str) -> String {
@@ -1345,6 +1354,8 @@ enum AppError {
     },
     #[error("cannot render cron file because {field} is not valid UTF-8: {}", path.display())]
     NonUtf8CronPath { field: &'static str, path: PathBuf },
+    #[error("lock file path has no parent directory: {}", path.display())]
+    MissingLockFileParent { path: PathBuf },
     #[error(
         "directory `{dir_name}` matched category regex `{category_regex}` with year_subdirectory enabled, but name does not start with two ASCII digits"
     )]
@@ -1371,10 +1382,7 @@ mod tests {
     use log::{LevelFilter, Log, Metadata, Record};
     use regex::Regex;
 
-    use super::{
-        classify, cron_file_path, lock_file_path, render_cron_file, run_is_complete,
-        scan_directories,
-    };
+    use super::{classify, cron_file_path, render_cron_file, run_is_complete, scan_directories};
     use crate::config::{Category, FileStructure};
     use crate::transfer_log::TransferLog;
 
@@ -1459,8 +1467,10 @@ mod tests {
                 ignore_globs: Vec::new(),
                 checkout_paths: HashSet::new(),
                 checkout_globs: vec![Pattern::new("**").expect("glob should parse")],
+                completion_file_globs: vec![
+                    Pattern::new("report*.html").expect("glob should parse"),
+                ],
             }),
-            completion_file_globs: vec![Pattern::new("report*.html").expect("glob should parse")],
             year_subdirectory: false,
         }
     }
@@ -1492,13 +1502,6 @@ mod tests {
             path,
             Path::new("/var/lib/sequencer/log/sequencer-sync.cron")
         );
-    }
-
-    #[test]
-    fn computes_lock_file_path_in_flockdir() {
-        let path = lock_file_path(Path::new("/var/lib/sequencer/flock"), "my.lock");
-
-        assert_eq!(path, Path::new("/var/lib/sequencer/flock/my.lock"));
     }
 
     #[test]
