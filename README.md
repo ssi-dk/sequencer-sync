@@ -20,7 +20,7 @@ When `sequencer-sync run` is invoked, it:
 * Scans the source directory for subdirectories not yet in the transfer log
 * For each new directory, matches it against the configured categories by regex
 * Skips directories where any configured completion file glob fails to match (i.e. the sequencing run is still in progress), unless `--transfer-incomplete` is set
-* Stages matching directories directly in the category's landing zone, copying checkout-classified files at their original relative paths and packing all remaining archive-classified files into `archive.tar`
+* Stages matching directories directly in the category's landing zone, copying checkout-classified files at their original relative paths and packing all remaining archive-classified files into `archive.tar.gz` unless `--skip-compress` is set
 * Records success/failure in the transfer log; on success, writes a `transfer_successful.txt` marker in the transferred directory
 
 - Previously failed transfers can be retried with `--retry-failed`
@@ -42,3 +42,4 @@ When `sequencer-sync run` is invoked, it:
 	* `--config-path` (required): path to config file to load, see our deploy repo
 	* `--retry-failed` A failed transfer is logged as unsuccessful in the `log/transferred-direcotries.jsonl` and skipped in future runs. If this flag is set, failed directories are not skipped (unless they also appear as succeeded later in the log).
 	* `--transfer-incomplete` Data from sequencing runs are only considered complete if every glob in `completion_file_globs` matches at least one file. Without this flag set, incomplete runs are skipped.
+	* `--skip-compress`: write archive files as `archive.tar` instead of gzip-compressing them as `archive.tar.gz`.

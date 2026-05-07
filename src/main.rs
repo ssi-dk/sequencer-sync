@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -9,6 +9,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use clap::{Args, Parser, Subcommand};
 use config::{Config, ConfigError};
+use flate2::Compression;
+use flate2::write::GzEncoder;
 use fs2::FileExt;
 use log::{debug, warn};
 use run_log::RunLog;
@@ -93,6 +95,9 @@ struct RunArgs {
     /// Print what would be copied instead of actually copying; disables run-log writes.
     #[arg(long, default_value_t = false)]
     dry_run: bool,
+    /// Store archive.tar uncompressed instead of gzip-compressing it as archive.tar.gz.
+    #[arg(long, default_value_t = false)]
+    skip_compress: bool,
 }
 
 fn main() -> ExitCode {
@@ -546,8 +551,12 @@ fn transfer_new_directories(
         }
 
         let destination_display = transferred_dir.display();
-        let transfer_result =
-            transfer_run_to_landing_zone(&entry.path(), &transferred_dir, &target.filestructure);
+        let transfer_result = transfer_run_to_landing_zone(
+            &entry.path(),
+            &transferred_dir,
+            &target.filestructure,
+            args.skip_compress,
+        );
 
         let key = transfer_log::relative_directory_key(source, &entry.path())
             .map_err(AppError::TransferLog)?;
@@ -587,8 +596,8 @@ fn transfer_new_directories(
 
 fn run_started_message(args: &RunArgs) -> String {
     format!(
-        "Run started: retry_failed={} transfer_incomplete={}",
-        args.retry_failed, args.transfer_incomplete
+        "Run started: retry_failed={} transfer_incomplete={} skip_compress={}",
+        args.retry_failed, args.transfer_incomplete, args.skip_compress
     )
 }
 
@@ -665,6 +674,7 @@ fn transfer_run_to_landing_zone(
     run_dir: &Path,
     transferred_dir: &Path,
     filestructure: &config::FileStructure,
+    skip_compress: bool,
 ) -> Result<(), AppError> {
     let classified_files = classify_run_files(run_dir, filestructure)?;
     ensure_no_archive_dir_checkout_conflict(run_dir, &classified_files.checkout)?;
@@ -701,8 +711,12 @@ fn transfer_run_to_landing_zone(
             copy_classified_file(run_dir, relative_path, &archive_dir)?;
         }
 
-        let archive_tar = transferred_dir.join("archive.tar");
-        create_archive_tar(&archive_dir, &archive_tar)?;
+        let archive_path = if skip_compress {
+            transferred_dir.join("archive.tar")
+        } else {
+            transferred_dir.join("archive.tar.gz")
+        };
+        create_archive_tar(&archive_dir, &archive_path, skip_compress)?;
         fs::remove_dir_all(&archive_dir).map_err(|source| AppError::RemoveArchiveDir {
             path: archive_dir,
             source,
@@ -717,8 +731,10 @@ fn ensure_no_archive_dir_checkout_conflict(
     checkout_paths: &[PathBuf],
 ) -> Result<(), AppError> {
     for relative_path in checkout_paths {
-        if relative_path.components().next()
-            == Some(Component::Normal(OsStr::new(ARCHIVE_DIR_NAME)))
+        if relative_path
+            .components()
+            .next()
+            .is_some_and(|component| archive_dir_name_conflicts(component.as_os_str()))
         {
             return Err(AppError::ArchiveDirCheckoutConflict {
                 run_dir: run_dir.to_path_buf(),
@@ -729,6 +745,42 @@ fn ensure_no_archive_dir_checkout_conflict(
     }
 
     Ok(())
+}
+
+// Check if an existing relative path in the run_dir could conflict with the creation of
+// the archive.
+// This conservatively ignores extensions, such that we can switch to another compression
+// algorithm (with a new extension) in the future and not reject new paths.
+fn archive_dir_name_conflicts(name: &OsStr) -> bool {
+    // Fast path: If the path doesn't start with the archive bytes, it can't
+    // be a match.
+    if !name
+        .as_encoded_bytes()
+        .starts_with(ARCHIVE_DIR_NAME.as_bytes())
+    {
+        return false;
+    }
+
+    // More complex implementation which detects cases like "{ARCHIVE_DIR_NAME}.tar.gz"
+    // but rejects cases like "{ARCHIVE_DIR_NAME}_foo".
+    // This is difficult to do efficiently because of variable byte-level encoding
+    // of paths on different platforms.
+    let archive_dir_name = OsStr::new(ARCHIVE_DIR_NAME);
+    let mut candidate = Path::new(name);
+
+    loop {
+        if candidate.as_os_str() == archive_dir_name {
+            return true;
+        }
+
+        let Some(stem) = candidate.file_stem() else {
+            return false;
+        };
+        if stem == candidate.as_os_str() {
+            return false;
+        }
+        candidate = Path::new(stem);
+    }
 }
 
 fn create_parent_directories(
@@ -774,24 +826,57 @@ fn copy_classified_file(
     Ok(())
 }
 
-fn create_archive_tar(archive_dir: &Path, archive_tar: &Path) -> Result<(), AppError> {
-    let file = File::create(archive_tar).map_err(|source| AppError::CreateArchiveTar {
-        path: archive_tar.to_path_buf(),
+fn create_archive_tar(
+    archive_dir: &Path,
+    archive_path: &Path,
+    skip_compress: bool,
+) -> Result<(), AppError> {
+    let file = File::create(archive_path).map_err(|source| AppError::CreateArchiveTar {
+        path: archive_path.to_path_buf(),
         source,
     })?;
-    let mut builder = tar::Builder::new(file);
+    if skip_compress {
+        let mut builder = tar::Builder::new(file);
+        write_archive_tar(archive_dir, archive_path, &mut builder)
+    } else {
+        let encoder = GzEncoder::new(file, Compression::default());
+        let mut builder = tar::Builder::new(encoder);
+        write_archive_tar(archive_dir, archive_path, &mut builder)?;
+        let encoder = builder
+            .into_inner()
+            .map_err(|source| AppError::WriteArchiveTar {
+                archive_dir: archive_dir.to_path_buf(),
+                archive_tar: archive_path.to_path_buf(),
+                source,
+            })?;
+        encoder
+            .finish()
+            .map_err(|source| AppError::WriteArchiveTar {
+                archive_dir: archive_dir.to_path_buf(),
+                archive_tar: archive_path.to_path_buf(),
+                source,
+            })?;
+        Ok(())
+    }
+}
+
+fn write_archive_tar<W: std::io::Write>(
+    archive_dir: &Path,
+    archive_path: &Path,
+    builder: &mut tar::Builder<W>,
+) -> Result<(), AppError> {
     builder
         .append_dir_all(".", archive_dir)
         .map_err(|source| AppError::WriteArchiveTar {
             archive_dir: archive_dir.to_path_buf(),
-            archive_tar: archive_tar.to_path_buf(),
+            archive_tar: archive_path.to_path_buf(),
             source,
         })?;
     builder
         .finish()
         .map_err(|source| AppError::WriteArchiveTar {
             archive_dir: archive_dir.to_path_buf(),
-            archive_tar: archive_tar.to_path_buf(),
+            archive_tar: archive_path.to_path_buf(),
             source,
         })
 }
