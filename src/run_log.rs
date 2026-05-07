@@ -9,7 +9,7 @@ pub struct RunLog {
     /// Absolute path to the append-only log that accumulates across all runs.
     full_log_path: PathBuf,
     /// Absolute path to the log that is overwritten only once a real transfer
-    /// attempt starts. Runs that do not start rsync append here instead.
+    /// attempt starts. Runs that do not start a transfer append here instead.
     latest_log_path: PathBuf,
     /// Lines buffered for the latest log until we know whether this run should
     /// append to the existing latest log or replace it.
@@ -86,7 +86,7 @@ impl RunLog {
     }
 
     /// Flush any buffered lines by appending them to the existing latest log.
-    /// This is used for noteworthy runs that did not actually start rsync.
+    /// This is used for noteworthy runs that did not actually start a transfer.
     pub fn finish(&mut self) {
         if let Err(error) = self.try_finish() {
             log::warn!("Failed to finalize latest run log: {error}");

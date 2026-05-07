@@ -1,4 +1,5 @@
 use std::fs;
+use std::fs::File;
 use std::path::PathBuf;
 
 use assert_cmd::Command;
@@ -48,17 +49,23 @@ server_user: "test"
 server_port: 22
 server_host: "localhost"
 source: "{source}"
+filestructures:
+  nanopore:
+    ignore_globs: []
+    checkout_globs:
+      - "report*.html"
+      - "data.txt"
 
 category:
   - regex: "^ONT_WGS_"
     landing_zone: "{landing_core}"
-    exclude: []
+    filestructure: "nanopore"
     completion_file_globs:
       - "report*.html"
 
   - regex: "^ONT_"
     landing_zone: "{landing_other}"
-    exclude: []
+    filestructure: "nanopore"
     completion_file_globs:
       - "report*.html"
 "#,
@@ -82,11 +89,17 @@ server_user: "test"
 server_port: 22
 server_host: "localhost"
 source: "{source}"
+filestructures:
+  nextseq:
+    ignore_globs: []
+    checkout_globs:
+      - "PrimaryAnalysisMetrics/PrimaryAnalysisMetrics.csv"
+      - "data.txt"
 
 category:
   - regex: "^\\d{{6}}_"
     landing_zone: "{landing}"
-    exclude: []
+    filestructure: "nextseq"
     completion_file_globs:
       - "PrimaryAnalysisMetrics/PrimaryAnalysisMetrics.csv"
 "#,
@@ -192,6 +205,22 @@ fn transfer_log_line_count(fixture: &TestFixture) -> usize {
         .count()
 }
 
+fn tar_entries(path: PathBuf) -> Vec<String> {
+    let file = File::open(path).unwrap();
+    let mut archive = tar::Archive::new(file);
+    archive
+        .entries()
+        .unwrap()
+        .map(|entry| entry.unwrap().path().unwrap().display().to_string())
+        .collect()
+}
+
+fn tar_contains(entries: &[String], relative_path: &str) -> bool {
+    entries
+        .iter()
+        .any(|entry| entry == relative_path || entry == &format!("./{relative_path}"))
+}
+
 #[test]
 fn run_fails_missing_flockdir() {
     let fixture = TestFixture::new("missing-flockdir");
@@ -226,17 +255,25 @@ server_user: "test"
 server_port: 22
 server_host: "localhost"
 source: "{source}"
+filestructures:
+  default:
+    ignore_globs: []
+    checkout_globs:
+      - "report*.html"
+      - "data.txt"
+      - "PrimaryAnalysisMetrics/PrimaryAnalysisMetrics.csv"
+      - "core.marker"
 
 category:
   - regex: "^ONT_WGS_"
     landing_zone: "{landing_core}"
-    exclude: []
+    filestructure: "default"
     completion_file_globs:
       - "report*.html"
 
   - regex: "^ONT_"
     landing_zone: "{root}/no-such-parent/nanopore-landing-other"
-    exclude: []
+    filestructure: "default"
     completion_file_globs:
       - "report*.html"
 "#,
@@ -305,6 +342,322 @@ fn nanopore_transfers_complete_runs() {
 }
 
 #[test]
+fn run_skips_when_landing_zone_run_already_has_transfer_marker() {
+    let fixture = TestFixture::new("landing-marker-present");
+    let config_path = fixture.setup_nanopore();
+    fixture.write_file(
+        "nanopore-landing-core/ONT_WGS_run1/transfer_successful.txt",
+        "",
+    );
+    fixture.write_file(
+        "nanopore-landing-core/ONT_WGS_run1/existing.txt",
+        "existing",
+    );
+
+    cmd()
+        .args(["run", "--config-path"])
+        .arg(&config_path)
+        .assert()
+        .success();
+
+    assert!(
+        !fixture
+            .path("nanopore-landing-core/ONT_WGS_run1/data.txt")
+            .exists()
+    );
+    assert!(
+        fixture
+            .path("nanopore-landing-core/ONT_WGS_run1/existing.txt")
+            .exists()
+    );
+    assert!(
+        fixture
+            .path("nanopore-landing-core/ONT_WGS_run1/transfer_successful.txt")
+            .exists()
+    );
+
+    let run_log = read_run_log(&fixture);
+    assert!(run_log.contains(
+        "Skipped ONT_WGS_run1 because transfer marker is unexpectedly already present in landing zone"
+    ));
+    assert_eq!(
+        read_transfer_log(&fixture)
+            .matches("\"directory\":\"ONT_WGS_run1\"")
+            .count(),
+        0
+    );
+    assert!(
+        fixture
+            .path("nanopore-landing-other/ONT_raw_run2/data.txt")
+            .exists()
+    );
+}
+
+#[test]
+fn archive_files_are_packed_and_archive_directory_removed() {
+    let fixture = TestFixture::new("archive-tar");
+    let config_path = fixture.setup_nanopore();
+    fixture.write_file("nanopore-source/ONT_WGS_run1/raw/pod5.bin", "raw");
+
+    cmd()
+        .args(["run", "--config-path"])
+        .arg(&config_path)
+        .assert()
+        .success();
+
+    let transferred = fixture.path("nanopore-landing-core/ONT_WGS_run1");
+    assert!(transferred.join("report_final.html").exists());
+    assert!(transferred.join("archive.tar").exists());
+    assert!(!transferred.join("sequencer-sync-archive").exists());
+
+    let entries = tar_entries(transferred.join("archive.tar"));
+    assert!(tar_contains(&entries, "raw/pod5.bin"));
+}
+
+#[test]
+fn archive_tar_is_not_created_when_no_files_are_archived() {
+    let fixture = TestFixture::new("no-archive-files");
+    let config_path = fixture.setup_nanopore();
+
+    cmd()
+        .args(["run", "--config-path"])
+        .arg(&config_path)
+        .assert()
+        .success();
+
+    let transferred = fixture.path("nanopore-landing-core/ONT_WGS_run1");
+    assert!(transferred.join("report_final.html").exists());
+    assert!(transferred.join("data.txt").exists());
+    assert!(!transferred.join("archive.tar").exists());
+    assert!(!transferred.join("sequencer-sync-archive").exists());
+}
+
+#[test]
+fn empty_checkout_globs_archives_every_non_ignored_file() {
+    let fixture = TestFixture::new("empty-checkout-archives-all");
+    fixture.mkdir("flockdir");
+    fixture.mkdir("logdir");
+    fixture.mkdir("nanopore-source");
+    fixture.mkdir("nanopore-landing-core");
+    fixture.mkdir("nanopore-source/ONT_WGS_run1");
+    fixture.write_file("nanopore-source/ONT_WGS_run1/report_final.html", "report");
+    fixture.write_file("nanopore-source/ONT_WGS_run1/data/data.txt", "data");
+
+    let config = format!(
+        r#"flockdir: "{flockdir}"
+lock_file_name: "sequencer-sync.lock"
+logdir: "{logdir}"
+server_user: "test"
+server_port: 22
+server_host: "localhost"
+source: "{source}"
+filestructures:
+  archive_only:
+    ignore_globs: []
+    checkout_globs: []
+
+category:
+  - regex: "^ONT_"
+    landing_zone: "{landing}"
+    filestructure: "archive_only"
+    completion_file_globs:
+      - "report*.html"
+"#,
+        flockdir = fixture.path("flockdir").display(),
+        logdir = fixture.path("logdir").display(),
+        source = fixture.path("nanopore-source").display(),
+        landing = fixture.path("nanopore-landing-core").display(),
+    );
+    let config_path = fixture.path("nanopore.yaml");
+    fs::write(&config_path, config).unwrap();
+
+    cmd()
+        .args(["run", "--config-path"])
+        .arg(&config_path)
+        .assert()
+        .success();
+
+    let transferred = fixture.path("nanopore-landing-core/ONT_WGS_run1");
+    assert!(!transferred.join("report_final.html").exists());
+    assert!(!transferred.join("data/data.txt").exists());
+    let entries = tar_entries(transferred.join("archive.tar"));
+    assert!(tar_contains(&entries, "report_final.html"));
+    assert!(tar_contains(&entries, "data/data.txt"));
+}
+
+#[test]
+fn ignored_files_are_absent_from_checkout_and_archive() {
+    let fixture = TestFixture::new("ignored-files");
+    fixture.mkdir("flockdir");
+    fixture.mkdir("logdir");
+    fixture.mkdir("nanopore-source");
+    fixture.mkdir("nanopore-landing-core");
+    fixture.mkdir("nanopore-landing-other");
+    fixture.mkdir("nanopore-source/ONT_WGS_run1");
+    fixture.write_file("nanopore-source/ONT_WGS_run1/report_final.html", "report");
+    fixture.write_file("nanopore-source/ONT_WGS_run1/ignored/secret.txt", "secret");
+    fixture.write_file("nanopore-source/ONT_WGS_run1/raw/pod5.bin", "raw");
+
+    let config = format!(
+        r#"flockdir: "{flockdir}"
+lock_file_name: "sequencer-sync.lock"
+logdir: "{logdir}"
+server_user: "test"
+server_port: 22
+server_host: "localhost"
+source: "{source}"
+filestructures:
+  nanopore:
+    ignore_globs:
+      - "ignored/**"
+    checkout_globs:
+      - "report*.html"
+
+category:
+  - regex: "^ONT_"
+    landing_zone: "{landing}"
+    filestructure: "nanopore"
+    completion_file_globs:
+      - "report*.html"
+"#,
+        flockdir = fixture.path("flockdir").display(),
+        logdir = fixture.path("logdir").display(),
+        source = fixture.path("nanopore-source").display(),
+        landing = fixture.path("nanopore-landing-core").display(),
+    );
+    let config_path = fixture.path("nanopore.yaml");
+    fs::write(&config_path, config).unwrap();
+
+    cmd()
+        .args(["run", "--config-path"])
+        .arg(&config_path)
+        .assert()
+        .success();
+
+    let transferred = fixture.path("nanopore-landing-core/ONT_WGS_run1");
+    assert!(!transferred.join("ignored/secret.txt").exists());
+    let entries = tar_entries(transferred.join("archive.tar"));
+    assert!(!tar_contains(&entries, "ignored/secret.txt"));
+    assert!(tar_contains(&entries, "raw/pod5.bin"));
+}
+
+#[test]
+fn run_fails_before_copy_when_file_matches_ignore_and_checkout() {
+    let fixture = TestFixture::new("conflict-run");
+    fixture.mkdir("flockdir");
+    fixture.mkdir("logdir");
+    fixture.mkdir("nanopore-source");
+    fixture.mkdir("nanopore-landing-core");
+    fixture.mkdir("nanopore-source/ONT_WGS_run1");
+    fixture.write_file("nanopore-source/ONT_WGS_run1/report_final.html", "report");
+    fixture.write_file("nanopore-source/ONT_WGS_run1/conflict.txt", "conflict");
+
+    let config = format!(
+        r#"flockdir: "{flockdir}"
+lock_file_name: "sequencer-sync.lock"
+logdir: "{logdir}"
+server_user: "test"
+server_port: 22
+server_host: "localhost"
+source: "{source}"
+filestructures:
+  nanopore:
+    ignore_globs:
+      - "conflict.txt"
+    checkout_globs:
+      - "report*.html"
+      - "conflict.txt"
+
+category:
+  - regex: "^ONT_"
+    landing_zone: "{landing}"
+    filestructure: "nanopore"
+    completion_file_globs:
+      - "report*.html"
+"#,
+        flockdir = fixture.path("flockdir").display(),
+        logdir = fixture.path("logdir").display(),
+        source = fixture.path("nanopore-source").display(),
+        landing = fixture.path("nanopore-landing-core").display(),
+    );
+    let config_path = fixture.path("nanopore.yaml");
+    fs::write(&config_path, config).unwrap();
+
+    cmd()
+        .args(["run", "--config-path"])
+        .arg(&config_path)
+        .assert()
+        .failure();
+
+    assert!(!fixture.path("nanopore-landing-core/ONT_WGS_run1").exists());
+    assert_eq!(
+        read_transfer_log(&fixture)
+            .matches("\"succeeded\":false")
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn run_fails_when_checkout_file_conflicts_with_internal_archive_dir() {
+    let fixture = TestFixture::new("archive-dir-checkout-conflict");
+    fixture.mkdir("flockdir");
+    fixture.mkdir("logdir");
+    fixture.mkdir("nanopore-source");
+    fixture.mkdir("nanopore-landing-core");
+    fixture.mkdir("nanopore-source/ONT_WGS_run1");
+    fixture.write_file("nanopore-source/ONT_WGS_run1/report_final.html", "report");
+    fixture.write_file(
+        "nanopore-source/ONT_WGS_run1/sequencer-sync-archive",
+        "checkout",
+    );
+
+    let config = format!(
+        r#"flockdir: "{flockdir}"
+lock_file_name: "sequencer-sync.lock"
+logdir: "{logdir}"
+server_user: "test"
+server_port: 22
+server_host: "localhost"
+source: "{source}"
+filestructures:
+  nanopore:
+    ignore_globs: []
+    checkout_globs:
+      - "report*.html"
+      - "sequencer-sync-archive"
+
+category:
+  - regex: "^ONT_"
+    landing_zone: "{landing}"
+    filestructure: "nanopore"
+    completion_file_globs:
+      - "report*.html"
+"#,
+        flockdir = fixture.path("flockdir").display(),
+        logdir = fixture.path("logdir").display(),
+        source = fixture.path("nanopore-source").display(),
+        landing = fixture.path("nanopore-landing-core").display(),
+    );
+    let config_path = fixture.path("nanopore.yaml");
+    fs::write(&config_path, config).unwrap();
+
+    cmd()
+        .args(["run", "--config-path"])
+        .arg(&config_path)
+        .assert()
+        .failure();
+
+    assert!(!fixture.path("nanopore-landing-core/ONT_WGS_run1").exists());
+    assert_eq!(
+        read_transfer_log(&fixture)
+            .matches("\"succeeded\":false")
+            .count(),
+        1
+    );
+}
+
+#[test]
 fn classification_glob_selects_first_matching_category_and_falls_back() {
     let fixture = TestFixture::new("classification-glob");
     fixture.mkdir("flockdir");
@@ -336,18 +689,26 @@ server_user: "test"
 server_port: 22
 server_host: "localhost"
 source: "{source}"
+filestructures:
+  default:
+    ignore_globs: []
+    checkout_globs:
+      - "report*.html"
+      - "data.txt"
+      - "PrimaryAnalysisMetrics/PrimaryAnalysisMetrics.csv"
+      - "core.marker"
 
 category:
   - regex: "^ONT_"
     classification_glob: "core.marker"
     landing_zone: "{landing_core}"
-    exclude: []
+    filestructure: "default"
     completion_file_globs:
       - "report*.html"
 
   - regex: "^ONT_"
     landing_zone: "{landing_other}"
-    exclude: []
+    filestructure: "default"
     completion_file_globs:
       - "report*.html"
 "#,
@@ -471,11 +832,19 @@ server_user: "test"
 server_port: 22
 server_host: "localhost"
 source: "{source}"
+filestructures:
+  default:
+    ignore_globs: []
+    checkout_globs:
+      - "report*.html"
+      - "data.txt"
+      - "PrimaryAnalysisMetrics/PrimaryAnalysisMetrics.csv"
+      - "core.marker"
 
 category:
   - regex: "^\\d{{6}}_"
     landing_zone: "{landing}"
-    exclude: []
+    filestructure: "default"
     completion_file_globs:
       - "PrimaryAnalysisMetrics/PrimaryAnalysisMetrics.csv"
       - "Analysis/*/Data/fastq/Logs/FastqComplete.txt"
@@ -613,7 +982,7 @@ fn retry_failed() {
 }
 
 #[test]
-fn redo_true_retransfers_succeeded_directory() {
+fn redo_true_skips_succeeded_directory_when_landing_marker_is_present() {
     let fixture = TestFixture::new("redo-true");
     let config_path = fixture.setup_nextseq();
 
@@ -643,14 +1012,19 @@ fn redo_true_retransfers_succeeded_directory() {
         .assert()
         .success();
 
-    assert!(transferred_file.exists());
+    assert!(!transferred_file.exists());
 
     let log = read_transfer_log(&fixture);
-    assert!(log.contains("\"redo\":false"));
-    assert!(log.contains("\"succeeded\":true"));
+    assert_eq!(
+        log.matches("\"directory\":\"240101_NB001\"").count(),
+        2,
+        "skipped redo should not append a transfer log entry"
+    );
 
     let run_log = read_run_log(&fixture);
-    assert!(run_log.contains("Transferred directory marked for redo 240101_NB001"));
+    assert!(run_log.contains(
+        "Skipped 240101_NB001 because transfer marker is unexpectedly already present in landing zone"
+    ));
 }
 
 #[test]
@@ -661,12 +1035,94 @@ fn setup_with_skip_ssh_check() {
     cmd()
         .args(["setup", "--config-path"])
         .arg(&config_path)
-        .args(["--skip-ssh-check"])
+        .args(["--skip-ssh-check", "--skip-tree-check"])
         .assert()
         .success();
 
     // Cron file should be created
     assert!(fixture.path("logdir/sequencer-sync.cron").exists());
+}
+
+#[test]
+fn setup_requires_tree_check_decision() {
+    let fixture = TestFixture::new("setup-tree-required");
+    let config_path = fixture.setup_nanopore();
+
+    cmd()
+        .args(["setup", "--config-path"])
+        .arg(&config_path)
+        .args(["--skip-ssh-check"])
+        .assert()
+        .failure();
+}
+
+#[test]
+fn setup_rejects_both_tree_check_options() {
+    let fixture = TestFixture::new("setup-tree-conflict-args");
+    let config_path = fixture.setup_nanopore();
+
+    cmd()
+        .args(["setup", "--config-path"])
+        .arg(&config_path)
+        .args([
+            "--skip-ssh-check",
+            "--skip-tree-check",
+            "--tree-check-source",
+        ])
+        .arg(fixture.path("nanopore-source"))
+        .assert()
+        .failure();
+}
+
+#[test]
+fn setup_tree_check_detects_ignore_checkout_overlap() {
+    let fixture = TestFixture::new("setup-tree-conflict");
+    fixture.mkdir("flockdir");
+    fixture.mkdir("logdir");
+    fixture.mkdir("nanopore-source");
+    fixture.mkdir("nanopore-landing-core");
+    fixture.mkdir("nanopore-source/ONT_WGS_run1");
+    fixture.write_file("nanopore-source/ONT_WGS_run1/report_final.html", "report");
+    fixture.write_file("nanopore-source/ONT_WGS_run1/conflict.txt", "conflict");
+
+    let config = format!(
+        r#"flockdir: "{flockdir}"
+lock_file_name: "sequencer-sync.lock"
+logdir: "{logdir}"
+server_user: "test"
+server_port: 22
+server_host: "localhost"
+source: "{source}"
+filestructures:
+  nanopore:
+    ignore_globs:
+      - "conflict.txt"
+    checkout_globs:
+      - "report*.html"
+      - "conflict.txt"
+
+category:
+  - regex: "^ONT_"
+    landing_zone: "{landing}"
+    filestructure: "nanopore"
+    completion_file_globs:
+      - "report*.html"
+"#,
+        flockdir = fixture.path("flockdir").display(),
+        logdir = fixture.path("logdir").display(),
+        source = fixture.path("nanopore-source").display(),
+        landing = fixture.path("nanopore-landing-core").display(),
+    );
+    let config_path = fixture.path("nanopore.yaml");
+    fs::write(&config_path, config).unwrap();
+
+    cmd()
+        .args(["setup", "--config-path"])
+        .arg(&config_path)
+        .args(["--skip-ssh-check", "--tree-check-source"])
+        .arg(fixture.path("nanopore-source"))
+        .assert()
+        .failure();
 }
 
 #[test]
@@ -678,7 +1134,7 @@ fn setup_fails_malformed_existing_transfer_log() {
     cmd()
         .args(["setup", "--config-path"])
         .arg(&config_path)
-        .args(["--skip-ssh-check"])
+        .args(["--skip-ssh-check", "--skip-tree-check"])
         .assert()
         .failure();
 }
@@ -715,8 +1171,8 @@ fn dry_run_prints_plan_without_copying() {
 }
 
 #[test]
-fn dry_run_shows_exclude_patterns() {
-    let fixture = TestFixture::new("dry-run-exclude");
+fn dry_run_shows_filestructure_patterns() {
+    let fixture = TestFixture::new("dry-run-filestructure");
     fixture.mkdir("flockdir");
     fixture.mkdir("logdir");
     fixture.mkdir("nanopore-source");
@@ -726,7 +1182,6 @@ fn dry_run_shows_exclude_patterns() {
     fixture.mkdir("nanopore-source/ONT_WGS_run1");
     fixture.write_file("nanopore-source/ONT_WGS_run1/report_final.html", "report");
 
-    // Config with exclude patterns
     let config = format!(
         r#"flockdir: "{flockdir}"
 lock_file_name: "sequencer-sync.lock"
@@ -735,17 +1190,25 @@ server_user: "test"
 server_port: 22
 server_host: "localhost"
 source: "{source}"
+filestructures:
+  default:
+    ignore_globs: []
+    checkout_globs:
+      - "report*.html"
+      - "data.txt"
+      - "PrimaryAnalysisMetrics/PrimaryAnalysisMetrics.csv"
+      - "core.marker"
 
 category:
   - regex: "^ONT_WGS_"
     landing_zone: "{landing_core}"
-    exclude: ["/Data", "/AutoCenter"]
+    filestructure: "default"
     completion_file_globs:
       - "report*.html"
 
   - regex: "^ONT_"
     landing_zone: "{landing_other}"
-    exclude: []
+    filestructure: "default"
     completion_file_globs:
       - "report*.html"
 "#,
@@ -766,13 +1229,13 @@ category:
         .unwrap();
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("exclude: /Data"));
-    assert!(stdout.contains("exclude: /AutoCenter"));
+    assert!(stdout.contains("checkout: report*.html"));
+    assert!(stdout.contains("checkout: data.txt"));
 }
 
 #[test]
-fn rsync_excludes_patterns_relative_to_transferred_directory() {
-    let fixture = TestFixture::new("rsync-exclude-patterns");
+fn transfers_checkout_files_preserving_relative_paths() {
+    let fixture = TestFixture::new("checkout-relative-paths");
     fixture.mkdir("flockdir");
     fixture.mkdir("logdir");
     fixture.mkdir("nanopore-source");
@@ -803,17 +1266,25 @@ server_user: "test"
 server_port: 22
 server_host: "localhost"
 source: "{source}"
+filestructures:
+  default:
+    ignore_globs: []
+    checkout_globs:
+      - "report*.html"
+      - "data.txt"
+      - "PrimaryAnalysisMetrics/PrimaryAnalysisMetrics.csv"
+      - "core.marker"
 
 category:
   - regex: "^ONT_WGS_"
     landing_zone: "{landing_core}"
-    exclude: ["/Data", "/AutoCenter"]
+    filestructure: "default"
     completion_file_globs:
       - "report*.html"
 
   - regex: "^ONT_"
     landing_zone: "{landing_other}"
-    exclude: []
+    filestructure: "default"
     completion_file_globs:
       - "report*.html"
 "#,
@@ -853,7 +1324,7 @@ category:
             .exists()
     );
     assert!(
-        fixture
+        !fixture
             .path("nanopore-landing-core/ONT_WGS_run1/other/Data/nested.txt")
             .exists()
     );
@@ -892,7 +1363,7 @@ fn setup_fails_missing_source() {
     cmd()
         .args(["setup", "--config-path"])
         .arg(&config_path)
-        .args(["--skip-ssh-check"])
+        .args(["--skip-ssh-check", "--skip-tree-check"])
         .assert()
         .failure();
 }
@@ -910,7 +1381,7 @@ fn setup_fails_missing_landing_zone() {
     cmd()
         .args(["setup", "--config-path"])
         .arg(&config_path)
-        .args(["--skip-ssh-check"])
+        .args(["--skip-ssh-check", "--skip-tree-check"])
         .assert()
         .failure();
 }
@@ -931,17 +1402,25 @@ server_user: "test"
 server_port: 22
 server_host: "localhost"
 source: "{source}"
+filestructures:
+  default:
+    ignore_globs: []
+    checkout_globs:
+      - "report*.html"
+      - "data.txt"
+      - "PrimaryAnalysisMetrics/PrimaryAnalysisMetrics.csv"
+      - "core.marker"
 
 category:
   - regex: "^ONT_WGS_"
     landing_zone: "{landing}"
-    exclude: []
+    filestructure: "default"
     completion_file_globs:
       - "report*.html"
 
   - regex: "^ONT_"
     landing_zone: "{landing}"
-    exclude: []
+    filestructure: "default"
     completion_file_globs:
       - "report*.html"
 "#,
@@ -956,7 +1435,7 @@ category:
     cmd()
         .args(["setup", "--config-path"])
         .arg(&config_path)
-        .args(["--skip-ssh-check"])
+        .args(["--skip-ssh-check", "--skip-tree-check"])
         .assert()
         .failure();
 }
@@ -976,11 +1455,19 @@ server_user: "test"
 server_port: 22
 server_host: "localhost"
 source: "{source}"
+filestructures:
+  default:
+    ignore_globs: []
+    checkout_globs:
+      - "report*.html"
+      - "data.txt"
+      - "PrimaryAnalysisMetrics/PrimaryAnalysisMetrics.csv"
+      - "core.marker"
 
 category:
   - regex: "^\\d{{6}}_"
     landing_zone: "{shared}"
-    exclude: []
+    filestructure: "default"
     completion_file_globs:
       - "PrimaryAnalysisMetrics/PrimaryAnalysisMetrics.csv"
 "#,
@@ -994,7 +1481,7 @@ category:
     cmd()
         .args(["setup", "--config-path"])
         .arg(&config_path)
-        .args(["--skip-ssh-check"])
+        .args(["--skip-ssh-check", "--skip-tree-check"])
         .assert()
         .failure();
 }

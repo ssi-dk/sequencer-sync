@@ -1,5 +1,7 @@
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use glob::Pattern;
 use regex::Regex;
@@ -23,7 +25,25 @@ pub struct Config {
 
     /// Canonicalized absolute path.
     pub source: PathBuf,
+    // Stored in Arcs, because it's nice that the Category object
+    // also has a reference to them
+    pub filestructures: HashMap<String, Arc<FileStructure>>,
     pub categories: Vec<Category>,
+}
+
+#[derive(Debug)]
+pub struct FileStructure {
+    pub name: String,
+    // We split ignore/checkout into paths and globs because matching a path
+    // is much faster, as it's just a hash check.
+    // Files matching these relative paths are not transferred
+    pub ignore_paths: HashSet<PathBuf>,
+    // Files matching these patterns are not transferred
+    pub ignore_globs: Vec<Pattern>,
+    // Files matching these relative paths are not archived in landing zone
+    pub checkout_paths: HashSet<PathBuf>,
+    // Files matching these patterns are not archived in landing zone
+    pub checkout_globs: Vec<Pattern>,
 }
 
 #[derive(Debug)]
@@ -32,7 +52,7 @@ pub struct Category {
     pub classification_glob: Option<Pattern>,
     /// Canonicalized absolute path.
     pub landing_zone: PathBuf,
-    pub exclude: Vec<String>,
+    pub filestructure: Arc<FileStructure>,
     pub completion_file_globs: Vec<Pattern>,
     /// When true, place runs into a year-based subdirectory under the landing
     /// zone. The year is derived from the directory name by prepending "20" to
@@ -41,6 +61,7 @@ pub struct Category {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct UnvalidatedConfig {
     flockdir: PathBuf,
     lock_file_name: String,
@@ -49,17 +70,26 @@ struct UnvalidatedConfig {
     server_port: u16,
     server_host: String,
     source: PathBuf,
+    filestructures: HashMap<String, UnvalidatedFileStructure>,
     #[serde(default)]
     category: Vec<UnvalidatedCategory>,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UnvalidatedFileStructure {
+    #[serde(default)]
+    ignore_globs: Vec<String>,
+    checkout_globs: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct UnvalidatedCategory {
     regex: String,
     classification_glob: Option<String>,
     landing_zone: PathBuf,
-    #[serde(default)]
-    exclude: Vec<String>,
+    filestructure: String,
     completion_file_globs: Vec<String>,
     #[serde(default)]
     year_subdirectory: bool,
@@ -92,6 +122,10 @@ pub enum ConfigError {
     },
     #[error("config must contain at least one [[category]]")]
     NoCategoriesConfigured,
+    #[error("config must contain at least one filestructure")]
+    NoFileStructuresConfigured,
+    #[error("config category references unknown filestructure `{name}`")]
+    UnknownFileStructure { name: String },
     #[error("config field `{field}` is not a valid regex: {source}")]
     InvalidRegex {
         field: &'static str,
@@ -240,10 +274,19 @@ impl UnvalidatedConfig {
         if self.category.is_empty() {
             return Err(ConfigError::NoCategoriesConfigured);
         }
+        if self.filestructures.is_empty() {
+            return Err(ConfigError::NoFileStructuresConfigured);
+        }
+
+        let mut filestructures = HashMap::with_capacity(self.filestructures.len());
+        for (name, filestructure) in self.filestructures {
+            validate_non_empty("filestructures key", &name)?;
+            filestructures.insert(name.clone(), Arc::new(filestructure.validate(name)?));
+        }
 
         let mut categories = Vec::with_capacity(self.category.len());
         for cat in self.category {
-            categories.push(cat.validate()?);
+            categories.push(cat.validate(&filestructures)?);
         }
 
         Ok(Config {
@@ -254,14 +297,35 @@ impl UnvalidatedConfig {
             server_port: self.server_port,
             server_host: self.server_host,
             source: self.source,
+            filestructures,
             categories,
         })
     }
 }
 
+impl UnvalidatedFileStructure {
+    fn validate(self, name: String) -> Result<FileStructure, ConfigError> {
+        let (ignore_paths, ignore_globs) =
+            validate_file_patterns("filestructures.*.ignore_globs", &self.ignore_globs)?;
+        let (checkout_paths, checkout_globs) =
+            validate_file_patterns("filestructures.*.checkout_globs", &self.checkout_globs)?;
+        Ok(FileStructure {
+            name,
+            ignore_paths,
+            ignore_globs,
+            checkout_paths,
+            checkout_globs,
+        })
+    }
+}
+
 impl UnvalidatedCategory {
-    fn validate(self) -> Result<Category, ConfigError> {
+    fn validate(
+        self,
+        filestructures: &HashMap<String, Arc<FileStructure>>,
+    ) -> Result<Category, ConfigError> {
         validate_absolute_path("category.landing_zone", &self.landing_zone)?;
+        validate_non_empty("category.filestructure", &self.filestructure)?;
 
         let regex = Regex::new(&self.regex).map_err(|source| ConfigError::InvalidRegex {
             field: "category.regex",
@@ -278,12 +342,18 @@ impl UnvalidatedCategory {
             "category.completion_file_globs",
             &self.completion_file_globs,
         )?;
+        let filestructure = filestructures
+            .get(&self.filestructure)
+            .cloned()
+            .ok_or_else(|| ConfigError::UnknownFileStructure {
+                name: self.filestructure.clone(),
+            })?;
 
         Ok(Category {
             regex,
             classification_glob,
             landing_zone: self.landing_zone,
-            exclude: self.exclude,
+            filestructure,
             completion_file_globs,
             year_subdirectory: self.year_subdirectory,
         })
@@ -335,6 +405,29 @@ fn validate_globs(field: &'static str, patterns: &[String]) -> Result<Vec<Patter
         .collect()
 }
 
+fn validate_file_patterns(
+    field: &'static str,
+    patterns: &[String],
+) -> Result<(HashSet<PathBuf>, Vec<Pattern>), ConfigError> {
+    let mut literal_paths = HashSet::new();
+    let mut glob_patterns = Vec::new();
+
+    for pattern in patterns {
+        let glob = validate_glob(field, pattern)?;
+        if is_literal_glob(pattern) {
+            literal_paths.insert(PathBuf::from(pattern));
+        } else {
+            glob_patterns.push(glob);
+        }
+    }
+
+    Ok((literal_paths, glob_patterns))
+}
+
+fn is_literal_glob(pattern: &str) -> bool {
+    !pattern.contains(['*', '?', '[', ']'])
+}
+
 fn validate_all_paths_distinct(paths: &[(&'static str, &Path)]) -> Result<(), ConfigError> {
     for i in 0..paths.len() {
         for j in (i + 1)..paths.len() {
@@ -368,10 +461,18 @@ server_user: "sequencer-sync"
 server_port: 22
 server_host: "sequencer.example.org"
 source: "/data/nextseq"
+filestructures:
+  default:
+    ignore_globs: []
+    checkout_globs:
+      - "report*.html"
+      - "PrimaryAnalysisMetrics/PrimaryAnalysisMetrics.csv"
+      - "Analysis/*/SampleSheet.csv"
 
 category:
   - regex: "^\\d{6}_"
     landing_zone: "/var/lib/sequencer/landing-zone"
+    filestructure: "default"
     completion_file_globs:
       - "PrimaryAnalysisMetrics/PrimaryAnalysisMetrics.csv"
 "#;
@@ -437,6 +538,11 @@ server_user: "sequencer-sync"
 server_port: 22
 server_host: "sequencer.example.org"
 source: "/data/sequencer"
+filestructures:
+  default:
+    ignore_globs: []
+    checkout_globs:
+      - "report*.html"
 "#,
         )
         .expect_err("config with no categories should fail");
@@ -455,10 +561,18 @@ server_user: "sequencer-sync"
 server_port: 22
 server_host: "sequencer.example.org"
 source: "relative/data"
+filestructures:
+  default:
+    ignore_globs: []
+    checkout_globs:
+      - "report*.html"
+      - "PrimaryAnalysisMetrics/PrimaryAnalysisMetrics.csv"
+      - "Analysis/*/SampleSheet.csv"
 
 category:
   - regex: "^\\d{6}_"
     landing_zone: "/var/lib/sequencer/landing-zone"
+    filestructure: "default"
     completion_file_globs:
       - "PrimaryAnalysisMetrics/PrimaryAnalysisMetrics.csv"
 "#,
@@ -475,6 +589,183 @@ category:
     }
 
     #[test]
+    fn rejects_unknown_filestructure_reference() {
+        let error = Config::from_yaml_str(
+            r#"
+flockdir: "/var/lib/sequencer/flock"
+lock_file_name: "sequencer-sync.lock"
+logdir: "/var/lib/sequencer/log"
+server_user: "sequencer-sync"
+server_port: 22
+server_host: "sequencer.example.org"
+source: "/data/sequencer"
+filestructures:
+  default:
+    ignore_globs: []
+    checkout_globs:
+      - "report*.html"
+
+category:
+  - regex: "^run"
+    landing_zone: "/var/lib/sequencer/landing-zone"
+    filestructure: "missing"
+    completion_file_globs:
+      - "complete.txt"
+"#,
+        )
+        .expect_err("unknown filestructure reference should fail");
+
+        assert!(matches!(
+            error,
+            ConfigError::UnknownFileStructure { name } if name == "missing"
+        ));
+    }
+
+    #[test]
+    fn accepts_empty_checkout_globs() {
+        let config = Config::from_yaml_str(
+            r#"
+flockdir: "/var/lib/sequencer/flock"
+lock_file_name: "sequencer-sync.lock"
+logdir: "/var/lib/sequencer/log"
+server_user: "sequencer-sync"
+server_port: 22
+server_host: "sequencer.example.org"
+source: "/data/sequencer"
+filestructures:
+  default:
+    ignore_globs: []
+    checkout_globs: []
+
+category:
+  - regex: "^run"
+    landing_zone: "/var/lib/sequencer/landing-zone"
+    filestructure: "default"
+    completion_file_globs:
+      - "complete.txt"
+"#,
+        )
+        .expect("empty checkout_globs should be valid");
+
+        assert!(config.categories[0].filestructure.checkout_globs.is_empty());
+    }
+
+    #[test]
+    fn stores_literal_filestructure_patterns_as_paths() {
+        let config = Config::from_yaml_str(
+            r#"
+flockdir: "/var/lib/sequencer/flock"
+lock_file_name: "sequencer-sync.lock"
+logdir: "/var/lib/sequencer/log"
+server_user: "sequencer-sync"
+server_port: 22
+server_host: "sequencer.example.org"
+source: "/data/sequencer"
+filestructures:
+  default:
+    ignore_globs:
+      - "skip/file.txt"
+    checkout_globs:
+      - "report.txt"
+
+category:
+  - regex: "^run"
+    landing_zone: "/var/lib/sequencer/landing-zone"
+    filestructure: "default"
+    completion_file_globs:
+      - "complete.txt"
+"#,
+        )
+        .expect("literal filestructure patterns should be valid");
+        let filestructure = &config.categories[0].filestructure;
+
+        assert!(
+            filestructure
+                .ignore_paths
+                .contains(Path::new("skip/file.txt"))
+        );
+        assert!(filestructure.ignore_globs.is_empty());
+        assert!(
+            filestructure
+                .checkout_paths
+                .contains(Path::new("report.txt"))
+        );
+        assert!(filestructure.checkout_globs.is_empty());
+    }
+
+    #[test]
+    fn stores_wildcard_filestructure_patterns_as_globs() {
+        let config = Config::from_yaml_str(
+            r#"
+flockdir: "/var/lib/sequencer/flock"
+lock_file_name: "sequencer-sync.lock"
+logdir: "/var/lib/sequencer/log"
+server_user: "sequencer-sync"
+server_port: 22
+server_host: "sequencer.example.org"
+source: "/data/sequencer"
+filestructures:
+  default:
+    ignore_globs:
+      - "skip/*.txt"
+    checkout_globs:
+      - "report?.txt"
+
+category:
+  - regex: "^run"
+    landing_zone: "/var/lib/sequencer/landing-zone"
+    filestructure: "default"
+    completion_file_globs:
+      - "complete.txt"
+"#,
+        )
+        .expect("wildcard filestructure patterns should be valid");
+        let filestructure = &config.categories[0].filestructure;
+
+        assert!(filestructure.ignore_paths.is_empty());
+        assert_eq!(filestructure.ignore_globs.len(), 1);
+        assert!(filestructure.checkout_paths.is_empty());
+        assert_eq!(filestructure.checkout_globs.len(), 1);
+    }
+
+    #[test]
+    fn rejects_invalid_filestructure_glob() {
+        let error = Config::from_yaml_str(
+            r#"
+flockdir: "/var/lib/sequencer/flock"
+lock_file_name: "sequencer-sync.lock"
+logdir: "/var/lib/sequencer/log"
+server_user: "sequencer-sync"
+server_port: 22
+server_host: "sequencer.example.org"
+source: "/data/sequencer"
+filestructures:
+  default:
+    ignore_globs:
+      - "["
+    checkout_globs:
+      - "report*.html"
+
+category:
+  - regex: "^run"
+    landing_zone: "/var/lib/sequencer/landing-zone"
+    filestructure: "default"
+    completion_file_globs:
+      - "complete.txt"
+"#,
+        )
+        .expect_err("invalid ignore_globs pattern should fail");
+
+        assert!(matches!(
+            error,
+            ConfigError::InvalidGlob {
+                field: "filestructures.*.ignore_globs",
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn rejects_empty_server_user() {
         let error = Config::from_yaml_str(
             r#"
@@ -485,10 +776,18 @@ server_user: "   "
 server_port: 22
 server_host: "sequencer.example.org"
 source: "/data/sequencer"
+filestructures:
+  default:
+    ignore_globs: []
+    checkout_globs:
+      - "report*.html"
+      - "PrimaryAnalysisMetrics/PrimaryAnalysisMetrics.csv"
+      - "Analysis/*/SampleSheet.csv"
 
 category:
   - regex: "^\\d{6}_"
     landing_zone: "/var/lib/sequencer/landing-zone"
+    filestructure: "default"
     completion_file_globs:
       - "PrimaryAnalysisMetrics/PrimaryAnalysisMetrics.csv"
 "#,
@@ -514,15 +813,24 @@ server_user: "sequencer-sync"
 server_port: 22
 server_host: "sequencer.example.org"
 source: "/data/nanopore"
+filestructures:
+  default:
+    ignore_globs: []
+    checkout_globs:
+      - "report*.html"
+      - "PrimaryAnalysisMetrics/PrimaryAnalysisMetrics.csv"
+      - "Analysis/*/SampleSheet.csv"
 
 category:
   - regex: "^ONT_WGS_"
     landing_zone: "/landing/core"
+    filestructure: "default"
     completion_file_globs:
       - "report*.html"
 
   - regex: "^ONT_"
     landing_zone: "/landing/other"
+    filestructure: "default"
     completion_file_globs:
       - "report*.html"
 "#,
@@ -561,15 +869,24 @@ server_user: "sequencer-sync"
 server_port: 22
 server_host: "sequencer.example.org"
 source: "/data/nanopore"
+filestructures:
+  default:
+    ignore_globs: []
+    checkout_globs:
+      - "report*.html"
+      - "PrimaryAnalysisMetrics/PrimaryAnalysisMetrics.csv"
+      - "Analysis/*/SampleSheet.csv"
 
 category:
   - regex: "^ONT_WGS_"
     landing_zone: "/landing/core"
+    filestructure: "default"
     completion_file_globs:
       - "report*.html"
 
   - regex: "^ONT_"
     landing_zone: "/landing/other"
+    filestructure: "default"
     completion_file_globs:
       - "report*.html"
 "#,
@@ -596,15 +913,24 @@ server_user: "sequencer-sync"
 server_port: 22
 server_host: "sequencer.example.org"
 source: "/data/nanopore"
+filestructures:
+  default:
+    ignore_globs: []
+    checkout_globs:
+      - "report*.html"
+      - "PrimaryAnalysisMetrics/PrimaryAnalysisMetrics.csv"
+      - "Analysis/*/SampleSheet.csv"
 
 category:
   - regex: "^ONT_WGS_"
     landing_zone: "/landing/core"
+    filestructure: "default"
     completion_file_globs:
       - "report*.html"
 
   - regex: "^ONT_"
     landing_zone: "/landing/other"
+    filestructure: "default"
     completion_file_globs:
       - "report*.html"
 "#,
@@ -629,10 +955,18 @@ server_user: "sequencer-sync"
 server_port: 22
 server_host: "sequencer.example.org"
 source: "/data/nextseq"
+filestructures:
+  default:
+    ignore_globs: []
+    checkout_globs:
+      - "report*.html"
+      - "PrimaryAnalysisMetrics/PrimaryAnalysisMetrics.csv"
+      - "Analysis/*/SampleSheet.csv"
 
 category:
   - regex: "^\\d{6}_"
     landing_zone: "/var/lib/sequencer/landing-zone"
+    filestructure: "default"
     completion_file_globs: []
 "#,
         )
@@ -657,11 +991,19 @@ server_user: "sequencer-sync"
 server_port: 22
 server_host: "sequencer.example.org"
 source: "/data/nextseq"
+filestructures:
+  default:
+    ignore_globs: []
+    checkout_globs:
+      - "report*.html"
+      - "PrimaryAnalysisMetrics/PrimaryAnalysisMetrics.csv"
+      - "Analysis/*/SampleSheet.csv"
 
 category:
   - regex: "^\\d{6}_"
     classification_glob: "Analysis/*/SampleSheet.csv"
     landing_zone: "/var/lib/sequencer/landing-zone"
+    filestructure: "default"
     completion_file_globs:
       - "PrimaryAnalysisMetrics/PrimaryAnalysisMetrics.csv"
 "#,
@@ -687,11 +1029,19 @@ server_user: "sequencer-sync"
 server_port: 22
 server_host: "sequencer.example.org"
 source: "/data/nextseq"
+filestructures:
+  default:
+    ignore_globs: []
+    checkout_globs:
+      - "report*.html"
+      - "PrimaryAnalysisMetrics/PrimaryAnalysisMetrics.csv"
+      - "Analysis/*/SampleSheet.csv"
 
 category:
   - regex: "^\\d{6}_"
     classification_glob: "["
     landing_zone: "/var/lib/sequencer/landing-zone"
+    filestructure: "default"
     completion_file_globs:
       - "PrimaryAnalysisMetrics/PrimaryAnalysisMetrics.csv"
 "#,
@@ -726,10 +1076,18 @@ server_user: "sequencer-sync"
 server_port: 22
 server_host: "sequencer.example.org"
 source: "{source}"
+filestructures:
+  default:
+    ignore_globs: []
+    checkout_globs:
+      - "report*.html"
+      - "PrimaryAnalysisMetrics/PrimaryAnalysisMetrics.csv"
+      - "Analysis/*/SampleSheet.csv"
 
 category:
   - regex: "^run"
     landing_zone: "{landing_zone}"
+    filestructure: "default"
     completion_file_globs:
       - "complete.txt"
 "#,
@@ -780,10 +1138,18 @@ server_user: "sequencer-sync"
 server_port: 22
 server_host: "sequencer.example.org"
 source: "{source}"
+filestructures:
+  default:
+    ignore_globs: []
+    checkout_globs:
+      - "report*.html"
+      - "PrimaryAnalysisMetrics/PrimaryAnalysisMetrics.csv"
+      - "Analysis/*/SampleSheet.csv"
 
 category:
   - regex: "^run"
     landing_zone: "{landing_zone}"
+    filestructure: "default"
     completion_file_globs:
       - "complete.txt"
 "#,

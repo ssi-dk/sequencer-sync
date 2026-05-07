@@ -16,6 +16,18 @@ server_host: "sequencer.example.org"
 # Each run is assumed to be one directory.
 source: "/data/nanopore"
 
+# Named file layouts used by categories. For every file leaf in a run:
+# - a match in ignore_globs is not copied
+# - a match in checkout_globs is copied at its original relative path
+# - no match is copied into archive.tar
+filestructures:
+  nanopore:
+    ignore_globs:
+      - "*_skip"
+      - "pod5*"
+    checkout_globs:
+      - "*/*/report*.html"
+
 # We might want to distinguish e.g. core facility runs (copy only fastq)
 # versus project runs (copy also raw data), even when those runs have the same
 # directory-name pattern.
@@ -36,10 +48,7 @@ category:
     # Copy to this directory
     landing_zone: "/var/lib/sequencer/landing-zone-core"
 
-    # Passed to rsync command with --exclude
-    exclude:
-      - "*_skip"
-      - "pod5*"
+    filestructure: "nanopore"
 
     # Only if every glob in this list matches at least one file in the
     # directory, we consider the sequencing run complete. Incomplete runs
@@ -56,8 +65,6 @@ category:
 
   - regex: "^ONT_"
     landing_zone: "/var/lib/sequencer/landing-zone-other"
-    exclude:
-      - "*_skip"
-      - "pod5*"
+    filestructure: "nanopore"
     completion_file_globs:
       - "*/*/report*.html"
