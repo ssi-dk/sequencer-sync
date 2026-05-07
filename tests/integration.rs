@@ -43,8 +43,7 @@ impl TestFixture {
 
     fn write_nanopore_config(&self) -> PathBuf {
         let config = format!(
-            r#"flockdir: "{flockdir}"
-lock_file_name: "sequencer-sync.lock"
+            r#"lock_file: "{flockdir}/sequencer-sync.lock"
 logdir: "{logdir}"
 server_user: "test"
 server_port: 22
@@ -56,19 +55,17 @@ filestructures:
     checkout_globs:
       - "report*.html"
       - "data.txt"
+    completion_file_globs:
+      - "report*.html"
 
 category:
   - regex: "^ONT_WGS_"
     landing_zone: "{landing_core}"
     filestructure: "nanopore"
-    completion_file_globs:
-      - "report*.html"
 
   - regex: "^ONT_"
     landing_zone: "{landing_other}"
     filestructure: "nanopore"
-    completion_file_globs:
-      - "report*.html"
 "#,
             flockdir = self.path("flockdir").display(),
             logdir = self.path("logdir").display(),
@@ -83,8 +80,7 @@ category:
 
     fn write_nextseq_config(&self) -> PathBuf {
         let config = format!(
-            r#"flockdir: "{flockdir}"
-lock_file_name: "sequencer-sync.lock"
+            r#"lock_file: "{flockdir}/sequencer-sync.lock"
 logdir: "{logdir}"
 server_user: "test"
 server_port: 22
@@ -96,13 +92,13 @@ filestructures:
     checkout_globs:
       - "PrimaryAnalysisMetrics/PrimaryAnalysisMetrics.csv"
       - "data.txt"
+    completion_file_globs:
+      - "PrimaryAnalysisMetrics/PrimaryAnalysisMetrics.csv"
 
 category:
   - regex: "^\\d{{6}}_"
     landing_zone: "{landing}"
     filestructure: "nextseq"
-    completion_file_globs:
-      - "PrimaryAnalysisMetrics/PrimaryAnalysisMetrics.csv"
 "#,
             flockdir = self.path("flockdir").display(),
             logdir = self.path("logdir").display(),
@@ -234,9 +230,9 @@ fn tar_contains(entries: &[String], relative_path: &str) -> bool {
 }
 
 #[test]
-fn run_fails_missing_flockdir() {
-    let fixture = TestFixture::new("missing-flockdir");
-    // Create source and landing zones but NOT flockdir
+fn run_fails_missing_lock_file_parent() {
+    let fixture = TestFixture::new("missing-lock-parent");
+    // Create source and landing zones but NOT lock file parent directory
     fixture.mkdir("logdir");
     fixture.mkdir("nanopore-source");
     fixture.mkdir("nanopore-landing-core");
@@ -260,8 +256,7 @@ fn run_fails_nonexistent_landing_zone() {
 
     // landing-other points to a nonexistent path — caught at config load time.
     let config = format!(
-        r#"flockdir: "{flockdir}"
-lock_file_name: "sequencer-sync.lock"
+        r#"lock_file: "{flockdir}/sequencer-sync.lock"
 logdir: "{logdir}"
 server_user: "test"
 server_port: 22
@@ -275,19 +270,17 @@ filestructures:
       - "data.txt"
       - "PrimaryAnalysisMetrics/PrimaryAnalysisMetrics.csv"
       - "core.marker"
+    completion_file_globs:
+      - "report*.html"
 
 category:
   - regex: "^ONT_WGS_"
     landing_zone: "{landing_core}"
     filestructure: "default"
-    completion_file_globs:
-      - "report*.html"
 
   - regex: "^ONT_"
     landing_zone: "{root}/no-such-parent/nanopore-landing-other"
     filestructure: "default"
-    completion_file_globs:
-      - "report*.html"
 "#,
         flockdir = fixture.path("flockdir").display(),
         logdir = fixture.path("logdir").display(),
@@ -480,8 +473,7 @@ fn empty_checkout_globs_archives_every_non_ignored_file() {
     fixture.write_file("nanopore-source/ONT_WGS_run1/data/data.txt", "data");
 
     let config = format!(
-        r#"flockdir: "{flockdir}"
-lock_file_name: "sequencer-sync.lock"
+        r#"lock_file: "{flockdir}/sequencer-sync.lock"
 logdir: "{logdir}"
 server_user: "test"
 server_port: 22
@@ -491,13 +483,13 @@ filestructures:
   archive_only:
     ignore_globs: []
     checkout_globs: []
+    completion_file_globs:
+      - "report*.html"
 
 category:
   - regex: "^ONT_"
     landing_zone: "{landing}"
     filestructure: "archive_only"
-    completion_file_globs:
-      - "report*.html"
 "#,
         flockdir = fixture.path("flockdir").display(),
         logdir = fixture.path("logdir").display(),
@@ -535,8 +527,7 @@ fn ignored_files_are_absent_from_checkout_and_archive() {
     fixture.write_file("nanopore-source/ONT_WGS_run1/raw/pod5.bin", "raw");
 
     let config = format!(
-        r#"flockdir: "{flockdir}"
-lock_file_name: "sequencer-sync.lock"
+        r#"lock_file: "{flockdir}/sequencer-sync.lock"
 logdir: "{logdir}"
 server_user: "test"
 server_port: 22
@@ -548,13 +539,13 @@ filestructures:
       - "ignored/**"
     checkout_globs:
       - "report*.html"
+    completion_file_globs:
+      - "report*.html"
 
 category:
   - regex: "^ONT_"
     landing_zone: "{landing}"
     filestructure: "nanopore"
-    completion_file_globs:
-      - "report*.html"
 "#,
         flockdir = fixture.path("flockdir").display(),
         logdir = fixture.path("logdir").display(),
@@ -589,8 +580,7 @@ fn run_fails_before_copy_when_file_matches_ignore_and_checkout() {
     fixture.write_file("nanopore-source/ONT_WGS_run1/conflict.txt", "conflict");
 
     let config = format!(
-        r#"flockdir: "{flockdir}"
-lock_file_name: "sequencer-sync.lock"
+        r#"lock_file: "{flockdir}/sequencer-sync.lock"
 logdir: "{logdir}"
 server_user: "test"
 server_port: 22
@@ -603,13 +593,13 @@ filestructures:
     checkout_globs:
       - "report*.html"
       - "conflict.txt"
+    completion_file_globs:
+      - "report*.html"
 
 category:
   - regex: "^ONT_"
     landing_zone: "{landing}"
     filestructure: "nanopore"
-    completion_file_globs:
-      - "report*.html"
 "#,
         flockdir = fixture.path("flockdir").display(),
         logdir = fixture.path("logdir").display(),
@@ -649,8 +639,7 @@ fn run_fails_when_checkout_file_conflicts_with_internal_archive_dir() {
     );
 
     let config = format!(
-        r#"flockdir: "{flockdir}"
-lock_file_name: "sequencer-sync.lock"
+        r#"lock_file: "{flockdir}/sequencer-sync.lock"
 logdir: "{logdir}"
 server_user: "test"
 server_port: 22
@@ -662,13 +651,13 @@ filestructures:
     checkout_globs:
       - "report*.html"
       - "sequencer-sync-archive.gz"
+    completion_file_globs:
+      - "report*.html"
 
 category:
   - regex: "^ONT_"
     landing_zone: "{landing}"
     filestructure: "nanopore"
-    completion_file_globs:
-      - "report*.html"
 "#,
         flockdir = fixture.path("flockdir").display(),
         logdir = fixture.path("logdir").display(),
@@ -718,8 +707,7 @@ fn classification_glob_selects_first_matching_category_and_falls_back() {
     fixture.write_file("nanopore-source/ONT_run_without_marker/data.txt", "data");
 
     let config = format!(
-        r#"flockdir: "{flockdir}"
-lock_file_name: "sequencer-sync.lock"
+        r#"lock_file: "{flockdir}/sequencer-sync.lock"
 logdir: "{logdir}"
 server_user: "test"
 server_port: 22
@@ -733,20 +721,18 @@ filestructures:
       - "data.txt"
       - "PrimaryAnalysisMetrics/PrimaryAnalysisMetrics.csv"
       - "core.marker"
+    completion_file_globs:
+      - "report*.html"
 
 category:
   - regex: "^ONT_"
     classification_glob: "core.marker"
     landing_zone: "{landing_core}"
     filestructure: "default"
-    completion_file_globs:
-      - "report*.html"
 
   - regex: "^ONT_"
     landing_zone: "{landing_other}"
     filestructure: "default"
-    completion_file_globs:
-      - "report*.html"
 "#,
         flockdir = fixture.path("flockdir").display(),
         logdir = fixture.path("logdir").display(),
@@ -861,8 +847,7 @@ fn nextseq_requires_all_completion_globs() {
     fixture.write_file("nextseq-source/240101_NB001/data.txt", "data");
 
     let config = format!(
-        r#"flockdir: "{flockdir}"
-lock_file_name: "sequencer-sync.lock"
+        r#"lock_file: "{flockdir}/sequencer-sync.lock"
 logdir: "{logdir}"
 server_user: "test"
 server_port: 22
@@ -872,18 +857,16 @@ filestructures:
   default:
     ignore_globs: []
     checkout_globs:
-      - "report*.html"
-      - "data.txt"
       - "PrimaryAnalysisMetrics/PrimaryAnalysisMetrics.csv"
-      - "core.marker"
+      - "data.txt"
+    completion_file_globs:
+      - "PrimaryAnalysisMetrics/PrimaryAnalysisMetrics.csv"
+      - "Analysis/*/Data/fastq/Logs/FastqComplete.txt"
 
 category:
   - regex: "^\\d{{6}}_"
     landing_zone: "{landing}"
     filestructure: "default"
-    completion_file_globs:
-      - "PrimaryAnalysisMetrics/PrimaryAnalysisMetrics.csv"
-      - "Analysis/*/Data/fastq/Logs/FastqComplete.txt"
 "#,
         flockdir = fixture.path("flockdir").display(),
         logdir = fixture.path("logdir").display(),
@@ -1122,8 +1105,7 @@ fn setup_tree_check_detects_ignore_checkout_overlap() {
     fixture.write_file("nanopore-source/ONT_WGS_run1/conflict.txt", "conflict");
 
     let config = format!(
-        r#"flockdir: "{flockdir}"
-lock_file_name: "sequencer-sync.lock"
+        r#"lock_file: "{flockdir}/sequencer-sync.lock"
 logdir: "{logdir}"
 server_user: "test"
 server_port: 22
@@ -1136,13 +1118,13 @@ filestructures:
     checkout_globs:
       - "report*.html"
       - "conflict.txt"
+    completion_file_globs:
+      - "report*.html"
 
 category:
   - regex: "^ONT_"
     landing_zone: "{landing}"
     filestructure: "nanopore"
-    completion_file_globs:
-      - "report*.html"
 "#,
         flockdir = fixture.path("flockdir").display(),
         logdir = fixture.path("logdir").display(),
@@ -1219,8 +1201,7 @@ fn dry_run_shows_filestructure_patterns() {
     fixture.write_file("nanopore-source/ONT_WGS_run1/report_final.html", "report");
 
     let config = format!(
-        r#"flockdir: "{flockdir}"
-lock_file_name: "sequencer-sync.lock"
+        r#"lock_file: "{flockdir}/sequencer-sync.lock"
 logdir: "{logdir}"
 server_user: "test"
 server_port: 22
@@ -1234,19 +1215,17 @@ filestructures:
       - "data.txt"
       - "PrimaryAnalysisMetrics/PrimaryAnalysisMetrics.csv"
       - "core.marker"
+    completion_file_globs:
+      - "report*.html"
 
 category:
   - regex: "^ONT_WGS_"
     landing_zone: "{landing_core}"
     filestructure: "default"
-    completion_file_globs:
-      - "report*.html"
 
   - regex: "^ONT_"
     landing_zone: "{landing_other}"
     filestructure: "default"
-    completion_file_globs:
-      - "report*.html"
 "#,
         flockdir = fixture.path("flockdir").display(),
         logdir = fixture.path("logdir").display(),
@@ -1295,8 +1274,7 @@ fn transfers_checkout_files_preserving_relative_paths() {
     );
 
     let config = format!(
-        r#"flockdir: "{flockdir}"
-lock_file_name: "sequencer-sync.lock"
+        r#"lock_file: "{flockdir}/sequencer-sync.lock"
 logdir: "{logdir}"
 server_user: "test"
 server_port: 22
@@ -1310,19 +1288,17 @@ filestructures:
       - "data.txt"
       - "PrimaryAnalysisMetrics/PrimaryAnalysisMetrics.csv"
       - "core.marker"
+    completion_file_globs:
+      - "report*.html"
 
 category:
   - regex: "^ONT_WGS_"
     landing_zone: "{landing_core}"
     filestructure: "default"
-    completion_file_globs:
-      - "report*.html"
 
   - regex: "^ONT_"
     landing_zone: "{landing_other}"
     filestructure: "default"
-    completion_file_globs:
-      - "report*.html"
 "#,
         flockdir = fixture.path("flockdir").display(),
         logdir = fixture.path("logdir").display(),
@@ -1431,8 +1407,7 @@ fn setup_fails_duplicate_landing_zones() {
     let shared_landing = fixture.mkdir("nanopore-landing-shared");
 
     let config = format!(
-        r#"flockdir: "{flockdir}"
-lock_file_name: "sequencer-sync.lock"
+        r#"lock_file: "{flockdir}/sequencer-sync.lock"
 logdir: "{logdir}"
 server_user: "test"
 server_port: 22
@@ -1446,19 +1421,17 @@ filestructures:
       - "data.txt"
       - "PrimaryAnalysisMetrics/PrimaryAnalysisMetrics.csv"
       - "core.marker"
+    completion_file_globs:
+      - "report*.html"
 
 category:
   - regex: "^ONT_WGS_"
     landing_zone: "{landing}"
     filestructure: "default"
-    completion_file_globs:
-      - "report*.html"
 
   - regex: "^ONT_"
     landing_zone: "{landing}"
     filestructure: "default"
-    completion_file_globs:
-      - "report*.html"
 "#,
         flockdir = fixture.path("flockdir").display(),
         logdir = fixture.path("logdir").display(),
@@ -1477,15 +1450,14 @@ category:
 }
 
 #[test]
-fn setup_fails_landing_zone_equals_flockdir() {
+fn setup_fails_landing_zone_equals_lock_file_parent() {
     let fixture = TestFixture::new("setup-landing-is-flock");
     let shared = fixture.mkdir("shared");
     fixture.mkdir("logdir");
     fixture.mkdir("nextseq-source");
 
     let config = format!(
-        r#"flockdir: "{shared}"
-lock_file_name: "sequencer-sync.lock"
+        r#"lock_file: "{shared}/sequencer-sync.lock"
 logdir: "{logdir}"
 server_user: "test"
 server_port: 22
@@ -1495,17 +1467,15 @@ filestructures:
   default:
     ignore_globs: []
     checkout_globs:
-      - "report*.html"
-      - "data.txt"
       - "PrimaryAnalysisMetrics/PrimaryAnalysisMetrics.csv"
-      - "core.marker"
+      - "data.txt"
+    completion_file_globs:
+      - "PrimaryAnalysisMetrics/PrimaryAnalysisMetrics.csv"
 
 category:
   - regex: "^\\d{{6}}_"
     landing_zone: "{shared}"
     filestructure: "default"
-    completion_file_globs:
-      - "PrimaryAnalysisMetrics/PrimaryAnalysisMetrics.csv"
 "#,
         shared = shared.display(),
         logdir = fixture.path("logdir").display(),

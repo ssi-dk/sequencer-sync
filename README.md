@@ -41,5 +41,5 @@ When `sequencer-sync run` is invoked, it:
 * `sequencer-sync run`: Synchronize files to the landing zone
 	* `--config-path` (required): path to config file to load, see our deploy repo
 	* `--retry-failed` A failed transfer is logged as unsuccessful in the `log/transferred-direcotries.jsonl` and skipped in future runs. If this flag is set, failed directories are not skipped (unless they also appear as succeeded later in the log).
-	* `--transfer-incomplete` Data from sequencing runs are only considered complete if every glob in `completion_file_globs` matches at least one file. Without this flag set, incomplete runs are skipped.
+	* `--transfer-incomplete` Data from sequencing runs are only considered complete if every glob in the matched file structure's `completion_file_globs` matches at least one file. Without this flag set, incomplete runs are skipped.
 	* `--skip-compress`: write archive files as `archive.tar` instead of gzip-compressing them as `archive.tar.gz`.
