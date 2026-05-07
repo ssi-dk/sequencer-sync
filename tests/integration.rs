@@ -3,6 +3,7 @@ use std::fs::File;
 use std::path::PathBuf;
 
 use assert_cmd::Command;
+use flate2::read::GzDecoder;
 
 struct TestFixture {
     root: PathBuf,
@@ -215,6 +216,17 @@ fn tar_entries(path: PathBuf) -> Vec<String> {
         .collect()
 }
 
+fn tar_gz_entries(path: PathBuf) -> Vec<String> {
+    let file = File::open(path).unwrap();
+    let decoder = GzDecoder::new(file);
+    let mut archive = tar::Archive::new(decoder);
+    archive
+        .entries()
+        .unwrap()
+        .map(|entry| entry.unwrap().path().unwrap().display().to_string())
+        .collect()
+}
+
 fn tar_contains(entries: &[String], relative_path: &str) -> bool {
     entries
         .iter()
@@ -407,7 +419,30 @@ fn archive_files_are_packed_and_archive_directory_removed() {
 
     let transferred = fixture.path("nanopore-landing-core/ONT_WGS_run1");
     assert!(transferred.join("report_final.html").exists());
+    assert!(transferred.join("archive.tar.gz").exists());
+    assert!(!transferred.join("archive.tar").exists());
+    assert!(!transferred.join("sequencer-sync-archive").exists());
+
+    let entries = tar_gz_entries(transferred.join("archive.tar.gz"));
+    assert!(tar_contains(&entries, "raw/pod5.bin"));
+}
+
+#[test]
+fn archive_files_are_not_compressed_with_skip_compress() {
+    let fixture = TestFixture::new("archive-tar-uncompressed");
+    let config_path = fixture.setup_nanopore();
+    fixture.write_file("nanopore-source/ONT_WGS_run1/raw/pod5.bin", "raw");
+
+    cmd()
+        .args(["run", "--config-path"])
+        .arg(&config_path)
+        .args(["--skip-compress"])
+        .assert()
+        .success();
+
+    let transferred = fixture.path("nanopore-landing-core/ONT_WGS_run1");
     assert!(transferred.join("archive.tar").exists());
+    assert!(!transferred.join("archive.tar.gz").exists());
     assert!(!transferred.join("sequencer-sync-archive").exists());
 
     let entries = tar_entries(transferred.join("archive.tar"));
@@ -429,6 +464,7 @@ fn archive_tar_is_not_created_when_no_files_are_archived() {
     assert!(transferred.join("report_final.html").exists());
     assert!(transferred.join("data.txt").exists());
     assert!(!transferred.join("archive.tar").exists());
+    assert!(!transferred.join("archive.tar.gz").exists());
     assert!(!transferred.join("sequencer-sync-archive").exists());
 }
 
@@ -480,7 +516,7 @@ category:
     let transferred = fixture.path("nanopore-landing-core/ONT_WGS_run1");
     assert!(!transferred.join("report_final.html").exists());
     assert!(!transferred.join("data/data.txt").exists());
-    let entries = tar_entries(transferred.join("archive.tar"));
+    let entries = tar_gz_entries(transferred.join("archive.tar.gz"));
     assert!(tar_contains(&entries, "report_final.html"));
     assert!(tar_contains(&entries, "data/data.txt"));
 }
@@ -536,7 +572,7 @@ category:
 
     let transferred = fixture.path("nanopore-landing-core/ONT_WGS_run1");
     assert!(!transferred.join("ignored/secret.txt").exists());
-    let entries = tar_entries(transferred.join("archive.tar"));
+    let entries = tar_gz_entries(transferred.join("archive.tar.gz"));
     assert!(!tar_contains(&entries, "ignored/secret.txt"));
     assert!(tar_contains(&entries, "raw/pod5.bin"));
 }
@@ -608,7 +644,7 @@ fn run_fails_when_checkout_file_conflicts_with_internal_archive_dir() {
     fixture.mkdir("nanopore-source/ONT_WGS_run1");
     fixture.write_file("nanopore-source/ONT_WGS_run1/report_final.html", "report");
     fixture.write_file(
-        "nanopore-source/ONT_WGS_run1/sequencer-sync-archive",
+        "nanopore-source/ONT_WGS_run1/sequencer-sync-archive.gz",
         "checkout",
     );
 
@@ -625,7 +661,7 @@ filestructures:
     ignore_globs: []
     checkout_globs:
       - "report*.html"
-      - "sequencer-sync-archive"
+      - "sequencer-sync-archive.gz"
 
 category:
   - regex: "^ONT_"
