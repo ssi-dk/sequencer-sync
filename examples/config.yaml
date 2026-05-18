@@ -1,5 +1,6 @@
 # Lock file path (prevents concurrent runs). The parent directory must exist
 # and be writeable.
+version: 2
 lock_file: "/var/lib/sequencer/flock/sequencer-sync.lock"
 
 # Writeable directory for log files (transfer log, run log, cron file)

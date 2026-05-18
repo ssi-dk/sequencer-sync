@@ -43,7 +43,8 @@ impl TestFixture {
 
     fn write_nanopore_config(&self) -> PathBuf {
         let config = format!(
-            r#"lock_file: "{flockdir}/sequencer-sync.lock"
+            r#"version: 2
+lock_file: "{flockdir}/sequencer-sync.lock"
 logdir: "{logdir}"
 server_user: "test"
 server_port: 22
@@ -80,7 +81,8 @@ category:
 
     fn write_nextseq_config(&self) -> PathBuf {
         let config = format!(
-            r#"lock_file: "{flockdir}/sequencer-sync.lock"
+            r#"version: 2
+lock_file: "{flockdir}/sequencer-sync.lock"
 logdir: "{logdir}"
 server_user: "test"
 server_port: 22
@@ -256,7 +258,8 @@ fn run_fails_nonexistent_landing_zone() {
 
     // landing-other points to a nonexistent path — caught at config load time.
     let config = format!(
-        r#"lock_file: "{flockdir}/sequencer-sync.lock"
+        r#"version: 2
+lock_file: "{flockdir}/sequencer-sync.lock"
 logdir: "{logdir}"
 server_user: "test"
 server_port: 22
@@ -473,7 +476,8 @@ fn empty_checkout_globs_archives_every_non_ignored_file() {
     fixture.write_file("nanopore-source/ONT_WGS_run1/data/data.txt", "data");
 
     let config = format!(
-        r#"lock_file: "{flockdir}/sequencer-sync.lock"
+        r#"version: 2
+lock_file: "{flockdir}/sequencer-sync.lock"
 logdir: "{logdir}"
 server_user: "test"
 server_port: 22
@@ -527,7 +531,8 @@ fn ignored_files_are_absent_from_checkout_and_archive() {
     fixture.write_file("nanopore-source/ONT_WGS_run1/raw/pod5.bin", "raw");
 
     let config = format!(
-        r#"lock_file: "{flockdir}/sequencer-sync.lock"
+        r#"version: 2
+lock_file: "{flockdir}/sequencer-sync.lock"
 logdir: "{logdir}"
 server_user: "test"
 server_port: 22
@@ -580,7 +585,8 @@ fn run_fails_before_copy_when_file_matches_ignore_and_checkout() {
     fixture.write_file("nanopore-source/ONT_WGS_run1/conflict.txt", "conflict");
 
     let config = format!(
-        r#"lock_file: "{flockdir}/sequencer-sync.lock"
+        r#"version: 2
+lock_file: "{flockdir}/sequencer-sync.lock"
 logdir: "{logdir}"
 server_user: "test"
 server_port: 22
@@ -639,7 +645,8 @@ fn run_fails_when_checkout_file_conflicts_with_internal_archive_dir() {
     );
 
     let config = format!(
-        r#"lock_file: "{flockdir}/sequencer-sync.lock"
+        r#"version: 2
+lock_file: "{flockdir}/sequencer-sync.lock"
 logdir: "{logdir}"
 server_user: "test"
 server_port: 22
@@ -707,7 +714,8 @@ fn classification_glob_selects_first_matching_category_and_falls_back() {
     fixture.write_file("nanopore-source/ONT_run_without_marker/data.txt", "data");
 
     let config = format!(
-        r#"lock_file: "{flockdir}/sequencer-sync.lock"
+        r#"version: 2
+lock_file: "{flockdir}/sequencer-sync.lock"
 logdir: "{logdir}"
 server_user: "test"
 server_port: 22
@@ -847,7 +855,8 @@ fn nextseq_requires_all_completion_globs() {
     fixture.write_file("nextseq-source/240101_NB001/data.txt", "data");
 
     let config = format!(
-        r#"lock_file: "{flockdir}/sequencer-sync.lock"
+        r#"version: 2
+lock_file: "{flockdir}/sequencer-sync.lock"
 logdir: "{logdir}"
 server_user: "test"
 server_port: 22
@@ -1105,7 +1114,8 @@ fn setup_tree_check_detects_ignore_checkout_overlap() {
     fixture.write_file("nanopore-source/ONT_WGS_run1/conflict.txt", "conflict");
 
     let config = format!(
-        r#"lock_file: "{flockdir}/sequencer-sync.lock"
+        r#"version: 2
+lock_file: "{flockdir}/sequencer-sync.lock"
 logdir: "{logdir}"
 server_user: "test"
 server_port: 22
@@ -1201,7 +1211,8 @@ fn dry_run_shows_filestructure_patterns() {
     fixture.write_file("nanopore-source/ONT_WGS_run1/report_final.html", "report");
 
     let config = format!(
-        r#"lock_file: "{flockdir}/sequencer-sync.lock"
+        r#"version: 2
+lock_file: "{flockdir}/sequencer-sync.lock"
 logdir: "{logdir}"
 server_user: "test"
 server_port: 22
@@ -1274,7 +1285,8 @@ fn transfers_checkout_files_preserving_relative_paths() {
     );
 
     let config = format!(
-        r#"lock_file: "{flockdir}/sequencer-sync.lock"
+        r#"version: 2
+lock_file: "{flockdir}/sequencer-sync.lock"
 logdir: "{logdir}"
 server_user: "test"
 server_port: 22
@@ -1407,7 +1419,8 @@ fn setup_fails_duplicate_landing_zones() {
     let shared_landing = fixture.mkdir("nanopore-landing-shared");
 
     let config = format!(
-        r#"lock_file: "{flockdir}/sequencer-sync.lock"
+        r#"version: 2
+lock_file: "{flockdir}/sequencer-sync.lock"
 logdir: "{logdir}"
 server_user: "test"
 server_port: 22
@@ -1457,7 +1470,8 @@ fn setup_fails_landing_zone_equals_lock_file_parent() {
     fixture.mkdir("nextseq-source");
 
     let config = format!(
-        r#"lock_file: "{shared}/sequencer-sync.lock"
+        r#"version: 2
+lock_file: "{shared}/sequencer-sync.lock"
 logdir: "{logdir}"
 server_user: "test"
 server_port: 22
