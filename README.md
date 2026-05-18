@@ -27,6 +27,9 @@ When `sequencer-sync run` is invoked, it:
 - If "redo" is manually set to true in the JSONL transfer log, previously transferred directories are re-transferred 
 - When the same directory is present multiple times in the transfer log, later entries override earlier.
 
+## Config
+Config files must include `version: 2`. If the config version is not supported by this binary, `sequencer-sync` exits before validating the rest of the config.
+
 ## Misc information
 * The file lock is not necessarily held if the lock file exists. Instead, the lock is managed with
   `flock()` system calls. Use the `flock` tool to check if the lock is held.

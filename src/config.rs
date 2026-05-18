@@ -8,6 +8,8 @@ use regex::Regex;
 use serde::Deserialize;
 use thiserror::Error;
 
+const SUPPORTED_CONFIG_VERSION: u16 = 2;
+
 #[derive(Debug)]
 pub struct Config {
     /// Absolute path to the lock file. Its parent directory is canonicalized.
@@ -59,8 +61,14 @@ pub struct Category {
 }
 
 #[derive(Debug, Deserialize)]
+struct ConfigHeader {
+    version: u16,
+}
+
+#[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct UnvalidatedConfig {
+    version: u16,
     lock_file: PathBuf,
     logdir: PathBuf,
     server_user: String,
@@ -102,6 +110,8 @@ pub enum ConfigError {
     },
     #[error("failed to parse YAML config: {0}")]
     Parse(serde_yaml::Error),
+    #[error("unsupported config version {found}; this binary supports config version {supported}")]
+    UnsupportedVersion { found: u16, supported: u16 },
     #[error("config field `{field}` must not be empty")]
     EmptyField { field: &'static str },
     #[error("config field `{field}` must not be 0")]
@@ -175,8 +185,17 @@ impl Config {
 
     // Note: This doesn't canonicalize paths!
     pub(crate) fn from_yaml_str(contents: &str) -> Result<Self, ConfigError> {
-        let config: UnvalidatedConfig =
-            serde_yaml::from_str(contents).map_err(ConfigError::Parse)?;
+        let config: UnvalidatedConfig = match serde_yaml::from_str(contents) {
+            Ok(config) => config,
+            Err(parse_error) => {
+                if let Ok(header) = serde_yaml::from_str::<ConfigHeader>(contents) {
+                    validate_config_version(header.version)?;
+                }
+                return Err(ConfigError::Parse(parse_error));
+            }
+        };
+
+        validate_config_version(config.version)?;
         config.validate()
     }
 
@@ -203,6 +222,17 @@ impl Config {
         validate_all_paths_distinct(&paths)?;
 
         Ok(())
+    }
+}
+
+fn validate_config_version(version: u16) -> Result<(), ConfigError> {
+    if version == SUPPORTED_CONFIG_VERSION {
+        Ok(())
+    } else {
+        Err(ConfigError::UnsupportedVersion {
+            found: version,
+            supported: SUPPORTED_CONFIG_VERSION,
+        })
     }
 }
 
@@ -479,6 +509,7 @@ mod tests {
 
     const EXAMPLE_CONFIG: &str = include_str!("../examples/config.yaml");
     const NEXTSEQ_EXAMPLE: &str = r#"
+version: 2
 lock_file: "/var/lib/sequencer/flock/sequencer-sync.lock"
 logdir: "/var/lib/sequencer/log"
 server_user: "sequencer-sync"
@@ -556,9 +587,53 @@ category:
     }
 
     #[test]
+    fn rejects_unsupported_config_version() {
+        let contents = NEXTSEQ_EXAMPLE.replace("version: 2", "version: 3");
+
+        let error =
+            Config::from_yaml_str(&contents).expect_err("unsupported config version should fail");
+
+        assert!(matches!(
+            error,
+            ConfigError::UnsupportedVersion {
+                found: 3,
+                supported: 2
+            }
+        ));
+    }
+
+    #[test]
+    fn rejects_unsupported_config_version_before_reporting_incompatible_shape() {
+        let contents =
+            NEXTSEQ_EXAMPLE.replacen("version: 2", "version: 3\nfuture_required_field: true", 1);
+
+        let error = Config::from_yaml_str(&contents)
+            .expect_err("unsupported future config shape should report version first");
+
+        assert!(matches!(
+            error,
+            ConfigError::UnsupportedVersion {
+                found: 3,
+                supported: 2
+            }
+        ));
+    }
+
+    #[test]
+    fn rejects_missing_config_version() {
+        let contents = NEXTSEQ_EXAMPLE.replace("version: 2\n", "");
+
+        let error =
+            Config::from_yaml_str(&contents).expect_err("missing config version should fail");
+
+        assert!(matches!(error, ConfigError::Parse(_)));
+    }
+
+    #[test]
     fn rejects_config_with_no_categories() {
         let error = Config::from_yaml_str(
             r#"
+version: 2
 lock_file: "/var/lib/sequencer/flock/sequencer-sync.lock"
 logdir: "/var/lib/sequencer/log"
 server_user: "sequencer-sync"
@@ -583,6 +658,7 @@ filestructures:
     fn rejects_relative_source_path() {
         let error = Config::from_yaml_str(
             r#"
+version: 2
 lock_file: "/var/lib/sequencer/flock/sequencer-sync.lock"
 logdir: "/var/lib/sequencer/log"
 server_user: "sequencer-sync"
@@ -619,6 +695,7 @@ category:
     fn rejects_unknown_filestructure_reference() {
         let error = Config::from_yaml_str(
             r#"
+version: 2
 lock_file: "/var/lib/sequencer/flock/sequencer-sync.lock"
 logdir: "/var/lib/sequencer/log"
 server_user: "sequencer-sync"
@@ -651,6 +728,7 @@ category:
     fn accepts_empty_checkout_globs() {
         let config = Config::from_yaml_str(
             r#"
+version: 2
 lock_file: "/var/lib/sequencer/flock/sequencer-sync.lock"
 logdir: "/var/lib/sequencer/log"
 server_user: "sequencer-sync"
@@ -679,6 +757,7 @@ category:
     fn stores_literal_filestructure_patterns_as_paths() {
         let config = Config::from_yaml_str(
             r#"
+version: 2
 lock_file: "/var/lib/sequencer/flock/sequencer-sync.lock"
 logdir: "/var/lib/sequencer/log"
 server_user: "sequencer-sync"
@@ -721,6 +800,7 @@ category:
     fn stores_wildcard_filestructure_patterns_as_globs() {
         let config = Config::from_yaml_str(
             r#"
+version: 2
 lock_file: "/var/lib/sequencer/flock/sequencer-sync.lock"
 logdir: "/var/lib/sequencer/log"
 server_user: "sequencer-sync"
@@ -755,6 +835,7 @@ category:
     fn rejects_invalid_filestructure_glob() {
         let error = Config::from_yaml_str(
             r#"
+version: 2
 lock_file: "/var/lib/sequencer/flock/sequencer-sync.lock"
 logdir: "/var/lib/sequencer/log"
 server_user: "sequencer-sync"
@@ -791,6 +872,7 @@ category:
     fn rejects_empty_server_user() {
         let error = Config::from_yaml_str(
             r#"
+version: 2
 lock_file: "/var/lib/sequencer/flock/sequencer-sync.lock"
 logdir: "/var/lib/sequencer/log"
 server_user: "   "
@@ -826,6 +908,7 @@ category:
     fn classify_matches_first_regex() {
         let config = Config::from_yaml_str(
             r#"
+version: 2
 lock_file: "/var/lib/sequencer/flock/sequencer-sync.lock"
 logdir: "/var/lib/sequencer/log"
 server_user: "sequencer-sync"
@@ -880,6 +963,7 @@ category:
     fn classify_first_match_wins() {
         let config = Config::from_yaml_str(
             r#"
+version: 2
 lock_file: "/var/lib/sequencer/flock/sequencer-sync.lock"
 logdir: "/var/lib/sequencer/log"
 server_user: "sequencer-sync"
@@ -922,6 +1006,7 @@ category:
     fn classify_returns_none_for_unmatched() {
         let config = Config::from_yaml_str(
             r#"
+version: 2
 lock_file: "/var/lib/sequencer/flock/sequencer-sync.lock"
 logdir: "/var/lib/sequencer/log"
 server_user: "sequencer-sync"
@@ -962,6 +1047,7 @@ category:
     fn rejects_empty_completion_glob_list() {
         let error = Config::from_yaml_str(
             r#"
+version: 2
 lock_file: "/var/lib/sequencer/flock/sequencer-sync.lock"
 logdir: "/var/lib/sequencer/log"
 server_user: "sequencer-sync"
@@ -996,6 +1082,7 @@ category:
     fn parses_classification_glob() {
         let config = Config::from_yaml_str(
             r#"
+version: 2
 lock_file: "/var/lib/sequencer/flock/sequencer-sync.lock"
 logdir: "/var/lib/sequencer/log"
 server_user: "sequencer-sync"
@@ -1032,6 +1119,7 @@ category:
     fn rejects_invalid_classification_glob() {
         let error = Config::from_yaml_str(
             r#"
+version: 2
 lock_file: "/var/lib/sequencer/flock/sequencer-sync.lock"
 logdir: "/var/lib/sequencer/log"
 server_user: "sequencer-sync"
@@ -1077,6 +1165,7 @@ category:
             &config_path,
             format!(
                 r#"
+version: 2
 lock_file: "{flockdir}/sequencer-sync.lock"
 logdir: "{logdir}"
 server_user: "sequencer-sync"
@@ -1137,6 +1226,7 @@ category:
             &config_path,
             format!(
                 r#"
+version: 2
 lock_file: "{flockdir}/sequencer-sync.lock"
 logdir: "{logdir}"
 server_user: "sequencer-sync"
