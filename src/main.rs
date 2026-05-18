@@ -95,9 +95,9 @@ struct RunArgs {
     /// Print what would be copied instead of actually copying; disables run-log writes.
     #[arg(long, default_value_t = false)]
     dry_run: bool,
-    /// Store archive.tar uncompressed instead of gzip-compressing it as archive.tar.gz.
+    /// Gzip-compress archive.tar as archive.tar.gz.
     #[arg(long, default_value_t = false)]
-    skip_compress: bool,
+    compress: bool,
 }
 
 fn main() -> ExitCode {
@@ -554,7 +554,7 @@ fn transfer_new_directories(
             &entry.path(),
             &transferred_dir,
             &target.filestructure,
-            args.skip_compress,
+            args.compress,
         );
 
         let key = transfer_log::relative_directory_key(source, &entry.path())
@@ -595,8 +595,8 @@ fn transfer_new_directories(
 
 fn run_started_message(args: &RunArgs) -> String {
     format!(
-        "Run started: retry_failed={} transfer_incomplete={} skip_compress={}",
-        args.retry_failed, args.transfer_incomplete, args.skip_compress
+        "Run started: retry_failed={} transfer_incomplete={} compress={}",
+        args.retry_failed, args.transfer_incomplete, args.compress
     )
 }
 
@@ -673,7 +673,7 @@ fn transfer_run_to_landing_zone(
     run_dir: &Path,
     transferred_dir: &Path,
     filestructure: &config::FileStructure,
-    skip_compress: bool,
+    compress: bool,
 ) -> Result<(), AppError> {
     let classified_files = classify_run_files(run_dir, filestructure)?;
     ensure_no_archive_dir_checkout_conflict(run_dir, &classified_files.checkout)?;
@@ -710,12 +710,12 @@ fn transfer_run_to_landing_zone(
             copy_classified_file(run_dir, relative_path, &archive_dir)?;
         }
 
-        let archive_path = if skip_compress {
-            transferred_dir.join("archive.tar")
-        } else {
+        let archive_path = if compress {
             transferred_dir.join("archive.tar.gz")
+        } else {
+            transferred_dir.join("archive.tar")
         };
-        create_archive_tar(&archive_dir, &archive_path, skip_compress)?;
+        create_archive_tar(&archive_dir, &archive_path, compress)?;
         fs::remove_dir_all(&archive_dir).map_err(|source| AppError::RemoveArchiveDir {
             path: archive_dir,
             source,
@@ -828,16 +828,13 @@ fn copy_classified_file(
 fn create_archive_tar(
     archive_dir: &Path,
     archive_path: &Path,
-    skip_compress: bool,
+    compress: bool,
 ) -> Result<(), AppError> {
     let file = File::create(archive_path).map_err(|source| AppError::CreateArchiveTar {
         path: archive_path.to_path_buf(),
         source,
     })?;
-    if skip_compress {
-        let mut builder = tar::Builder::new(file);
-        write_archive_tar(archive_dir, archive_path, &mut builder)
-    } else {
+    if compress {
         let encoder = GzEncoder::new(file, Compression::default());
         let mut builder = tar::Builder::new(encoder);
         write_archive_tar(archive_dir, archive_path, &mut builder)?;
@@ -856,6 +853,9 @@ fn create_archive_tar(
                 source,
             })?;
         Ok(())
+    } else {
+        let mut builder = tar::Builder::new(file);
+        write_archive_tar(archive_dir, archive_path, &mut builder)
     }
 }
 

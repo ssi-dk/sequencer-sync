@@ -17,7 +17,7 @@ source: "/data/nanopore"
 # Named file layouts used by categories. For every file leaf in a run:
 # - a match in ignore_globs is not copied
 # - a match in checkout_globs is copied at its original relative path
-# - no match is copied into archive.tar.gz by default
+# - no match is copied into archive.tar by default
 filestructures:
   nanopore:
     ignore_globs:

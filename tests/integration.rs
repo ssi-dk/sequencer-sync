@@ -412,33 +412,33 @@ fn archive_files_are_packed_and_archive_directory_removed() {
 
     let transferred = fixture.path("nanopore-landing-core/ONT_WGS_run1");
     assert!(transferred.join("report_final.html").exists());
-    assert!(transferred.join("archive.tar.gz").exists());
-    assert!(!transferred.join("archive.tar").exists());
+    assert!(transferred.join("archive.tar").exists());
+    assert!(!transferred.join("archive.tar.gz").exists());
     assert!(!transferred.join("sequencer-sync-archive").exists());
 
-    let entries = tar_gz_entries(transferred.join("archive.tar.gz"));
+    let entries = tar_entries(transferred.join("archive.tar"));
     assert!(tar_contains(&entries, "raw/pod5.bin"));
 }
 
 #[test]
-fn archive_files_are_not_compressed_with_skip_compress() {
-    let fixture = TestFixture::new("archive-tar-uncompressed");
+fn archive_files_are_compressed_with_compress() {
+    let fixture = TestFixture::new("archive-tar-compressed");
     let config_path = fixture.setup_nanopore();
     fixture.write_file("nanopore-source/ONT_WGS_run1/raw/pod5.bin", "raw");
 
     cmd()
         .args(["run", "--config-path"])
         .arg(&config_path)
-        .args(["--skip-compress"])
+        .args(["--compress"])
         .assert()
         .success();
 
     let transferred = fixture.path("nanopore-landing-core/ONT_WGS_run1");
-    assert!(transferred.join("archive.tar").exists());
-    assert!(!transferred.join("archive.tar.gz").exists());
+    assert!(transferred.join("archive.tar.gz").exists());
+    assert!(!transferred.join("archive.tar").exists());
     assert!(!transferred.join("sequencer-sync-archive").exists());
 
-    let entries = tar_entries(transferred.join("archive.tar"));
+    let entries = tar_gz_entries(transferred.join("archive.tar.gz"));
     assert!(tar_contains(&entries, "raw/pod5.bin"));
 }
 
@@ -508,7 +508,7 @@ category:
     let transferred = fixture.path("nanopore-landing-core/ONT_WGS_run1");
     assert!(!transferred.join("report_final.html").exists());
     assert!(!transferred.join("data/data.txt").exists());
-    let entries = tar_gz_entries(transferred.join("archive.tar.gz"));
+    let entries = tar_entries(transferred.join("archive.tar"));
     assert!(tar_contains(&entries, "report_final.html"));
     assert!(tar_contains(&entries, "data/data.txt"));
 }
@@ -563,7 +563,7 @@ category:
 
     let transferred = fixture.path("nanopore-landing-core/ONT_WGS_run1");
     assert!(!transferred.join("ignored/secret.txt").exists());
-    let entries = tar_gz_entries(transferred.join("archive.tar.gz"));
+    let entries = tar_entries(transferred.join("archive.tar"));
     assert!(!tar_contains(&entries, "ignored/secret.txt"));
     assert!(tar_contains(&entries, "raw/pod5.bin"));
 }
