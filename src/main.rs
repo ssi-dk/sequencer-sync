@@ -82,6 +82,38 @@ struct SetupArgs {
     skip_tree_check: bool,
 }
 
+impl SetupArgs {
+    fn validate(self) -> Result<ValidatedSetupArgs, AppError> {
+        let tree_check = match (self.tree_check_source, self.skip_tree_check) {
+            (Some(_), true) => return Err(AppError::ConflictingTreeCheckArgs),
+            (Some(p), false) => TreeCheck::Source(p),
+            (None, false) => return Err(AppError::MissingTreeCheckArg),
+            (None, true) => TreeCheck::Skipped,
+        };
+        debug!(
+            "Canonicalizing config path: Path given from CLI: {}",
+            self.config_path.display()
+        );
+        let config_path = canonicalize_config_path(&self.config_path)?;
+        Ok(ValidatedSetupArgs {
+            config_path,
+            skip_ssh_check: self.skip_ssh_check,
+            tree_check,
+        })
+    }
+}
+
+enum TreeCheck {
+    Source(PathBuf),
+    Skipped,
+}
+
+struct ValidatedSetupArgs {
+    config_path: PathBuf,
+    skip_ssh_check: bool,
+    tree_check: TreeCheck,
+}
+
 #[derive(Args, Debug)]
 struct RunArgs {
     #[arg(long)]
@@ -119,13 +151,9 @@ fn try_main() -> Result<(), AppError> {
     }
 }
 
-fn setup(args: SetupArgs) -> Result<(), AppError> {
-    debug!(
-        "Canonicalizing config path: Path given from CLI: {}",
-        args.config_path.display()
-    );
-    let config_path = canonicalize_config_path(&args.config_path)?;
-    debug!("Loading config path at {}", config_path.display());
+fn setup(raw_args: SetupArgs) -> Result<(), AppError> {
+    let args = raw_args.validate()?;
+    debug!("Loading config path at {}", args.config_path.display());
     let config = load_config(&args.config_path)?;
     debug!(
         "Loaded {} configured filestructure(s)",
@@ -133,15 +161,15 @@ fn setup(args: SetupArgs) -> Result<(), AppError> {
     );
 
     validate_environment(&config, args.skip_ssh_check)?;
-    validate_setup_tree_check_args(&args)?;
-    if let Some(tree_check_source) = &args.tree_check_source {
-        check_run_trees(tree_check_source, &config.categories)?;
+    match args.tree_check {
+        TreeCheck::Source(p) => check_run_trees(&p, &config.categories)?,
+        TreeCheck::Skipped => {}
     }
     check_lock_is_available(&config.lock_file)?;
     let _ = TransferLog::load(&config.logdir).map_err(AppError::TransferLog)?;
     transfer_log::initialize_if_absent(&config.logdir).map_err(AppError::TransferLog)?;
     eprintln!("Setup successful!");
-    let cron_path = write_cron_file(&config.logdir, &config_path)?;
+    let cron_path = write_cron_file(&config.logdir, &args.config_path)?;
     eprintln!(
         "Install the generated cron job with your system cron configuration: {}",
         cron_path.display()
@@ -192,12 +220,10 @@ fn run_command(args: RunArgs) -> Result<(), AppError> {
     let _lock = match acquire_run_lock(&config.lock_file)? {
         Some(lock) => lock,
         None => {
-            if !args.dry_run {
-                run_log.info("Run skipped: file lock already held");
-                run_log.finish();
-                if run_log.had_error() {
-                    return Err(AppError::RunLogWriteFailed);
-                }
+            run_log.info("Run skipped: file lock already held");
+            run_log.finish();
+            if run_log.had_error() {
+                return Err(AppError::RunLogWriteFailed);
             }
             return Ok(());
         }
@@ -943,14 +969,6 @@ fn classify_relative_file(
             files.archived.push(relative_path);
             Ok(())
         }
-    }
-}
-
-fn validate_setup_tree_check_args(args: &SetupArgs) -> Result<(), AppError> {
-    match (args.tree_check_source.as_ref(), args.skip_tree_check) {
-        (Some(_), true) => Err(AppError::ConflictingTreeCheckArgs),
-        (None, false) => Err(AppError::MissingTreeCheckArg),
-        _ => Ok(()),
     }
 }
 
