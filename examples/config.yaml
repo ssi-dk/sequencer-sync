@@ -22,8 +22,8 @@ source: "/data/nanopore"
 filestructures:
   nanopore:
     ignore_globs:
-      - "*_skip"
-      - "pod5*"
+      - "**/*_skip"
+      - "**/pod5*"
     checkout_globs:
       - "*/*/report*.html"
     completion_file_globs:
