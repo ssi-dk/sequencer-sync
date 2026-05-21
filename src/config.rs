@@ -49,6 +49,8 @@ pub struct FileStructure {
 
 #[derive(Debug)]
 pub struct Category {
+    // Folder is classified as this category if name matches regex, and classification glob
+    // is None, or it matches a file relative to the folder.
     pub regex: Regex,
     pub classification_glob: Option<Pattern>,
     /// Canonicalized absolute path.

@@ -94,7 +94,12 @@ impl SetupArgs {
             "Canonicalizing config path: Path given from CLI: {}",
             self.config_path.display()
         );
-        let config_path = canonicalize_config_path(&self.config_path)?;
+        let config_path = fs::canonicalize(&self.config_path).map_err(|source| {
+            AppError::CanonicalizeConfigPath {
+                path: self.config_path.to_path_buf(),
+                source,
+            }
+        })?;
         Ok(ValidatedSetupArgs {
             config_path,
             skip_ssh_check: self.skip_ssh_check,
@@ -103,12 +108,16 @@ impl SetupArgs {
     }
 }
 
+// Config file may specify filestructures which do not match actual sequencing run
+// folder structure. Setup subcommand can check existing run folders in some source folder
+// against the specified filestructure. This enum stores whether setup should do that
 enum TreeCheck {
     Source(PathBuf),
     Skipped,
 }
 
 struct ValidatedSetupArgs {
+    // Canonicalized, verified to exist
     config_path: PathBuf,
     skip_ssh_check: bool,
     tree_check: TreeCheck,
@@ -696,17 +705,17 @@ struct ClassifiedFiles {
 }
 
 fn transfer_run_to_landing_zone(
-    run_dir: &Path,
-    transferred_dir: &Path,
+    source_run_dir: &Path,
+    target_run_dir: &Path,
     filestructure: &config::FileStructure,
     compress: bool,
 ) -> Result<(), AppError> {
-    let classified_files = classify_run_files(run_dir, filestructure)?;
-    ensure_no_archive_dir_checkout_conflict(run_dir, &classified_files.checkout)?;
+    let classified_files = classify_run_files(source_run_dir, filestructure)?;
+    ensure_no_archive_dir_checkout_conflict(source_run_dir, &classified_files.checkout)?;
 
     // create_dir_all because transferred_dir may not exist
-    fs::create_dir_all(transferred_dir).map_err(|source| AppError::CreateTransferDir {
-        path: transferred_dir.to_path_buf(),
+    fs::create_dir_all(target_run_dir).map_err(|source| AppError::CreateTransferDir {
+        path: target_run_dir.to_path_buf(),
         source,
     })?;
     debug!(
@@ -718,28 +727,28 @@ fn transfer_run_to_landing_zone(
 
     // Create parent directories once, so we can create files without worrying
     // about whether their parent exists
-    create_parent_directories(transferred_dir, &classified_files.checkout)?;
+    create_parent_directories(target_run_dir, &classified_files.checkout)?;
 
     for relative_path in &classified_files.checkout {
-        copy_classified_file(run_dir, relative_path, transferred_dir)?;
+        copy_classified_file(source_run_dir, relative_path, target_run_dir)?;
     }
 
     // Create the tarball only if there are files to be archived.
     if !classified_files.archived.is_empty() {
-        let archive_dir = transferred_dir.join(ARCHIVE_DIR_NAME);
+        let archive_dir = target_run_dir.join(ARCHIVE_DIR_NAME);
         fs::create_dir(&archive_dir).map_err(|source| AppError::CreateTransferDir {
             path: archive_dir.clone(),
             source,
         })?;
         create_parent_directories(&archive_dir, &classified_files.archived)?;
         for relative_path in &classified_files.archived {
-            copy_classified_file(run_dir, relative_path, &archive_dir)?;
+            copy_classified_file(source_run_dir, relative_path, &archive_dir)?;
         }
 
         let archive_path = if compress {
-            transferred_dir.join("archive.tar.gz")
+            target_run_dir.join("archive.tar.gz")
         } else {
-            transferred_dir.join("archive.tar")
+            target_run_dir.join("archive.tar")
         };
         create_archive_tar(&archive_dir, &archive_path, compress)?;
         fs::remove_dir_all(&archive_dir).map_err(|source| AppError::RemoveArchiveDir {
@@ -1100,13 +1109,6 @@ fn temp_probe_path(directory: &Path, field: &str) -> PathBuf {
     );
 
     directory.join(filename)
-}
-
-fn canonicalize_config_path(path: &Path) -> Result<PathBuf, AppError> {
-    fs::canonicalize(path).map_err(|source| AppError::CanonicalizeConfigPath {
-        path: path.to_path_buf(),
-        source,
-    })
 }
 
 fn write_cron_file(logdir: &Path, config_path: &Path) -> Result<PathBuf, AppError> {
