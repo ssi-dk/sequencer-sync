@@ -3,6 +3,8 @@ use std::{
 };
 use thiserror::Error;
 
+use crate::paths::SubDirectoryResult::IsNotDirectory;
+
 // File exists and is absolute and normalized
 #[derive(Debug, Hash, PartialEq, Eq)]
 pub struct CanonicalDirBuf(PathBuf);
@@ -10,6 +12,20 @@ pub struct CanonicalDirBuf(PathBuf);
 impl AsRef<Path> for CanonicalDirBuf {
     fn as_ref(&self) -> &Path {
         &self.0
+    }
+}
+
+pub enum SubDirectoryResult {
+    IsNotDirectory,
+    SubDirectory(CanonicalDirBuf)
+}
+
+impl SubDirectoryResult {
+    pub fn expect_dir(self, s: &str) -> CanonicalDirBuf {
+        match self {
+            Self::IsNotDirectory => panic!("{}", s),
+            Self::SubDirectory(x) => x
+        }
     }
 }
 
@@ -31,22 +47,22 @@ impl CanonicalDirBuf {
         }
     }
 
-    pub fn try_from_existing_subdirectory(&self, relative: &RelativePathBuf) -> Result<Option<Self>, PathError> {
+    pub fn try_from_existing_subdirectory(&self, relative: &RelativePathBuf) -> Result<SubDirectoryResult, PathError> {
         let inner = self.0.join(relative.as_ref());
         let metadata = inner.metadata().map_err(|source| PathError::GeneralIOError {
             path: inner.to_owned(),
             source,
         })?;
         if metadata.is_dir() {
-            Ok(Some(Self(inner)))
+            Ok(SubDirectoryResult::SubDirectory(Self(inner)))
         } else {
-            Ok(None)
+            Ok(SubDirectoryResult::IsNotDirectory)
         }
     }
 }
 
 // File is not absolute, do not contain . or .. and may not exist
-#[derive(Debug)]
+#[derive(Debug, Hash, PartialEq, Eq)]
 pub struct RelativePathBuf(PathBuf);
 
 impl RelativePathBuf {

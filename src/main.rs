@@ -18,7 +18,7 @@ use thiserror::Error;
 use transfer_log::TransferLog;
 use walkdir::WalkDir;
 
-use crate::paths::{CanonicalChildFileBuf, CanonicalDirBuf, PathError, RelativePathBuf};
+use crate::paths::{CanonicalChildFileBuf, CanonicalDirBuf, PathError, RelativePathBuf, SubDirectoryResult};
 
 mod config;
 mod paths;
@@ -89,14 +89,13 @@ impl SetupArgs {
     fn validate(self) -> Result<ValidatedSetupArgs, AppError> {
         let tree_check = match (self.tree_check_source, self.skip_tree_check) {
             (Some(_), true) => return Err(AppError::ConflictingTreeCheckArgs),
-            (Some(p), false) => TreeCheck::Source(p),
+            (Some(p), false) => {
+                TreeCheck::Source(CanonicalDirBuf::from_absolute(&p, "--tree-check-source path")?)
+            },
             (None, false) => return Err(AppError::MissingTreeCheckArg),
             (None, true) => TreeCheck::Skipped,
         };
-        debug!(
-            "Canonicalizing config path: Path given from CLI: {}",
-            self.config_path.display()
-        );
+
         let config_path = canonicalize_config_path(&self.config_path)?;
         Ok(ValidatedSetupArgs {
             config_path,
@@ -107,7 +106,7 @@ impl SetupArgs {
 }
 
 enum TreeCheck {
-    Source(PathBuf),
+    Source(CanonicalDirBuf),
     Skipped,
 }
 
@@ -708,14 +707,14 @@ fn transfer_run_to_landing_zone(
     compress: bool,
 ) -> Result<(), AppError> {
     // Classify all files in the run dir in the source
-    let canonical_source_run_dir = source.join(run_dir);
+    let canonical_source_run_dir = source.try_from_existing_subdirectory(run_dir)?.expect_dir("run_dir is known to be a dir");
     let classified_files = classify_run_files(&canonical_source_run_dir, filestructure)?;
     ensure_no_archive_dir_checkout_conflict(&canonical_source_run_dir, &classified_files.checkout)?;
 
     // Create the dir in staging area
-    let canonical_staging_run_dir = staging_zone.join(run_dir);
+    let canonical_staging_run_dir = staging_zone.as_ref().join(run_dir);
     fs::create_dir(&canonical_staging_run_dir).map_err(|source| AppError::CreateDir {
-        path: canonical_staging_run_dir.as_ref().to_owned(),
+        path: canonical_staging_run_dir,
         source,
     })?;
     
@@ -766,8 +765,8 @@ fn move_from_staging_zone_to_landing_zone(
     staging_zone: &CanonicalDirBuf,
     landing_zone: &CanonicalDirBuf,
 ) -> Result<(), AppError> {
-    let src = staging_zone.join(path);
-    let dst = landing_zone.join(path);
+    let src = staging_zone.as_ref().join(path);
+    let dst = landing_zone.as_ref().join(path);
     match fs::rename(src, dst) {
         Ok(_) => Ok(()),
         Err(error) => match error.kind() {
@@ -847,19 +846,24 @@ fn create_parent_directories(
     target_root: &CanonicalDirBuf,
     relative_paths: &[RelativePathBuf],
 ) -> Result<(), AppError> {
-    let mut directories = HashSet::new();
+    // Use HashSet to deduplicate
+    let mut directories = HashSet::<RelativePathBuf>::new();
 
     for relative_path in relative_paths {
-        // We need to create all directories. The target root must already exist.
-        let Some(parent) = relative_path.parent() else {
-            continue;
+        // We need to create all directories. The target root must already exist,
+        // so we can skip that
+        let parent = if let Some(parent) = relative_path.parent() {
+            parent
+        } else {
+            continue
         };
-        directories.insert(target_root.join(&parent));
+        directories.insert(parent);
     }
 
     for directory in directories {
-        fs::create_dir_all(&directory).map_err(|source| AppError::CreateTransferDir {
-            path: directory,
+        let to_create = target_root.as_ref().join(directory.as_ref());
+        fs::create_dir_all(&to_create).map_err(|source| AppError::CreateDir {
+            path: to_create,
             source,
         })?;
     }
@@ -1015,23 +1019,22 @@ fn check_run_trees(
             source,
         })?;
         let relative: RelativePathBuf = (&entry).into();
-        let subdir = if let Some(s) = tree_check_source.try_from_existing_subdirectory(&relative)? {
+        let subdir = if let SubDirectoryResult::SubDirectory(s) = tree_check_source.try_from_existing_subdirectory(&relative)? {
             s
         } else {
             continue
         };
         
-        let full_path = tree_check_source.join(&relative);
         let file_type = entry.file_type().map_err(|source| AppError::ReadMetadata {
             field: "tree_check_source",
-            path: full_path.as_ref().to_owned(),
+            path: subdir.as_ref().to_owned(),
             source,
         })?;
         if !file_type.is_dir() {
             continue;
         }
-        if let Some(target) = classify(&full_path, categories)? {
-            let _ = classify_run_files(&full_path, &target.filestructure)?;
+        if let Some(target) = classify(&subdir, categories)? {
+            let _ = classify_run_files(&subdir, &target.filestructure)?;
         }
     }
 
@@ -1123,7 +1126,7 @@ fn canonicalize_config_path(path: &Path) -> Result<PathBuf, AppError> {
     })
 }
 
-fn write_cron_file(logdir: &Path, config_path: &Path) -> Result<PathBuf, AppError> {
+fn write_cron_file(logdir: &CanonicalDirBuf, config_path: &Path) -> Result<PathBuf, AppError> {
     debug!("Determining cron file content");
     let binary_path = std::env::current_exe()
         .and_then(fs::canonicalize)
