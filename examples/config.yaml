@@ -1,7 +1,12 @@
+version: 2
 # Lock file path (prevents concurrent runs). The parent directory must exist
 # and be writeable.
-version: 2
 lock_file: "/var/lib/sequencer/flock/sequencer-sync.lock"
+
+# Directory to put partially-copied run dirs into before final move to the landing zone.
+# This should be on the same file system as the landing zone to make atomic transfers
+# from the staging zone to the landing zone more likely.
+staging_zone: "/var/lib/sequencer/staging"
 
 # Writeable directory for log files (transfer log, run log, cron file)
 logdir: "/var/lib/sequencer/log"

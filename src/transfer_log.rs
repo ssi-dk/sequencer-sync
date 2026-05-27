@@ -7,6 +7,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::paths::CanonicalDirBuf;
 use crate::{TransferAction, TransferReason};
 
 const TRANSFER_LOG_FILE_NAME: &str = "transferred-directories.jsonl";
@@ -101,7 +102,7 @@ struct TransferState {
 }
 
 impl TransferLog {
-    pub fn load(logdir: &Path) -> Result<Self, TransferLogError> {
+    pub fn load(logdir: &CanonicalDirBuf) -> Result<Self, TransferLogError> {
         let path = transfer_log_path(logdir);
         let file = match fs::File::open(&path) {
             Ok(file) => file,
@@ -266,14 +267,14 @@ pub fn relative_directory_key(
         })
 }
 
-pub fn transfer_log_path(logdir: &Path) -> PathBuf {
-    logdir.join(TRANSFER_LOG_FILE_NAME)
+pub fn transfer_log_path(logdir: &CanonicalDirBuf) -> PathBuf {
+    logdir.as_ref().join(TRANSFER_LOG_FILE_NAME)
 }
 
 /// Write a sentinel record to the transfer log if the file is absent or blank.
 /// This ensures the file is always present after setup, making it easy to
 /// inspect the log format even before any real transfers have occurred.
-pub fn initialize_if_absent(logdir: &Path) -> Result<(), TransferLogError> {
+pub fn initialize_if_absent(logdir: &CanonicalDirBuf) -> Result<(), TransferLogError> {
     let path = transfer_log_path(logdir);
 
     let needs_init = match fs::read_to_string(&path) {
