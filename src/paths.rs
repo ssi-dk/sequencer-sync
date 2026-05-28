@@ -1,9 +1,117 @@
+use serde::{Deserialize, Serialize};
 use std::{
-    io::{self, ErrorKind}, path::{Path, PathBuf}
+    borrow::Borrow,
+    ffi::{OsStr, OsString},
+    io::ErrorKind,
+    path::{Path, PathBuf},
+    time::{SystemTime, UNIX_EPOCH},
 };
 use thiserror::Error;
 
-use crate::paths::SubDirectoryResult::IsNotDirectory;
+#[derive(Debug, Hash, PartialEq, Eq, Deserialize, Serialize, Clone)]
+pub struct NormalPathSegmentBuf(OsString);
+
+impl From<&std::fs::DirEntry> for NormalPathSegmentBuf {
+    fn from(item: &std::fs::DirEntry) -> Self {
+        // Safety: The file name of an entry is always a Component::Normal (I think)
+        NormalPathSegmentBuf(item.file_name())
+    }
+}
+
+impl AsRef<OsStr> for NormalPathSegment {
+    fn as_ref(&self) -> &OsStr {
+        &self.0
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Hash, PartialEq, Eq)]
+pub struct NormalUTF8Segment(String);
+
+impl NormalUTF8Segment {
+    pub fn to_inner(self) -> String {
+        self.0
+    }
+
+    pub fn from_timestamp(tag: &str) -> Self {
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time should be after unix epoch")
+            .as_nanos();
+        let s = format!(
+            ".sequencer-sync-{tag}-write-probe-{}-{timestamp}",
+            std::process::id()
+        );
+        Self(s)
+    }
+}
+
+impl From<NormalUTF8Segment> for NormalPathSegmentBuf {
+    fn from(value: NormalUTF8Segment) -> Self {
+        NormalPathSegmentBuf(value.to_inner().into())
+    }
+}
+
+impl<'a> From<&'a NormalPathSegment> for &'a Path {
+    fn from(value: &'a NormalPathSegment) -> Self {
+        Path::new(&value.0)
+    }
+}
+
+impl TryFrom<&NormalPathSegment> for NormalUTF8Segment {
+    type Error = ();
+
+    fn try_from(value: &NormalPathSegment) -> Result<Self, Self::Error> {
+        value.0.to_str().map(|s| Self(s.to_owned())).ok_or(())
+    }
+}
+
+// Not the file root, not the Windows drive, not .., not ., and
+// no path separator in this.
+#[repr(transparent)]
+pub struct NormalPathSegment(OsStr);
+
+impl NormalPathSegment {
+    pub fn new<'a, T: AsRef<&'a Path>>(x: T) -> Option<&'a Self> {
+        let path: &'a Path = x.as_ref();
+        let mut components = path.components();
+        match components.next() {
+            None => return None,
+            Some(std::path::Component::Normal(_)) => (),
+            Some(_) => return None,
+        }
+        if components.next().is_some() {
+            return None;
+        }
+        unsafe { return Some(Self::from_os_str(path.as_os_str())) }
+    }
+
+    unsafe fn from_os_str(s: &OsStr) -> &Self {
+        // SAFETY: `MyOsStr` has the same layout as `OsStr`
+        unsafe { &*(s as *const OsStr as *const Self) }
+    }
+}
+
+impl ToOwned for NormalPathSegment {
+    type Owned = NormalPathSegmentBuf;
+
+    fn to_owned(&self) -> Self::Owned {
+        NormalPathSegmentBuf(self.0.to_owned())
+    }
+}
+
+impl Borrow<NormalPathSegment> for NormalPathSegmentBuf {
+    fn borrow(&self) -> &NormalPathSegment {
+        unsafe { NormalPathSegment::from_os_str(&self.0) }
+    }
+}
+
+impl std::ops::Deref for NormalPathSegmentBuf {
+    type Target = NormalPathSegment;
+
+    fn deref(&self) -> &NormalPathSegment {
+        unsafe { NormalPathSegment::from_os_str(&self.0) }
+    }
+}
 
 // File exists and is absolute and normalized
 #[derive(Debug, Hash, PartialEq, Eq)]
@@ -17,14 +125,14 @@ impl AsRef<Path> for CanonicalDirBuf {
 
 pub enum SubDirectoryResult {
     IsNotDirectory,
-    SubDirectory(CanonicalDirBuf)
+    SubDirectory(CanonicalDirBuf),
 }
 
 impl SubDirectoryResult {
     pub fn expect_dir(self, s: &str) -> CanonicalDirBuf {
         match self {
             Self::IsNotDirectory => panic!("{}", s),
-            Self::SubDirectory(x) => x
+            Self::SubDirectory(x) => x,
         }
     }
 }
@@ -47,17 +155,31 @@ impl CanonicalDirBuf {
         }
     }
 
-    pub fn try_from_existing_subdirectory(&self, relative: &RelativePathBuf) -> Result<SubDirectoryResult, PathError> {
-        let inner = self.0.join(relative.as_ref());
-        let metadata = inner.metadata().map_err(|source| PathError::GeneralIOError {
-            path: inner.to_owned(),
-            source,
-        })?;
+    pub fn try_from_existing_subdirectory(
+        &self,
+        relative: &NormalPathSegment,
+    ) -> Result<SubDirectoryResult, PathError> {
+        let inner = self.0.join(Path::new(&relative.0));
+        let metadata = inner
+            .metadata()
+            .map_err(|source| PathError::GeneralIOError {
+                path: inner.to_owned(),
+                source,
+            })?;
         if metadata.is_dir() {
             Ok(SubDirectoryResult::SubDirectory(Self(inner)))
         } else {
             Ok(SubDirectoryResult::IsNotDirectory)
         }
+    }
+
+    pub fn join_file_name(
+        &self,
+        segment: &NormalPathSegment,
+    ) -> Result<CanonicalChildFileBuf, PathError> {
+        let path = self.0.join(&segment.0);
+        check_is_file_or_missing(&path, "")?; // TODO: Better error here
+        Ok(CanonicalChildFileBuf(path))
     }
 }
 
@@ -68,14 +190,21 @@ pub struct RelativePathBuf(PathBuf);
 impl RelativePathBuf {
     pub fn new(path: &Path) -> Option<Self> {
         if path.is_absolute() {
-            return None
+            return None;
         }
 
-        if !path.components().all(|c| matches!(c, std::path::Component::Normal(_))) {
-            return None
+        if path.as_os_str().is_empty() {
+            return None;
         }
 
-        return Some(RelativePathBuf(path.to_owned()))
+        if !path
+            .components()
+            .all(|c| matches!(c, std::path::Component::Normal(_)))
+        {
+            return None;
+        }
+
+        return Some(RelativePathBuf(path.to_owned()));
     }
 
     pub fn parent(&self) -> Option<Self> {
@@ -96,15 +225,22 @@ impl AsRef<Path> for RelativePathBuf {
     }
 }
 
+impl From<NormalPathSegmentBuf> for RelativePathBuf {
+    fn from(item: NormalPathSegmentBuf) -> Self {
+        Self(item.0.into())
+    }
+}
+
 impl From<&std::fs::DirEntry> for RelativePathBuf {
     fn from(item: &std::fs::DirEntry) -> Self {
-        // Safety: The file name of an entry is always a Component::Normal (I think)
-        Self::new(Path::new(&item.file_name())).unwrap()
+        let segment: NormalPathSegmentBuf = item.into();
+        segment.into()
     }
 }
 
 // File may not exist, but is absolute and normalized.
-// Its parent is caonical
+// Its parent is canonical.
+// If it exists, it must be a file
 #[derive(Debug)]
 pub struct CanonicalChildFileBuf(PathBuf);
 
@@ -139,11 +275,8 @@ impl CanonicalChildFileBuf {
 
         let full_path = canonical_parent.0.join(file_name);
 
-        if full_path.exists() && !full_path.is_file() {
-            Err(PathError::IsNotFileOrMissing { description: description.to_owned(), path: full_path })
-        } else {
-            Ok(Self(full_path))
-        }
+        check_is_file_or_missing(&full_path, description)?;
+        Ok(Self(full_path))
     }
 
     pub fn parent(&self) -> CanonicalDirBuf {
@@ -151,7 +284,28 @@ impl CanonicalChildFileBuf {
         // tests that the parent exists and is a canonical directory
         CanonicalDirBuf(self.0.parent().unwrap().to_owned())
     }
+}
 
+fn check_is_file_or_missing(path: &Path, description: &str) -> Result<(), PathError> {
+    match path.metadata() {
+        Ok(md) => {
+            if md.is_file() {
+                Ok(())
+            } else {
+                Err(PathError::IsNotFileOrMissing {
+                    description: description.to_owned(),
+                    path: path.to_owned(),
+                })
+            }
+        }
+        Err(inner) => match inner.kind() {
+            ErrorKind::NotFound => Ok(()),
+            _ => Err(PathError::GeneralIOError {
+                path: path.to_owned(),
+                source: inner,
+            }),
+        },
+    }
 }
 
 fn check_absolute(path: &Path, description: &str) -> Result<(), PathError> {
@@ -164,7 +318,6 @@ fn check_absolute(path: &Path, description: &str) -> Result<(), PathError> {
     Ok(())
 }
 
-
 #[derive(Debug, Error)]
 pub enum PathError {
     #[error("Got an unexpected IO error.\nPath: {}\nError: {source}", path.display())]
@@ -173,7 +326,7 @@ pub enum PathError {
         #[source]
         source: std::io::Error,
     },
-    
+
     #[error("{description} must be an absolute path, but it was {}", path.display())]
     NotAbsolute { description: String, path: PathBuf },
 
@@ -186,5 +339,5 @@ pub enum PathError {
 
     #[error("{description} at path {} must be a file or must not exist,\n\
         but is not a normal file (i.e. maybe a directory?)", path.display())]
-    IsNotFileOrMissing {description: String, path: PathBuf}
+    IsNotFileOrMissing { description: String, path: PathBuf },
 }

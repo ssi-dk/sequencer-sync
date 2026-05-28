@@ -1,16 +1,18 @@
 use std::fs::OpenOptions;
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use chrono::Local;
+
+use crate::paths::{CanonicalChildFileBuf, CanonicalDirBuf, NormalPathSegment, RelativePathBuf};
 
 // Human-readable log. Two files: Full log, and latest attempted transfer log.
 pub struct RunLog {
     /// Absolute path to the append-only log that accumulates across all runs.
-    full_log_path: PathBuf,
+    full_log_path: CanonicalChildFileBuf,
     /// Absolute path to the log that is overwritten only once a real transfer
     /// attempt starts. Runs that do not start a transfer append here instead.
-    latest_log_path: PathBuf,
+    latest_log_path: CanonicalChildFileBuf,
     /// Lines buffered for the latest log until we know whether this run should
     /// append to the existing latest log or replace it.
     pending_latest_lines: Vec<String>,
@@ -22,10 +24,13 @@ pub struct RunLog {
 }
 
 impl RunLog {
-    pub fn new(logdir: &Path) -> Self {
+    pub fn new(logdir: &CanonicalDirBuf) -> Self {
         Self {
-            full_log_path: logdir.join("sequencer-sync.log"),
-            latest_log_path: logdir.join("sequencer-sync-latest.log"),
+            full_log_path: logdir
+                .join_file_name(&NormalPathSegment::new("sequencer-sync.log".as_ref()).unwrap())?,
+            latest_log_path: logdir.join_file_name(
+                &NormalPathSegment::new("sequencer-sync-latest.log".as_ref()).unwrap(),
+            )?,
             pending_latest_lines: Vec::new(),
             latest_started: false,
             had_error: false,
@@ -136,7 +141,7 @@ impl RunLog {
         Ok(())
     }
 
-    fn append_line(&self, path: &Path, line: &str) -> std::io::Result<()> {
+    fn append_line(&self, path: &CanonicalChildFileBuf, line: &str) -> std::io::Result<()> {
         let mut file = OpenOptions::new().create(true).append(true).open(path)?;
         file.write_all(line.as_bytes())?;
         file.sync_all()?;

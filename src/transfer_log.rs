@@ -7,7 +7,10 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::paths::CanonicalDirBuf;
+use crate::paths::{
+    CanonicalDirBuf, NormalPathSegment, NormalPathSegmentBuf, NormalPathSegmentStr,
+    NormalUTF8Segment,
+};
 use crate::{TransferAction, TransferReason};
 
 const TRANSFER_LOG_FILE_NAME: &str = "transferred-directories.jsonl";
@@ -17,7 +20,7 @@ const TRANSFER_LOG_FILE_NAME: &str = "transferred-directories.jsonl";
 pub struct TransferLog {
     path: PathBuf,
     /// Maps directory key to its latest transfer state.
-    transferred_directories: HashMap<PathBuf, TransferState>,
+    transferred_directories: HashMap<NormalUTF8Segment, TransferState>,
     /// Lazily opened file handle for appending records.
     file: Option<File>,
 }
@@ -83,7 +86,7 @@ pub enum TransferLogError {
 
 #[derive(Debug, Deserialize, Serialize)]
 struct TransferRecord {
-    directory: PathBuf,
+    directory: NormalUTF8Segment,
     transferred_at: String, // UTC time, but in String format for serialization
     #[serde(default = "default_succeeded")]
     succeeded: bool,
@@ -117,7 +120,7 @@ impl TransferLog {
         };
 
         let reader = BufReader::new(file);
-        let mut transferred_directories: HashMap<PathBuf, TransferState> = HashMap::new();
+        let mut transferred_directories: HashMap<NormalUTF8Segment, TransferState> = HashMap::new();
 
         for (index, line_result) in reader.lines().enumerate() {
             let line = line_result.map_err(|source| TransferLogError::Read {
@@ -171,7 +174,11 @@ impl TransferLog {
         })
     }
 
-    pub fn transfer_action(&self, directory: &Path, retry_failed: bool) -> TransferAction {
+    pub fn transfer_action(
+        &self,
+        directory: &NormalUTF8Segment,
+        retry_failed: bool,
+    ) -> TransferAction {
         match self.transferred_directories.get(directory).copied() {
             None => TransferAction::Tranfer(TransferReason::New),
             Some(TransferState { redo: true, .. }) => TransferAction::Tranfer(TransferReason::Redo),
@@ -195,13 +202,11 @@ impl TransferLog {
 
     pub fn record_transfer(
         &mut self,
-        directory: &Path,
+        directory: &NormalUTF8Segment,
         succeeded: bool,
     ) -> Result<(), TransferLogError> {
-        let directory = directory.to_path_buf();
-
         let record = TransferRecord {
-            directory: directory.clone(),
+            directory: directory.to_owned(),
             transferred_at: Utc::now().to_rfc3339(),
             succeeded,
             redo: false,
@@ -209,7 +214,7 @@ impl TransferLog {
 
         let line =
             serde_json::to_string(&record).map_err(|source| TransferLogError::Serialize {
-                directory: directory.display().to_string(),
+                directory: directory.clone().to_inner(),
                 source,
             })?;
 
@@ -228,7 +233,7 @@ impl TransferLog {
         })?;
 
         self.transferred_directories.insert(
-            directory,
+            directory.clone(),
             TransferState {
                 succeeded,
                 redo: false,
@@ -254,19 +259,6 @@ impl TransferLog {
     }
 }
 
-pub fn relative_directory_key(
-    source: &Path,
-    directory: &Path,
-) -> Result<PathBuf, TransferLogError> {
-    directory
-        .strip_prefix(source)
-        .map(Path::to_path_buf)
-        .map_err(|_| TransferLogError::DirectoryOutsideSource {
-            source_dir: source.to_path_buf(),
-            directory: directory.to_path_buf(),
-        })
-}
-
 pub fn transfer_log_path(logdir: &CanonicalDirBuf) -> PathBuf {
     logdir.as_ref().join(TRANSFER_LOG_FILE_NAME)
 }
@@ -288,14 +280,17 @@ pub fn initialize_if_absent(logdir: &CanonicalDirBuf) -> Result<(), TransferLogE
     }
 
     let record = TransferRecord {
-        directory: PathBuf::from("_sequencer_sync_setup_"),
+        directory: NormalPathSegment::new("_sequencer_sync_setup_".as_ref())
+            .unwrap()
+            .try_into()
+            .unwrap(),
         transferred_at: Utc::now().to_rfc3339(),
         succeeded: true,
         redo: false,
     };
 
     let line = serde_json::to_string(&record).map_err(|source| TransferLogError::Serialize {
-        directory: record.directory.display().to_string(),
+        directory: record.directory.clone().to_inner(),
         source,
     })?;
 
