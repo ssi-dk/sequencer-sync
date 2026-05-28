@@ -955,6 +955,7 @@ name = "sequencer-sync"
 version = "2.0.1"
 dependencies = [
  "assert_cmd",
+ "bstr",
  "chrono",
  "clap",
  "env_logger",

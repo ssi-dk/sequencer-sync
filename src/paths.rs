@@ -2,7 +2,9 @@ use serde::{Deserialize, Serialize};
 use std::{
     borrow::Borrow,
     ffi::{OsStr, OsString},
-    io::ErrorKind,
+    fs::DirEntry,
+    io::{Error, ErrorKind},
+    os::unix::ffi::OsStrExt,
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -43,6 +45,40 @@ impl NormalUTF8Segment {
         );
         Self(s)
     }
+
+    pub fn as_normal(&self) -> &NormalPathSegment {
+        // Safety: Self's invariants are a superset of NormalPathSegment
+        unsafe { NormalPathSegment::from_os_str(OsStr::from_bytes(self.0.as_bytes())) }
+    }
+}
+
+pub enum DirEntrySegmentCases {
+    UTF8Segment(NormalUTF8Segment),
+    IOError(std::io::Error),
+    IsRoot,
+    NotUTF8,
+    IsSymlink,
+}
+
+pub fn segment(entry: &DirEntry) -> DirEntrySegmentCases {
+    let md = match entry.metadata() {
+        Ok(md) => md,
+        Err(e) => return DirEntrySegmentCases::IOError(e),
+    };
+    if md.is_symlink() {
+        return DirEntrySegmentCases::IsSymlink;
+    }
+    let file_name = entry.file_name();
+    if file_name == "/" {
+        return DirEntrySegmentCases::IsRoot;
+    }
+    NormalPathSegment::new(Path::new(&file_name)).unwrap_or_else(|| {
+        panic!("DirEntry segment ought to be a Normal segment, got {:?file_name}")
+    });
+    match file_name.into_string() {
+        Ok(s) => DirEntrySegmentCases::UTF8Segment(NormalUTF8Segment(s)),
+        Err(_) => DirEntrySegmentCases::NotUTF8,
+    }
 }
 
 impl From<NormalUTF8Segment> for NormalPathSegmentBuf {
@@ -71,8 +107,7 @@ impl TryFrom<&NormalPathSegment> for NormalUTF8Segment {
 pub struct NormalPathSegment(OsStr);
 
 impl NormalPathSegment {
-    pub fn new<'a, T: AsRef<&'a Path>>(x: T) -> Option<&'a Self> {
-        let path: &'a Path = x.as_ref();
+    pub fn new(path: &Path) -> Option<&Self> {
         let mut components = path.components();
         match components.next() {
             None => return None,
@@ -114,7 +149,7 @@ impl std::ops::Deref for NormalPathSegmentBuf {
 }
 
 // File exists and is absolute and normalized
-#[derive(Debug, Hash, PartialEq, Eq)]
+#[derive(Debug, Hash, PartialEq, Eq, Clone)]
 pub struct CanonicalDirBuf(PathBuf);
 
 impl AsRef<Path> for CanonicalDirBuf {
@@ -138,6 +173,21 @@ impl SubDirectoryResult {
 }
 
 impl CanonicalDirBuf {
+    pub fn create_subdir(&self, subdir: &NormalPathSegment) -> Result<Self, PathError> {
+        let path = self.as_ref().join(subdir.as_ref());
+        match std::fs::create_dir(&path) {
+            Ok(()) => {
+                // Guaranteed to work, since we just created the directory
+                // and the normal segment is already normalized
+                Ok(CanonicalDirBuf(path))
+            }
+            Err(source) => Err(PathError::GeneralIOError {
+                path: path.to_owned(),
+                source,
+            }),
+        }
+    }
+
     pub fn from_absolute(path: &Path, description: &str) -> Result<Self, PathError> {
         check_absolute(path, description)?;
         match path.canonicalize() {

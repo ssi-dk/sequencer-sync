@@ -15,7 +15,7 @@ const SUPPORTED_CONFIG_VERSION: u16 = 2;
 #[derive(Debug)]
 pub struct Config {
     pub lock_file: CanonicalChildFileBuf,
-    
+
     /// Directory for log files (transfer log, run log, cron file).
     pub logdir: CanonicalDirBuf,
 
@@ -53,7 +53,7 @@ pub struct Category {
     pub regex: Regex,
     pub classification_glob: Option<Pattern>,
     pub landing_zone: CanonicalDirBuf,
-    
+
     /// Here, run directories are created incrementally before final atomic move to landing zone.
     /// Setup command validates this is on the same partition as the landing zone.
     pub staging_zone: CanonicalDirBuf,
@@ -278,11 +278,12 @@ fn directory_label(field: &'static str) -> &'static str {
 
 impl UnvalidatedConfig {
     fn validate(self) -> Result<Config, ConfigError> {
-        let lock_file = CanonicalChildFileBuf::from_absolute(&self.lock_file, "Lock file in config file")?;
+        let lock_file =
+            CanonicalChildFileBuf::from_absolute(&self.lock_file, "Lock file in config file")?;
 
         let logdir = CanonicalDirBuf::from_absolute(&self.logdir, "Log dir in config file")?;
         let source = CanonicalDirBuf::from_absolute(&self.source, "Source in config file")?;
-        
+
         validate_non_empty("server_user", &self.server_user)?;
         validate_non_empty("server_host", &self.server_host)?;
 
@@ -349,8 +350,10 @@ impl UnvalidatedCategory {
         self,
         filestructures: &HashMap<String, Arc<FileStructure>>,
     ) -> Result<Category, ConfigError> {
-        let landing_zone = CanonicalDirBuf::from_absolute(&self.landing_zone, "Landing zone of a category")?;
-        let staging_zone = CanonicalDirBuf::from_absolute(&self.staging_zone, "Staging zone of a category")?;
+        let landing_zone =
+            CanonicalDirBuf::from_absolute(&self.landing_zone, "Landing zone of a category")?;
+        let staging_zone =
+            CanonicalDirBuf::from_absolute(&self.staging_zone, "Staging zone of a category")?;
 
         validate_non_empty("category.filestructure", &self.filestructure)?;
 
