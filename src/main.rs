@@ -294,17 +294,18 @@ fn validate_environment(config: &Config, skip_ssh_check: bool) -> Result<(), App
             "\tChecking files can be created in staging zone {}",
             cat.staging_zone.as_ref().display()
         );
-        let field = "category.staging_zone";
         let segment: NormalPathSegmentBuf = NormalUTF8Segment::from_timestamp().into();
         let staging_zone_marker_path = cat.staging_zone.join_file_name(&segment)?;
         OpenOptions::new()
             .write(true)
             .create_new(true)
             .open(&staging_zone_marker_path)
-            .map_err(|source| UserError::WriteDirectory {
-                field,
-                path: staging_zone_marker_path.as_ref().to_owned(),
-                source,
+            .with_context(|| {
+                format!(
+                    "Failure when writing marker file to staging directory to check \
+                    writeability of staging directory.\nMarker path: {:?}",
+                    staging_zone_marker_path.as_ref()
+                )
             })?;
 
         debug!("\tChecking file can be moved to landing_zone");
@@ -373,17 +374,14 @@ fn scan_directories(
     transfer_log: &TransferLog,
     retry_failed: bool,
     transfer_incomplete: bool,
-) -> Result<ScanResult, UserError> {
+) -> Result<ScanResult, AppError> {
     debug!(
         "Searching for new directories in {}",
         &source.as_ref().display()
     );
 
-    let entries = fs::read_dir(source).map_err(|e| UserError::ReadDirectory {
-        field: "source",
-        path: source.as_ref().to_path_buf(),
-        source: e,
-    })?;
+    let entries = fs::read_dir(source)
+        .with_context(|| format!("Failure when reading the source directory at {:?}", source))?;
 
     let mut planned_transfers = Vec::new();
     let mut incomplete_messages = Vec::new();
@@ -397,10 +395,11 @@ fn scan_directories(
     }
 
     for entry in entries {
-        let entry = entry.map_err(|e| UserError::ReadDirectory {
-            field: "source",
-            path: source.as_ref().to_path_buf(),
-            source: e,
+        let entry = entry.with_context(|| {
+            format!(
+                "Failure when reading entry of source directory {:?}",
+                source.as_ref()
+            )
         })?;
 
         let (entry_path, segment) = match paths::utf8_subdir(&entry) {
@@ -409,11 +408,7 @@ fn scan_directories(
                 last_segment,
             } => (full_path, last_segment),
             DirEntrySubdirCases::IOError(e) => {
-                return Err(UserError::ReadDirectory {
-                    field: "Run dir",
-                    path: entry.path(),
-                    source: e,
-                });
+                return Err(AppError::Internal(Error::from(e).context("TODO!")));
             }
             DirEntrySubdirCases::IsSymlink => {
                 warn!(
@@ -1100,30 +1095,27 @@ fn check_run_trees(
     categories: &[config::Category],
 ) -> Result<(), AppError> {
     check_readable_directory(tree_check_source, "tree_check_source")?;
-    let entries = fs::read_dir(tree_check_source).map_err(|source| UserError::ReadDirectory {
-        field: "tree_check_source",
-        path: tree_check_source.as_ref().to_owned(),
-        source,
+    let entries = fs::read_dir(tree_check_source).with_context(|| {
+        format!(
+            "Error when checking reading directory {:?}",
+            tree_check_source.as_ref()
+        )
     })?;
 
     for entry in entries {
-        let entry = entry.map_err(|source| UserError::ReadDirectory {
-            field: "tree_check_source",
-            path: tree_check_source.as_ref().to_owned(),
-            source,
+        let entry = entry.with_context(|| {
+            format!(
+                "Error when checking reading directory {:?}",
+                tree_check_source.as_ref()
+            )
         })?;
         let (sub_dir, _) = match paths::utf8_subdir(&entry) {
             DirEntrySubdirCases::UTF8SubDir {
                 full_path,
                 last_segment,
             } => (full_path, last_segment),
-            DirEntrySubdirCases::IOError(e) => {
-                return Err(UserError::ReadDirectory {
-                    field: "Check run trees",
-                    path: entry.path(),
-                    source: e,
-                }
-                .into());
+            DirEntrySubdirCases::IOError(_) => {
+                panic!("TODO");
             }
             DirEntrySubdirCases::NotUTF8 => {
                 warn!(
@@ -1186,24 +1178,24 @@ fn check_ssh_access(config: &Config) -> Result<(), AppError> {
     }
 }
 
-fn check_readable_directory(path: &CanonicalDirBuf, field: &'static str) -> Result<(), UserError> {
-    fs::read_dir(path).map_err(|source| UserError::ReadDirectory {
-        field,
+fn check_readable_directory(path: &CanonicalDirBuf, description: &str) -> Result<(), UserError> {
+    fs::read_dir(path).map_err(|source| UserError::DirectoryNotReadable {
+        description: description.to_owned(),
         path: path.as_ref().to_owned(),
         source,
     })?;
     Ok(())
 }
 
-fn check_writable_directory(path: &CanonicalDirBuf, tag: &'static str) -> Result<(), UserError> {
+fn check_writable_directory(path: &CanonicalDirBuf, description: &str) -> Result<(), UserError> {
     let segment: NormalPathSegmentBuf = NormalUTF8Segment::from_timestamp().into();
     let temp_path = path.join_file_name(&segment)?;
     OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(&temp_path)
-        .map_err(|source| UserError::WriteDirectory {
-            field: tag,
+        .map_err(|source| UserError::DirectoryNotWriteable {
+            description: description.to_owned(),
             path: path.as_ref().to_owned(),
             source,
         })?;
@@ -1383,20 +1375,6 @@ enum UserError {
         host: String,
         port: u16,
     },
-    #[error("failed to read `{field}` directory {}: {source}", path.display())]
-    ReadDirectory {
-        field: &'static str,
-        path: PathBuf,
-        #[source]
-        source: std::io::Error,
-    },
-    #[error("failed to write to `{field}` directory {}: {source}", path.display())]
-    WriteDirectory {
-        field: &'static str,
-        path: PathBuf,
-        #[source]
-        source: std::io::Error,
-    },
     #[error("failed to remove temporary probe file {}: {source}", path.display())]
     CleanupProbeFile {
         path: PathBuf,
@@ -1470,6 +1448,26 @@ enum UserError {
     FileStructureConflict {
         run_dir: PathBuf,
         relative_path: PathBuf,
+    },
+    #[error("error when reading a directory {description} at {} \
+        This directory must be readable \
+        Please make sure that you have permissions to read the directory\n\
+        Error: {}", path.display(), source)]
+    DirectoryNotReadable {
+        description: String,
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("error when writing a probe file to {description}.\n\
+        This directory must be writeable. Please make sure you have write permissions.\n\
+        Probe file path: {}\n\
+        Error: {}", path.display(), source)]
+    DirectoryNotWriteable {
+        description: String,
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
     },
     #[error("checked-out file {} in run {} conflicts with internal archive directory name `{archive_dir_name}`", relative_path.display(), run_dir.display())]
     ArchiveDirCheckoutConflict {
