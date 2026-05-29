@@ -1,3 +1,7 @@
+// The code in this module repsents file-system level knowledge about paths using newtypes.
+// There is plenty of opportunities for TOCTOU issues, but we don't want to anticipiate those
+// in this program.
+
 use serde::{Deserialize, Serialize};
 use std::{
     borrow::Borrow,
@@ -10,8 +14,61 @@ use std::{
 };
 use thiserror::Error;
 
+// This type represents a single, normal path segment. That is, an element of the path, which:
+// * Does not contain the root, or a Windows drive segment
+// * Does not contain a path separator
+// * Is not . or ..
+// * Is not the empty string
+#[repr(transparent)]
+pub struct NormalPathSegment(OsStr);
+
+impl NormalPathSegment {
+    pub fn new(path: &Path) -> Option<&Self> {
+        // Check path contains exactly one segment, which is Normal
+        let mut components = path.components();
+        match components.next() {
+            None => return None,
+            Some(std::path::Component::Normal(_)) => (),
+            Some(_) => return None,
+        }
+        if components.next().is_some() {
+            return None;
+        }
+        unsafe { Some(Self::from_os_str(path.as_os_str())) }
+    }
+
+    // Safety: The invariants above must be upheld
+    unsafe fn from_os_str(s: &OsStr) -> &Self {
+        // SAFETY: `MyOsStr` has the same layout as `OsStr`
+        unsafe { &*(s as *const OsStr as *const Self) }
+    }
+}
+
+// Owned version of NormalPathSegment, with same invariants
 #[derive(Debug, Hash, PartialEq, Eq, Deserialize, Serialize, Clone)]
 pub struct NormalPathSegmentBuf(OsString);
+
+impl ToOwned for NormalPathSegment {
+    type Owned = NormalPathSegmentBuf;
+
+    fn to_owned(&self) -> Self::Owned {
+        NormalPathSegmentBuf(self.0.to_owned())
+    }
+}
+
+impl Borrow<NormalPathSegment> for NormalPathSegmentBuf {
+    fn borrow(&self) -> &NormalPathSegment {
+        unsafe { NormalPathSegment::from_os_str(&self.0) }
+    }
+}
+
+impl std::ops::Deref for NormalPathSegmentBuf {
+    type Target = NormalPathSegment;
+
+    fn deref(&self) -> &NormalPathSegment {
+        unsafe { NormalPathSegment::from_os_str(&self.0) }
+    }
+}
 
 impl From<&std::fs::DirEntry> for NormalPathSegmentBuf {
     fn from(item: &std::fs::DirEntry) -> Self {
@@ -26,6 +83,8 @@ impl AsRef<OsStr> for NormalPathSegment {
     }
 }
 
+// This has the same invariants as NormalPathSegment, but also guarantees
+// that the segment is UTF8.
 #[derive(Serialize, Deserialize, Clone, Debug, Hash, PartialEq, Eq)]
 pub struct NormalUTF8Segment(String);
 
@@ -52,35 +111,49 @@ impl NormalUTF8Segment {
     }
 }
 
-pub enum DirEntrySegmentCases {
-    UTF8Segment(NormalUTF8Segment),
+// What can happen when a DirEntry of reading a dir and looking for normal UTF8
+// subdirectories
+pub enum DirEntrySubdirCases {
+    // Unexpected IO Error
     IOError(std::io::Error),
-    IsRoot,
-    NotUTF8,
+    // Found a normal UTF8 subdir
+    UTF8SubDir {
+        full_path: CanonicalDirBuf,
+        last_segment: NormalUTF8Segment,
+    },
     IsSymlink,
+    IsNotDir,
+    NotUTF8,
 }
 
-pub fn segment(entry: &DirEntry) -> DirEntrySegmentCases {
+// Get last segment of this entry
+pub fn utf8_subdir(entry: &DirEntry) -> DirEntrySubdirCases {
     let md = match entry.metadata() {
         Ok(md) => md,
-        Err(e) => return DirEntrySegmentCases::IOError(e),
+        Err(e) => return DirEntrySubdirCases::IOError(e),
     };
     if md.is_symlink() {
-        return DirEntrySegmentCases::IsSymlink;
+        return DirEntrySubdirCases::IsSymlink;
+    }
+    if !md.is_dir() {
+        return DirEntrySubdirCases::IsNotDir;
     }
     let file_name = entry.file_name();
-    if file_name == "/" {
-        return DirEntrySegmentCases::IsRoot;
-    }
     NormalPathSegment::new(Path::new(&file_name)).unwrap_or_else(|| {
         panic!(
             "DirEntry segment ought to be a Normal segment, got {}",
             file_name.display()
         )
     });
+    // This is not entirely safe, because this presupposes the user created the
+    // DirEntry from an already canonical path.
+    let canonical = CanonicalDirBuf(entry.path().join(&file_name));
     match file_name.into_string() {
-        Ok(s) => DirEntrySegmentCases::UTF8Segment(NormalUTF8Segment(s)),
-        Err(_) => DirEntrySegmentCases::NotUTF8,
+        Ok(s) => DirEntrySubdirCases::UTF8SubDir {
+            full_path: canonical,
+            last_segment: NormalUTF8Segment(s),
+        },
+        Err(_) => DirEntrySubdirCases::NotUTF8,
     }
 }
 
@@ -104,54 +177,7 @@ impl TryFrom<&NormalPathSegment> for NormalUTF8Segment {
     }
 }
 
-// Not the file root, not the Windows drive, not .., not ., and
-// no path separator in this.
-#[repr(transparent)]
-pub struct NormalPathSegment(OsStr);
-
-impl NormalPathSegment {
-    pub fn new(path: &Path) -> Option<&Self> {
-        let mut components = path.components();
-        match components.next() {
-            None => return None,
-            Some(std::path::Component::Normal(_)) => (),
-            Some(_) => return None,
-        }
-        if components.next().is_some() {
-            return None;
-        }
-        unsafe { Some(Self::from_os_str(path.as_os_str())) }
-    }
-
-    unsafe fn from_os_str(s: &OsStr) -> &Self {
-        // SAFETY: `MyOsStr` has the same layout as `OsStr`
-        unsafe { &*(s as *const OsStr as *const Self) }
-    }
-}
-
-impl ToOwned for NormalPathSegment {
-    type Owned = NormalPathSegmentBuf;
-
-    fn to_owned(&self) -> Self::Owned {
-        NormalPathSegmentBuf(self.0.to_owned())
-    }
-}
-
-impl Borrow<NormalPathSegment> for NormalPathSegmentBuf {
-    fn borrow(&self) -> &NormalPathSegment {
-        unsafe { NormalPathSegment::from_os_str(&self.0) }
-    }
-}
-
-impl std::ops::Deref for NormalPathSegmentBuf {
-    type Target = NormalPathSegment;
-
-    fn deref(&self) -> &NormalPathSegment {
-        unsafe { NormalPathSegment::from_os_str(&self.0) }
-    }
-}
-
-// File exists and is absolute and normalized
+// File exists, is a directory, and is absolute and normalized
 #[derive(Debug, Hash, PartialEq, Eq, Clone)]
 pub struct CanonicalDirBuf(PathBuf);
 
@@ -161,15 +187,18 @@ impl AsRef<Path> for CanonicalDirBuf {
     }
 }
 
+// When building a CanonicalDirBuf from a CanonicalDirBuf and a NormalPathSegment,
+// you can get these errors (and also IOError, not covered here)
 pub enum SubDirectoryResult {
     IsNotDirectory,
+    IsSymlink,
     SubDirectory(CanonicalDirBuf),
 }
 
 impl SubDirectoryResult {
-    pub fn expect_dir(self, s: &str) -> CanonicalDirBuf {
+    pub fn expect_normal_dir(self, s: &str) -> CanonicalDirBuf {
         match self {
-            Self::IsNotDirectory => panic!("{}", s),
+            Self::IsNotDirectory | Self::IsSymlink => panic!("{}", s),
             Self::SubDirectory(x) => x,
         }
     }
@@ -219,6 +248,10 @@ impl CanonicalDirBuf {
                 path: inner.to_owned(),
                 source,
             })?;
+        // If this is a symlink, it's not canonicalized
+        if metadata.is_symlink() {
+            return Ok(SubDirectoryResult::IsSymlink);
+        }
         if metadata.is_dir() {
             Ok(SubDirectoryResult::SubDirectory(Self(inner)))
         } else {
@@ -236,7 +269,10 @@ impl CanonicalDirBuf {
     }
 }
 
-// File is not absolute, do not contain . or .. and may not exist
+// Is not absolute, and therefore cannot be considered canonical
+// (i.e. it makes no sense to query the file system to normalize it)
+// but it should be lexographically normalized (i.e. no segments with)
+// . or .. ie all segments should be Component::Normal
 #[derive(Debug, Hash, PartialEq, Eq)]
 pub struct RelativePathBuf(PathBuf);
 
@@ -291,9 +327,10 @@ impl From<&std::fs::DirEntry> for RelativePathBuf {
     }
 }
 
-// File may not exist, but is absolute and normalized.
-// Its parent is canonical.
-// If it exists, it must be a file
+// This represents a child of a CanonicalDirBuf, which is either an existing
+// file (not a dir), or which does not exist.
+// The last segment must be a Normal segment.
+// This is used to represent e.g. a log file, which may not have been created yet.
 #[derive(Debug)]
 pub struct CanonicalChildFileBuf(PathBuf);
 

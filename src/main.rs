@@ -20,8 +20,8 @@ use transfer_log::TransferLog;
 use walkdir::WalkDir;
 
 use crate::paths::{
-    CanonicalChildFileBuf, CanonicalDirBuf, DirEntrySegmentCases, NormalPathSegment,
-    NormalPathSegmentBuf, NormalUTF8Segment, PathError, RelativePathBuf, SubDirectoryResult,
+    CanonicalChildFileBuf, CanonicalDirBuf, DirEntrySubdirCases, NormalPathSegment,
+    NormalPathSegmentBuf, NormalUTF8Segment, PathError, RelativePathBuf,
 };
 
 mod config;
@@ -393,16 +393,26 @@ fn scan_directories(
             source: e,
         })?;
 
-        let segment = match paths::segment(&entry) {
-            DirEntrySegmentCases::UTF8Segment(s) => s,
-            DirEntrySegmentCases::IOError(e) => {
+        let (entry_path, segment) = match paths::utf8_subdir(&entry) {
+            DirEntrySubdirCases::UTF8SubDir {
+                full_path,
+                last_segment,
+            } => (full_path, last_segment),
+            DirEntrySubdirCases::IOError(e) => {
                 return Err(AppError::ReadDirectory {
                     field: "Run dir",
                     path: entry.path(),
                     source: e,
                 });
             }
-            DirEntrySegmentCases::NotUTF8 => {
+            DirEntrySubdirCases::IsSymlink => {
+                warn!(
+                    "Found symlink when traversing source directory: {:?}, skipping",
+                    &entry.file_name()
+                );
+                continue;
+            }
+            DirEntrySubdirCases::NotUTF8 => {
                 warn!(
                     "Found non-UTF8 entry in source {}: {}. Skipping",
                     source.as_ref().display(),
@@ -410,22 +420,10 @@ fn scan_directories(
                 );
                 continue;
             }
-            DirEntrySegmentCases::IsRoot => panic!("Should not be possible"),
-            DirEntrySegmentCases::IsSymlink => {
-                warn!(
-                    "Found symlink when traversing source directory: {:?}, skipping",
-                    &entry.file_name()
-                );
-                continue;
-            }
+            DirEntrySubdirCases::IsNotDir => continue,
         };
 
         let relative = segment.as_normal();
-        let entry_path = match source.try_from_existing_subdirectory(relative)? {
-            // Skip files, since we only transfer subdirectories
-            SubDirectoryResult::IsNotDirectory => continue,
-            SubDirectoryResult::SubDirectory(p) => p,
-        };
 
         debug!("Classifying {}", entry_path.as_ref().display());
 
@@ -449,7 +447,7 @@ fn scan_directories(
 
         let sub_dir_path = source
             .try_from_existing_subdirectory(relative)?
-            .expect_dir("We just checked it was a dir");
+            .expect_normal_dir("We just checked it was a non-symlink dir");
 
         let target = match categorize(&sub_dir_path, categories)? {
             Some(t) => {
@@ -646,7 +644,7 @@ fn transfer_new_directories(
     {
         let source_run_dir = source
             .try_from_existing_subdirectory(run_dir.as_normal())?
-            .expect_dir("Run dir should be directory");
+            .expect_normal_dir("Run dir should be directory");
         let classification = classify_run_files(&source_run_dir, &target.filestructure)?;
 
         let destination_to_create = {
@@ -802,7 +800,7 @@ fn transfer_run_to_landing_zone(
     // Classify all files in the run dir in the source
     let canonical_source_run_dir = source
         .try_from_existing_subdirectory(run_dir.as_normal())?
-        .expect_dir("run_dir is known to be a dir");
+        .expect_normal_dir("run_dir is known to be a dir");
     ensure_no_archive_dir_checkout_conflict(&canonical_source_run_dir, &classified_files.checkout)?;
 
     // Create the dir in staging area
@@ -1114,39 +1112,38 @@ fn check_run_trees(
             path: tree_check_source.as_ref().to_owned(),
             source,
         })?;
-        let file_name = match paths::segment(&entry) {
-            DirEntrySegmentCases::UTF8Segment(s) => s,
-            DirEntrySegmentCases::IOError(e) => {
+        let (sub_dir, _) = match paths::utf8_subdir(&entry) {
+            DirEntrySubdirCases::UTF8SubDir {
+                full_path,
+                last_segment,
+            } => (full_path, last_segment),
+            DirEntrySubdirCases::IOError(e) => {
                 return Err(AppError::ReadDirectory {
                     field: "Check run trees",
                     path: entry.path(),
                     source: e,
                 });
             }
-            DirEntrySegmentCases::IsRoot => panic!("Should never happen"),
-            DirEntrySegmentCases::NotUTF8 => {
+            DirEntrySubdirCases::NotUTF8 => {
                 warn!(
                     "Found non-UTF8 directory entry: {:?}, skipping",
                     &entry.file_name()
                 );
                 continue;
             }
-            DirEntrySegmentCases::IsSymlink => {
+            DirEntrySubdirCases::IsSymlink => {
                 warn!(
                     "Found symlink when traversing tun trees: {:?}, skipping",
                     &entry.file_name()
                 );
                 continue;
             }
+            DirEntrySubdirCases::IsNotDir => {
+                continue;
+            }
         };
-        let segment: NormalPathSegmentBuf = file_name.into();
-        let subdir = match tree_check_source.try_from_existing_subdirectory(&segment)? {
-            SubDirectoryResult::SubDirectory(s) => s,
-            // Skip non-directories in check
-            SubDirectoryResult::IsNotDirectory => continue,
-        };
-        if let Some(target) = categorize(&subdir, categories)? {
-            let _ = classify_run_files(&subdir, &target.filestructure)?;
+        if let Some(target) = categorize(&sub_dir, categories)? {
+            let _ = classify_run_files(&sub_dir, &target.filestructure)?;
         }
     }
 
