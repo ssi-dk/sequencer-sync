@@ -1178,7 +1178,7 @@ fn load_config(config_path: &Path) -> Result<Config, UserError> {
     })
 }
 
-fn check_ssh_access(config: &Config) -> Result<(), UserError> {
+fn check_ssh_access(config: &Config) -> Result<(), AppError> {
     debug!(
         "Checking SSH access. User name: {} port: {} domain name: {}",
         config.server_user, config.server_port, config.server_host
@@ -1192,7 +1192,7 @@ fn check_ssh_access(config: &Config) -> Result<(), UserError> {
         .arg("--")
         .arg("true")
         .status()
-        .map_err(|source| UserError::SpawnSsh { source })?;
+        .context("Failed to execute SSH command")?;
 
     if status.success() {
         Ok(())
@@ -1201,7 +1201,8 @@ fn check_ssh_access(config: &Config) -> Result<(), UserError> {
             user: config.server_user.clone(),
             host: config.server_host.clone(),
             port: config.server_port,
-        })
+        }
+        .into())
     }
 }
 
@@ -1392,11 +1393,6 @@ enum UserError {
         path: PathBuf,
         #[source]
         source: ConfigError,
-    },
-    #[error("failed to execute ssh: {source}")]
-    SpawnSsh {
-        #[source]
-        source: std::io::Error,
     },
     #[error("ssh access check failed for {user}@{host}:{port}")]
     SshAccessDenied {
