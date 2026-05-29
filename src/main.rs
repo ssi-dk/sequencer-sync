@@ -1,13 +1,11 @@
 use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
-use std::io::ErrorKind;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::process::ExitCode;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use bstr::{BStr, BString, ByteSlice};
 use clap::{Args, Parser, Subcommand};
@@ -15,7 +13,7 @@ use config::{Config, ConfigError};
 use flate2::Compression;
 use flate2::write::GzEncoder;
 use fs2::FileExt;
-use log::{debug, error, warn};
+use log::{debug, warn};
 use run_log::RunLog;
 use thiserror::Error;
 use transfer_log::TransferLog;
@@ -236,7 +234,7 @@ struct ScanResult {
 
 fn run_command(args: RunArgs) -> Result<(), AppError> {
     let config = load_config(&args.config_path)?;
-    let mut run_log = RunLog::new(&config.logdir);
+    let mut run_log = RunLog::new(&config.logdir)?;
 
     let _lock = match acquire_run_lock(&config.lock_file)? {
         Some(lock) => lock,
@@ -305,10 +303,15 @@ fn validate_environment(config: &Config, skip_ssh_check: bool) -> Result<(), App
             })?;
 
         debug!("\tChecking file can be moved to landing_zone");
-        move_from_staging_zone_to_landing_zone(&segment, &cat.staging_zone, &cat.landing_zone)?;
+        let landing_zone_marker_path =
+            move_from_staging_zone_to_landing_zone(&segment, &cat.staging_zone, &cat.landing_zone)?;
 
         debug!("Removing marker file from landing zone");
-        fs::remove_file(&cat.landing_zone.join_file_name(&segment)?);
+
+        fs::remove_file(&landing_zone_marker_path).map_err(|e| AppError::RemoveMarker {
+            path: landing_zone_marker_path,
+            source: e,
+        })?;
 
         check_writable_directory(&cat.landing_zone, "category.landing_zone")?;
     }
@@ -481,7 +484,11 @@ fn scan_directories(
             }
         }
 
-        planned_transfers.push(PlannedTransfer { run_dir: segment, reason, target });
+        planned_transfers.push(PlannedTransfer {
+            run_dir: segment,
+            reason,
+            target,
+        });
     }
     summary.planned = planned_transfers.len() as u32;
 
@@ -571,7 +578,13 @@ fn categorize(
                 });
             }
             // This can't fail because it's guaranteed to just be four ASCII integers
-            let segment = NormalPathSegment::new(Path::new(&format!("20{}{}", bytes[0] as char, bytes[1] as char))).unwrap().try_into().unwrap();
+            let segment = NormalPathSegment::new(Path::new(&format!(
+                "20{}{}",
+                bytes[0] as char, bytes[1] as char
+            )))
+            .unwrap()
+            .try_into()
+            .unwrap();
             TransferDestination::YearSubDirectory((cat.landing_zone.clone(), segment))
         } else {
             TransferDestination::LandingZone(cat.landing_zone.clone())
@@ -593,7 +606,6 @@ fn transfer_new_directories(
     run_log: &mut RunLog,
     args: &RunArgs,
 ) -> Result<(), AppError> {
-    
     let (mut succeeded, mut failed) = (0u32, 0u32);
 
     // Scan directories to classify them
@@ -609,10 +621,7 @@ fn transfer_new_directories(
         args.transfer_incomplete,
     )?;
 
-    debug!(
-        "Total directories to transfer: {}",
-        planned_transfers.len()
-    );
+    debug!("Total directories to transfer: {}", planned_transfers.len());
 
     if !summary.has_noteworthy_activity() {
         return Ok(());
@@ -629,14 +638,23 @@ fn transfer_new_directories(
         }
     }
 
-    for PlannedTransfer{run_dir, reason, target} in planned_transfers {
-        let source_run_dir = source.try_from_existing_subdirectory(run_dir.as_normal())?.expect_dir("Run dir should be directory");
+    for PlannedTransfer {
+        run_dir,
+        reason,
+        target,
+    } in planned_transfers
+    {
+        let source_run_dir = source
+            .try_from_existing_subdirectory(run_dir.as_normal())?
+            .expect_dir("Run dir should be directory");
         let classification = classify_run_files(&source_run_dir, &target.filestructure)?;
-        
+
         let destination_to_create = {
-            let lz: PathBuf = match target.destination {
+            let lz: PathBuf = match &target.destination {
                 TransferDestination::LandingZone(lz) => lz.as_ref().to_owned(),
-                TransferDestination::YearSubDirectory((lz, subdir)) => lz.as_ref().join(subdir.as_normal().as_ref()).to_owned(),
+                TransferDestination::YearSubDirectory((lz, subdir)) => {
+                    lz.as_ref().join(subdir.as_normal().as_ref())
+                }
             };
             lz.join(run_dir.as_normal().as_ref())
         };
@@ -1273,15 +1291,6 @@ fn acquire_run_lock(path: &CanonicalChildFileBuf) -> Result<Option<RunLock>, App
     }
 }
 
-fn lock_file_parent(lock_file: &Path) -> Result<&Path, AppError> {
-    lock_file
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .ok_or_else(|| AppError::MissingLockFileParent {
-            path: lock_file.to_path_buf(),
-        })
-}
-
 fn shell_quote(value: &BStr) -> BString {
     let mut s = BString::new(vec![b'\'']);
     s.append(&mut value.replace(b"\'", b"'\\''").to_vec());
@@ -1307,6 +1316,12 @@ enum AppError {
         #[source]
         source: ConfigError,
     },
+    #[error("failed to remove marker file at landing zone at {path}, got: {source}")]
+    RemoveMarker {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
     #[error("failed to execute ssh: {source}")]
     SpawnSsh {
         #[source]
@@ -1318,15 +1333,6 @@ enum AppError {
         host: String,
         port: u16,
     },
-    #[error("failed to access metadata for `{field}` directory {}: {source}", path.display())]
-    ReadMetadata {
-        field: &'static str,
-        path: PathBuf,
-        #[source]
-        source: std::io::Error,
-    },
-    #[error("config field `{field}` must point to a directory: {}", path.display())]
-    NotADirectory { field: &'static str, path: PathBuf },
     #[error("failed to read `{field}` directory {}: {source}", path.display())]
     ReadDirectory {
         field: &'static str,
@@ -1465,20 +1471,6 @@ enum AppError {
         relative_path: PathBuf,
         archive_dir_name: &'static str,
     },
-    #[error("run file {} is not under run directory {}", path.display(), run_dir.display())]
-    RunFileOutsideRunDir { run_dir: PathBuf, path: PathBuf },
-    #[error("failed to write transfer marker {}: {source}", path.display())]
-    WriteTransferMarker {
-        path: PathBuf,
-        #[source]
-        source: std::io::Error,
-    },
-    #[error("failed to inspect transfer marker {}: {source}", path.display())]
-    ReadTransferMarker {
-        path: PathBuf,
-        #[source]
-        source: std::io::Error,
-    },
     #[error("one or more run log writes failed (see warnings above)")]
     RunLogWriteFailed,
     #[error("failed to determine path to current executable: {source}")]
@@ -1486,10 +1478,6 @@ enum AppError {
         #[source]
         source: std::io::Error,
     },
-    #[error("cannot render cron file because {field} is not valid UTF-8: {}", path.display())]
-    NonUtf8CronPath { field: &'static str, path: PathBuf },
-    #[error("lock file path has no parent directory: {}", path.display())]
-    MissingLockFileParent { path: PathBuf },
     #[error(
         "directory `{dir_name}` matched category regex `{category_regex}` with year_subdirectory enabled, but name does not start with two ASCII digits"
     )]

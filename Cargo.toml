@@ -2,7 +2,7 @@
 name = "sequencer-sync"
 version = "2.0.1"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.87"
 build = "build.rs"
 
 [dependencies]

@@ -1,10 +1,12 @@
 use std::fs::OpenOptions;
 use std::io::Write;
-use std::path::Path;
 
 use chrono::Local;
 
-use crate::paths::{CanonicalChildFileBuf, CanonicalDirBuf, NormalPathSegment, RelativePathBuf};
+use crate::{
+    AppError,
+    paths::{CanonicalChildFileBuf, CanonicalDirBuf, NormalPathSegment},
+};
 
 // Human-readable log. Two files: Full log, and latest attempted transfer log.
 pub struct RunLog {
@@ -24,8 +26,8 @@ pub struct RunLog {
 }
 
 impl RunLog {
-    pub fn new(logdir: &CanonicalDirBuf) -> Self {
-        Self {
+    pub fn new(logdir: &CanonicalDirBuf) -> Result<Self, AppError> {
+        Ok(Self {
             full_log_path: logdir
                 .join_file_name(&NormalPathSegment::new("sequencer-sync.log".as_ref()).unwrap())?,
             latest_log_path: logdir.join_file_name(
@@ -34,7 +36,7 @@ impl RunLog {
             pending_latest_lines: Vec::new(),
             latest_started: false,
             had_error: false,
-        }
+        })
     }
 
     /// Returns true if a non-fatal error was recorded during this run.

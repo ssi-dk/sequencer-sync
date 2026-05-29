@@ -3,7 +3,7 @@ use std::{
     borrow::Borrow,
     ffi::{OsStr, OsString},
     fs::DirEntry,
-    io::{Error, ErrorKind},
+    io::ErrorKind,
     os::unix::ffi::OsStrExt,
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
@@ -73,7 +73,10 @@ pub fn segment(entry: &DirEntry) -> DirEntrySegmentCases {
         return DirEntrySegmentCases::IsRoot;
     }
     NormalPathSegment::new(Path::new(&file_name)).unwrap_or_else(|| {
-        panic!("DirEntry segment ought to be a Normal segment, got {:?file_name}")
+        panic!(
+            "DirEntry segment ought to be a Normal segment, got {}",
+            file_name.display()
+        )
     });
     match file_name.into_string() {
         Ok(s) => DirEntrySegmentCases::UTF8Segment(NormalUTF8Segment(s)),

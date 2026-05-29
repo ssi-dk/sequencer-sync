@@ -129,8 +129,8 @@ pub enum ConfigError {
         path.display()
     )]
     DuplicatePath {
-        first: &'static str,
-        second: &'static str,
+        first: String,
+        second: String,
         path: PathBuf,
     },
     #[error("config must contain at least one [[category]]")]
@@ -153,17 +153,6 @@ pub enum ConfigError {
     },
     #[error("config field `{field}` must contain at least one glob pattern")]
     EmptyGlobList { field: &'static str },
-    #[error("Expected {label} directory to exist: '{}'", path.display())]
-    MissingDirectory { label: &'static str, path: PathBuf },
-    #[error("Expected {label} to be a directory: '{}'", path.display())]
-    NotDirectory { label: &'static str, path: PathBuf },
-    #[error("failed to inspect {label} directory '{}': {source}", path.display())]
-    ReadDirectoryMetadata {
-        label: &'static str,
-        path: PathBuf,
-        #[source]
-        source: std::io::Error,
-    },
 }
 
 impl From<PathError> for ConfigError {
@@ -238,44 +227,6 @@ fn validate_config_version(version: u16) -> Result<(), ConfigError> {
     }
 }
 
-fn validate_existing_directory(field: &'static str, path: &Path) -> Result<(), ConfigError> {
-    let label = directory_label(field);
-    let metadata = fs::metadata(path).map_err(|source| {
-        if source.kind() == std::io::ErrorKind::NotFound {
-            ConfigError::MissingDirectory {
-                label,
-                path: path.to_path_buf(),
-            }
-        } else {
-            ConfigError::ReadDirectoryMetadata {
-                label,
-                path: path.to_path_buf(),
-                source,
-            }
-        }
-    })?;
-
-    if metadata.is_dir() {
-        Ok(())
-    } else {
-        Err(ConfigError::NotDirectory {
-            label,
-            path: path.to_path_buf(),
-        })
-    }
-}
-
-fn directory_label(field: &'static str) -> &'static str {
-    match field {
-        "lock_file parent" => "lock",
-        "logdir" => "log",
-        "source" => "source",
-        "category.landing_zone" => "landing zone",
-        "category.staging_zone" => "staging zone",
-        _ => field,
-    }
-}
-
 impl UnvalidatedConfig {
     fn validate(self) -> Result<Config, ConfigError> {
         let lock_file =
@@ -306,10 +257,27 @@ impl UnvalidatedConfig {
             filestructures.insert(name.clone(), Arc::new(filestructure.validate(name)?));
         }
 
+        let mut distinct_paths: Vec<(String, PathBuf)> = vec![
+            ("source".to_owned(), source.as_ref().to_owned()),
+            (
+                "lock_file parent".to_owned(),
+                lock_file.parent().as_ref().to_owned(),
+            ),
+            ("logdir".to_owned(), logdir.as_ref().to_owned()),
+        ];
+
         let mut categories = Vec::with_capacity(self.category.len());
         for cat in self.category {
             categories.push(cat.validate(&filestructures)?);
         }
+        for (category_index, category) in categories.iter().enumerate() {
+            distinct_paths.push((
+                format!("Landing zone of category {}", category_index),
+                category.landing_zone.as_ref().to_owned(),
+            ));
+        }
+
+        validate_all_paths_distinct(&distinct_paths)?;
 
         Ok(Config {
             lock_file,
@@ -432,16 +400,15 @@ fn is_literal_glob(pattern: &str) -> bool {
     !pattern.contains(['*', '?', '[', ']'])
 }
 
-fn validate_all_paths_distinct(paths: &[(&'static str, &Path)]) -> Result<(), ConfigError> {
-    for i in 0..paths.len() {
-        for j in (i + 1)..paths.len() {
-            if paths[i].1 == paths[j].1 {
-                return Err(ConfigError::DuplicatePath {
-                    first: paths[i].0,
-                    second: paths[j].0,
-                    path: paths[i].1.to_path_buf(),
-                });
-            }
+fn validate_all_paths_distinct(paths: &[(String, PathBuf)]) -> Result<(), ConfigError> {
+    let mut description_of = HashMap::new();
+    for (description, path) in paths.iter() {
+        if let Some(old_description) = description_of.insert(path, description) {
+            return Err(ConfigError::DuplicatePath {
+                first: old_description.clone(),
+                second: description.clone(),
+                path: path.clone(),
+            });
         }
     }
     Ok(())

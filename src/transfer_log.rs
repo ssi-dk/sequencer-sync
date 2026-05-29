@@ -1,16 +1,13 @@
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::paths::{
-    CanonicalDirBuf, NormalPathSegment, NormalPathSegmentBuf, NormalPathSegmentStr,
-    NormalUTF8Segment,
-};
+use crate::paths::{CanonicalDirBuf, NormalPathSegment, NormalUTF8Segment};
 use crate::{TransferAction, TransferReason};
 
 const TRANSFER_LOG_FILE_NAME: &str = "transferred-directories.jsonl";
@@ -72,15 +69,6 @@ pub enum TransferLogError {
         directory: String,
         #[source]
         source: serde_json::Error,
-    },
-    #[error(
-        "transfer directory {} is not under source directory {}",
-        directory.display(),
-        source_dir.display()
-    )]
-    DirectoryOutsideSource {
-        source_dir: PathBuf,
-        directory: PathBuf,
     },
 }
 
