@@ -613,7 +613,7 @@ fn transfer_new_directories(
     transfer_log: &mut TransferLog,
     run_log: &mut RunLog,
     args: &RunArgs,
-) -> Result<(), UserError> {
+) -> Result<(), AppError> {
     let (mut succeeded, mut failed) = (0u32, 0u32);
 
     // Scan directories to classify them
@@ -806,7 +806,7 @@ fn transfer_run_to_landing_zone(
     landing_zone: &CanonicalDirBuf,
     classified_files: ClassifiedFiles,
     compress: bool,
-) -> Result<(), UserError> {
+) -> Result<(), AppError> {
     ensure_no_archive_dir_checkout_conflict(directory_to_transfer, &classified_files.checkout)?;
 
     let staging_run_dir = staging_run_dir_segment(run_dir);
@@ -843,10 +843,8 @@ fn transfer_run_to_landing_zone(
         let archive_path = canonical_staging_run_dir.join_file_name(archive_segment)?;
 
         create_archive_tar(&archive_path, &archive_dir, compress)?;
-        fs::remove_dir_all(&archive_dir).map_err(|source| UserError::RemoveArchiveDir {
-            path: archive_dir.as_ref().to_owned(),
-            source,
-        })?;
+        fs::remove_dir_all(&archive_dir)
+            .context("Failed to remove archive directory after creating tar")?;
     }
 
     move_from_staging_zone_to_landing_zone(
@@ -993,7 +991,7 @@ fn create_archive_tar(
     archive_path: &CanonicalChildFileBuf,
     archive_dir: &CanonicalDirBuf,
     compress: bool,
-) -> Result<(), UserError> {
+) -> Result<(), AppError> {
     let file = File::create(archive_path).map_err(|source| UserError::CreateArchiveTar {
         path: archive_path.as_ref().to_path_buf(),
         source,
@@ -1001,60 +999,42 @@ fn create_archive_tar(
     if compress {
         let encoder = GzEncoder::new(file, Compression::default());
         let mut builder = tar::Builder::new(encoder);
-        write_archive_tar(archive_dir, archive_path, &mut builder)?;
+        write_archive_tar(archive_dir, &mut builder)?;
         let encoder = builder
             .into_inner()
-            .map_err(|source| UserError::WriteArchiveTar {
-                archive_dir: archive_dir.as_ref().to_path_buf(),
-                archive_tar: archive_path.as_ref().to_path_buf(),
-                source,
-            })?;
+            .context("Failed to write archive tar in staging area")?;
         encoder
             .finish()
-            .map_err(|source| UserError::WriteArchiveTar {
-                archive_dir: archive_dir.as_ref().to_path_buf(),
-                archive_tar: archive_path.as_ref().to_path_buf(),
-                source,
-            })?;
+            .context("Failed to write archive tar in staging area")?;
         Ok(())
     } else {
         let mut builder = tar::Builder::new(file);
-        write_archive_tar(archive_dir, archive_path, &mut builder)
+        write_archive_tar(archive_dir, &mut builder)
     }
 }
 
 fn write_archive_tar<W: std::io::Write>(
     archive_dir: &CanonicalDirBuf,
-    archive_path: &CanonicalChildFileBuf, // exists at this point
     builder: &mut tar::Builder<W>,
-) -> Result<(), UserError> {
+) -> Result<(), AppError> {
     builder
         .append_dir_all(".", archive_dir)
-        .map_err(|source| UserError::WriteArchiveTar {
-            archive_dir: archive_dir.as_ref().to_owned(),
-            archive_tar: archive_path.as_ref().to_owned(),
-            source,
-        })?;
+        .context("Failed to write archive tar in staging area")?;
     builder
         .finish()
-        .map_err(|source| UserError::WriteArchiveTar {
-            archive_dir: archive_dir.as_ref().to_owned(),
-            archive_tar: archive_path.as_ref().to_owned(),
-            source,
-        })
+        .context("Failed to write archive tar in staging area")?;
+    Ok(())
 }
 
 fn classify_run_files(
     run_dir: &CanonicalDirBuf,
     filestructure: &config::FileStructure,
-) -> Result<ClassifiedFiles, UserError> {
+) -> Result<ClassifiedFiles, AppError> {
     let mut files = ClassifiedFiles::default();
 
     for entry in WalkDir::new(run_dir).follow_links(false) {
-        let entry = entry.map_err(|source| UserError::WalkRunDirectory {
-            run_dir: run_dir.as_ref().to_owned(),
-            source,
-        })?;
+        let entry = entry
+            .with_context(|| format!("Failed to walk run directory at {:?}", run_dir.as_ref()))?;
         if !entry.file_type().is_file() {
             continue;
         }
@@ -1119,7 +1099,7 @@ fn classify_relative_file(
 fn check_run_trees(
     tree_check_source: &CanonicalDirBuf,
     categories: &[config::Category],
-) -> Result<(), UserError> {
+) -> Result<(), AppError> {
     check_readable_directory(tree_check_source, "tree_check_source")?;
     let entries = fs::read_dir(tree_check_source).map_err(|source| UserError::ReadDirectory {
         field: "tree_check_source",
@@ -1143,7 +1123,8 @@ fn check_run_trees(
                     field: "Check run trees",
                     path: entry.path(),
                     source: e,
-                });
+                }
+                .into());
             }
             DirEntrySubdirCases::NotUTF8 => {
                 warn!(
@@ -1468,19 +1449,6 @@ enum UserError {
         from.display(),
         to.display())]
     StagingZoneNotOnRightDevice { from: PathBuf, to: PathBuf },
-    #[error("failed to write archive tar from {} to {}: {source}", archive_dir.display(), archive_tar.display())]
-    WriteArchiveTar {
-        archive_dir: PathBuf,
-        archive_tar: PathBuf,
-        #[source]
-        source: std::io::Error,
-    },
-    #[error("failed to remove archive directory {} after creating archive.tar: {source}", path.display())]
-    RemoveArchiveDir {
-        path: PathBuf,
-        #[source]
-        source: std::io::Error,
-    },
     #[error(transparent)]
     TransferLog(#[from] transfer_log::TransferLogError),
     #[error("failed to open run lock file {}: {source}", path.display())]
@@ -1508,12 +1476,6 @@ enum UserError {
         run_dir: PathBuf,
         #[source]
         source: glob::GlobError,
-    },
-    #[error("failed to walk run directory {}: {source}", run_dir.display())]
-    WalkRunDirectory {
-        run_dir: PathBuf,
-        #[source]
-        source: walkdir::Error,
     },
     #[error("file {} in run {} matches both ignore_globs and checkout_globs", relative_path.display(), run_dir.display())]
     FileStructureConflict {
