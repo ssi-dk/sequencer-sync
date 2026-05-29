@@ -29,9 +29,9 @@ impl RunLog {
     pub fn new(logdir: &CanonicalDirBuf) -> Result<Self, AppError> {
         Ok(Self {
             full_log_path: logdir
-                .join_file_name(&NormalPathSegment::new("sequencer-sync.log".as_ref()).unwrap())?,
+                .join_file_name(NormalPathSegment::new("sequencer-sync.log".as_ref()).unwrap())?,
             latest_log_path: logdir.join_file_name(
-                &NormalPathSegment::new("sequencer-sync-latest.log".as_ref()).unwrap(),
+                NormalPathSegment::new("sequencer-sync-latest.log".as_ref()).unwrap(),
             )?,
             pending_latest_lines: Vec::new(),
             latest_started: false,

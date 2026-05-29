@@ -680,7 +680,7 @@ fn transfer_new_directories(
         let destination = match target.destination {
             TransferDestination::LandingZone(lz) => lz.clone(),
             TransferDestination::YearSubDirectory((lz, segment)) => {
-                lz.create_subdir(&segment.as_normal())?
+                lz.create_subdir(segment.as_normal())?
             }
         };
 
@@ -703,7 +703,7 @@ fn transfer_new_directories(
                 run_log.info(&format!(
                     "Transferred {} {} -> {}",
                     transfer_reason_label(reason),
-                    run_dir.to_inner(),
+                    run_dir.into_inner(),
                     destination.as_ref().display()
                 ));
             }
@@ -712,7 +712,7 @@ fn transfer_new_directories(
                 run_log.error(&format!(
                     "FAILED transfer {} {} -> {}: {error}",
                     transfer_reason_label(reason),
-                    run_dir.to_inner(),
+                    run_dir.into_inner(),
                     destination.as_ref().display()
                 ));
             }
@@ -828,7 +828,7 @@ fn transfer_run_to_landing_zone(
 
         create_parent_directories(&archive_dir, &classified_files.archived)?;
         for relative_path in &classified_files.archived {
-            copy_classified_file(&relative_path, &canonical_source_run_dir, &archive_dir)?;
+            copy_classified_file(relative_path, &canonical_source_run_dir, &archive_dir)?;
         }
 
         let archive_segment = if compress {
@@ -836,7 +836,7 @@ fn transfer_run_to_landing_zone(
         } else {
             NormalPathSegment::new(Path::new("archive.tar")).unwrap()
         };
-        let archive_path = canonical_staging_run_dir.join_file_name(&archive_segment)?;
+        let archive_path = canonical_staging_run_dir.join_file_name(archive_segment)?;
 
         create_archive_tar(&archive_path, &archive_dir, compress)?;
         fs::remove_dir_all(&archive_dir).map_err(|source| AppError::RemoveArchiveDir {
@@ -987,7 +987,7 @@ fn create_archive_tar(
     if compress {
         let encoder = GzEncoder::new(file, Compression::default());
         let mut builder = tar::Builder::new(encoder);
-        write_archive_tar(&archive_dir, &archive_path, &mut builder)?;
+        write_archive_tar(archive_dir, archive_path, &mut builder)?;
         let encoder = builder
             .into_inner()
             .map_err(|source| AppError::WriteArchiveTar {
@@ -1005,7 +1005,7 @@ fn create_archive_tar(
         Ok(())
     } else {
         let mut builder = tar::Builder::new(file);
-        write_archive_tar(&archive_dir, &archive_path, &mut builder)
+        write_archive_tar(archive_dir, archive_path, &mut builder)
     }
 }
 

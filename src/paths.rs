@@ -30,7 +30,7 @@ impl AsRef<OsStr> for NormalPathSegment {
 pub struct NormalUTF8Segment(String);
 
 impl NormalUTF8Segment {
-    pub fn to_inner(self) -> String {
+    pub fn into_inner(self) -> String {
         self.0
     }
 
@@ -86,7 +86,7 @@ pub fn segment(entry: &DirEntry) -> DirEntrySegmentCases {
 
 impl From<NormalUTF8Segment> for NormalPathSegmentBuf {
     fn from(value: NormalUTF8Segment) -> Self {
-        NormalPathSegmentBuf(value.to_inner().into())
+        NormalPathSegmentBuf(value.into_inner().into())
     }
 }
 
@@ -120,7 +120,7 @@ impl NormalPathSegment {
         if components.next().is_some() {
             return None;
         }
-        unsafe { return Some(Self::from_os_str(path.as_os_str())) }
+        unsafe { Some(Self::from_os_str(path.as_os_str())) }
     }
 
     unsafe fn from_os_str(s: &OsStr) -> &Self {
@@ -257,16 +257,16 @@ impl RelativePathBuf {
             return None;
         }
 
-        return Some(RelativePathBuf(path.to_owned()));
+        Some(RelativePathBuf(path.to_owned()))
     }
 
     pub fn parent(&self) -> Option<Self> {
-        self.0.parent().and_then(|x| {
+        self.0.parent().map(|x| {
             // Not sure why this can happen, but an LLM guarded against this, so just to be sure
             if x.as_os_str().is_empty() {
                 panic!("Two-component RelativePathBuf should never have empty path");
             } else {
-                Some(Self(x.to_owned()))
+                Self(x.to_owned())
             }
         })
     }

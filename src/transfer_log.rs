@@ -202,7 +202,7 @@ impl TransferLog {
 
         let line =
             serde_json::to_string(&record).map_err(|source| TransferLogError::Serialize {
-                directory: directory.clone().to_inner(),
+                directory: directory.clone().into_inner(),
                 source,
             })?;
 
@@ -278,7 +278,7 @@ pub fn initialize_if_absent(logdir: &CanonicalDirBuf) -> Result<(), TransferLogE
     };
 
     let line = serde_json::to_string(&record).map_err(|source| TransferLogError::Serialize {
-        directory: record.directory.clone().to_inner(),
+        directory: record.directory.clone().into_inner(),
         source,
     })?;
 
