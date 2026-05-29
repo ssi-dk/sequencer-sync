@@ -16,6 +16,8 @@ use std::{
 
 use thiserror::Error;
 
+use crate::{AppError, UserError};
+
 // This type represents a single, normal path segment. That is, an element of the path, which:
 // * Does not contain the root, or a Windows drive segment
 // * Does not contain a path separator
@@ -230,7 +232,7 @@ impl CanonicalDirBuf {
     pub unsafe fn new_unchecked(p: PathBuf) -> Self {
         Self(p)
     }
-    
+
     pub fn create_if_not_exist(&self, subdir: &NormalPathSegment) -> Result<Self, PathError> {
         let path = self.as_ref().join(subdir.as_ref());
         match std::fs::create_dir(&path) {
@@ -270,28 +272,27 @@ impl CanonicalDirBuf {
         }
     }
 
-    pub fn from_absolute(path: &Path, description: &str) -> Result<Self, PathError> {
+    pub fn from_absolute(path: &Path, description: &str) -> Result<Self, AppError> {
         check_absolute(path, description)?;
         match path.canonicalize() {
             Ok(path) => {
                 if path.is_dir() {
                     Ok(Self(path))
                 } else {
-                    Err(PathError::NotADirectory {
+                    Err(UserError::NotADirectory {
                         description: description.to_owned(),
                         path: path.to_owned(),
-                    })
+                    }
+                    .into())
                 }
             }
             Err(source) => match source.kind() {
-                ErrorKind::NotFound => Err(PathError::NotFound {
+                ErrorKind::NotFound => Err(UserError::NotFound {
                     description: description.to_owned(),
                     path: path.to_owned(),
-                }),
-                _ => Err(PathError::GeneralIOError {
-                    path: path.to_owned(),
-                    source,
-                }),
+                }
+                .into()),
+                _ => Err(AppError::Internal(anyhow::Error::from(source))),
             },
         }
     }
@@ -320,9 +321,10 @@ impl CanonicalDirBuf {
     pub fn join_file_name(
         &self,
         segment: &NormalPathSegment,
-    ) -> Result<CanonicalChildFileBuf, PathError> {
+        description: &str,
+    ) -> Result<CanonicalChildFileBuf, AppError> {
         let path = self.0.join(&segment.0);
-        check_is_file_or_missing(&path, "")?; // TODO: Better error here
+        check_is_file_or_missing(&path, description)?;
         Ok(CanonicalChildFileBuf(path))
     }
 }
@@ -400,12 +402,13 @@ impl AsRef<Path> for CanonicalChildFileBuf {
 }
 
 impl CanonicalChildFileBuf {
-    pub fn from_absolute(path: &Path, description: &str) -> Result<Self, PathError> {
+    pub fn from_absolute(path: &Path, description: &str) -> Result<Self, AppError> {
         check_absolute(path, description)?;
 
+        // This can only fail if paths ends in ..
         let file_name = path
             .file_name()
-            .ok_or_else(|| PathError::BadChildDirectory {
+            .ok_or_else(|| UserError::PathEndsInParent {
                 description: description.to_owned(),
                 path: path.to_owned(),
             })?;
@@ -414,7 +417,7 @@ impl CanonicalChildFileBuf {
         let parent = path
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
-            .ok_or_else(|| PathError::BadChildDirectory {
+            .ok_or_else(|| UserError::PathHasNoParent {
                 description: description.to_owned(),
                 path: path.to_owned(),
             })?;
@@ -435,31 +438,37 @@ impl CanonicalChildFileBuf {
     }
 }
 
-fn check_is_file_or_missing(path: &Path, description: &str) -> Result<(), PathError> {
+fn check_is_file_or_missing(path: &Path, description: &str) -> Result<(), AppError> {
     match path.metadata() {
         Ok(md) => {
+            if md.is_symlink() {
+                return Err(UserError::IsSymlinkNotRegularFile {
+                    description: description.to_owned(),
+                    path: path.to_owned(),
+                }
+                .into());
+            }
+
             if md.is_file() {
                 Ok(())
             } else {
-                Err(PathError::IsNotFileOrMissing {
+                Err(UserError::IsNotFileOrMissing {
                     description: description.to_owned(),
                     path: path.to_owned(),
-                })
+                }
+                .into())
             }
         }
         Err(inner) => match inner.kind() {
             ErrorKind::NotFound => Ok(()),
-            _ => Err(PathError::GeneralIOError {
-                path: path.to_owned(),
-                source: inner,
-            }),
+            _ => Err(AppError::internal_from(inner)),
         },
     }
 }
 
-fn check_absolute(path: &Path, description: &str) -> Result<(), PathError> {
+fn check_absolute(path: &Path, description: &str) -> Result<(), UserError> {
     if !path.is_absolute() {
-        return Err(PathError::NotAbsolute {
+        return Err(UserError::PathNotAbsolute {
             description: description.to_owned(),
             path: path.to_owned(),
         });

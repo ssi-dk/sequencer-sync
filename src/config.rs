@@ -10,6 +10,7 @@ use serde::Deserialize;
 use thiserror::Error;
 
 use crate::paths::{CanonicalChildFileBuf, CanonicalDirBuf, PathError};
+use crate::{AppError, UserError};
 
 const SUPPORTED_CONFIG_VERSION: u16 = 3;
 
@@ -137,8 +138,7 @@ struct UnvalidatedCategory {
 #[derive(Debug, Error)]
 pub enum ConfigError {
     #[error("Config path not found. No file at: {}", path.display())]
-    NotFound{path: PathBuf},
-    
+    NotFound { path: PathBuf },
     #[error("Config path {description} must be absolute and should not contain . or ..")]
     NonAbsolutePath { description: String },
     #[error("failed to read config file {}: {source}", path.display())]
@@ -156,8 +156,7 @@ pub enum ConfigError {
     },
     #[error("failed to parse YAML config: {0}")]
     Parse(serde_yaml::Error),
-    #[error("unsupported config version {found}; this binary supports config version {supported}")]
-    UnsupportedVersion { found: u16, supported: u16 },
+
     #[error("config field `{field}` must not be empty")]
     EmptyField { field: &'static str },
     #[error("config field `{field}` must not be 0")]
@@ -202,14 +201,17 @@ impl From<PathError> for ConfigError {
 }
 
 impl ConfigSpec {
-    pub(crate) fn from_yaml_str(contents: &str) -> Result<Self, ConfigError> {
+    pub(crate) fn from_yaml_str(contents: &str) -> Result<Self, AppError> {
         let config: UnvalidatedConfig = match serde_yaml::from_str(contents) {
             Ok(config) => config,
             Err(parse_error) => {
                 if let Ok(header) = serde_yaml::from_str::<ConfigHeader>(contents) {
                     validate_config_version(header.version)?;
                 }
-                return Err(ConfigError::Parse(parse_error));
+                return Err(AppError::Internal(
+                    anyhow::Error::from(parse_error)
+                        .context("Error in YAML parser when parsing config file"),
+                ));
             }
         };
 
@@ -217,7 +219,7 @@ impl ConfigSpec {
         config.validate_spec()
     }
 
-    fn into_resolved(self) -> Result<Config, ConfigError> {
+    fn into_resolved(self) -> Result<Config, AppError> {
         let lock_file =
             CanonicalChildFileBuf::from_absolute(&self.lock_file, "Lock file in config file")?;
         let logdir = CanonicalDirBuf::from_absolute(&self.log_dir, "Log dir in config file")?;
@@ -260,11 +262,12 @@ impl ConfigSpec {
 
         for (path, description) in lz_paths_descriptions.iter() {
             if let Some(existing) = description_of.get(path) {
-                return Err(ConfigError::DuplicatePath {
+                return Err(UserError::DuplicateConfigPath {
                     first: existing.clone(),
                     second: description.clone(),
                     path: path.clone(),
-                });
+                }
+                .into());
             }
         }
 
@@ -275,11 +278,12 @@ impl ConfigSpec {
         }
 
         if let Some(existing) = description_of.get(source.as_ref()) {
-            return Err(ConfigError::DuplicatePath {
+            return Err(UserError::DuplicateConfigPath {
                 first: existing.clone(),
                 second: "Source directory".to_owned(),
                 path: source.as_ref().to_owned(),
-            });
+            }
+            .into());
         }
 
         Ok(Config {
@@ -296,51 +300,54 @@ impl ConfigSpec {
 }
 
 impl Config {
-    pub fn from_path(path: &Path) -> Result<Self, ConfigError> {
-        
-        
+    pub fn from_path(path: &Path) -> Result<Self, AppError> {
         let contents = match fs::read_to_string(path) {
             Ok(s) => s,
             Err(e) if e.kind() == ErrorKind::NotFound => {
-                return Err(ConfigError::NotFound { path: path.to_owned() })
-            },
+                return Err(UserError::NotFound {
+                    description: "Config file".to_owned(),
+                    path: path.to_owned(),
+                }
+                .into());
+            }
+
             Err(source) => {
-                return Err(ConfigError::Read {
-                path: path.to_path_buf(),
-                source,
-                })
-            },
+                return Err(AppError::Internal(
+                    anyhow::Error::from(source).context("When reading config file"),
+                ));
+            }
         };
         let config = Self::resolve_from_yaml_str(&contents)?;
         Ok(config)
     }
 
-    pub(crate) fn resolve_from_yaml_str(contents: &str) -> Result<Self, ConfigError> {
+    pub(crate) fn resolve_from_yaml_str(contents: &str) -> Result<Self, AppError> {
         let spec = ConfigSpec::from_yaml_str(contents)?;
         spec.into_resolved()
     }
 }
 
-fn validate_config_version(version: u16) -> Result<(), ConfigError> {
+fn validate_config_version(version: u16) -> Result<(), UserError> {
     if version == SUPPORTED_CONFIG_VERSION {
         Ok(())
     } else {
-        Err(ConfigError::UnsupportedVersion {
+        Err(UserError::UnsupportedConfigVersion {
             found: version,
             supported: SUPPORTED_CONFIG_VERSION,
         })
     }
 }
 
-fn validate_absolute_normal(path: &Path, description: &str) -> Result<PathBuf, ConfigError> {
+fn validate_absolute_normal(path: &Path, description: &str) -> Result<PathBuf, UserError> {
     if (!path.is_absolute())
         || path
             .components()
             .skip(1)
             .any(|c| !matches!(c, std::path::Component::Normal(_)))
     {
-        Err(ConfigError::NonAbsolutePath {
+        Err(UserError::PathNotAbsolute {
             description: description.to_owned(),
+            path: path.to_owned(),
         })
     } else {
         Ok(path.to_owned())
@@ -394,7 +401,7 @@ impl UnvalidatedConfig {
 }
 
 impl UnvalidatedFileStructure {
-    fn validate(self, name: String) -> Result<FileStructure, ConfigError> {
+    fn validate(self, name: String) -> Result<FileStructure, AppError> {
         let (ignore_paths, ignore_globs) =
             validate_file_patterns("filestructures.*.ignore_globs", &self.ignore_globs)?;
         let (checkout_paths, checkout_globs) =
@@ -418,14 +425,14 @@ impl UnvalidatedCategory {
     fn validate_spec(
         self,
         filestructures: &HashMap<String, Arc<FileStructure>>,
-    ) -> Result<CategorySpec, ConfigError> {
+    ) -> Result<CategorySpec, AppError> {
         let landing_zone =
             validate_absolute_normal(&self.landing_zone, "Landing zone of category")?;
         let staging_zone =
             validate_absolute_normal(&self.staging_zone, "Staging zone of category")?;
 
-        let regex = Regex::new(&self.regex).map_err(|source| ConfigError::InvalidRegex {
-            field: "category.regex",
+        let regex = Regex::new(&self.regex).map_err(|source| UserError::InvalidConfigRegex {
+            description: "File structure regex".into(),
             source,
         })?;
 
@@ -439,9 +446,10 @@ impl UnvalidatedCategory {
         let file_structure = if let Some(file_structure) = filestructures.get(&self.filestructure) {
             file_structure.clone()
         } else {
-            return Err(ConfigError::UnknownFileStructure {
+            return Err(UserError::UnknownConfigFileStructure {
                 name: self.filestructure,
-            });
+            }
+            .into());
         };
 
         Ok(CategorySpec {
@@ -456,7 +464,7 @@ impl UnvalidatedCategory {
 }
 
 impl CategorySpec {
-    fn into_resolved(self) -> Result<Category, ConfigError> {
+    fn into_resolved(self) -> Result<Category, AppError> {
         // Check absolute paths
         let landing_zone =
             CanonicalDirBuf::from_absolute(&self.landing_zone, "Landing zone of a category")?;
@@ -474,15 +482,7 @@ impl CategorySpec {
     }
 }
 
-fn validate_non_empty(field: &'static str, value: &str) -> Result<(), ConfigError> {
-    if value.trim().is_empty() {
-        Err(ConfigError::EmptyField { field })
-    } else {
-        Ok(())
-    }
-}
-
-fn validate_glob(field: &'static str, pattern: &str) -> Result<Pattern, ConfigError> {
+fn validate_glob(description: &'static str, pattern: &str) -> Result<Pattern, AppError> {
     let path = Path::new(pattern);
 
     if pattern.is_empty()
@@ -497,13 +497,21 @@ fn validate_glob(field: &'static str, pattern: &str) -> Result<Pattern, ConfigEr
             )
         })
     {
-        return Err(ConfigError::GlobOutsideRunDirectory {
-            field,
+        return Err(UserError::ConfigGlobOutsideRunDirectory {
+            description: desciption.to_owned(),
             pattern: pattern.to_owned(),
-        });
+        }
+        .into());
     }
 
-    Pattern::new(pattern).map_err(|source| ConfigError::InvalidGlob { field, source })
+    Pattern::new(pattern).map_err(|source| {
+        UserError::InvalidConfigGlob {
+            description: description.to_owned(),
+            glob_string: pattern.to_owned(),
+            source,
+        }
+        .into()
+    })
 }
 
 fn validate_globs(field: &'static str, patterns: &[String]) -> Result<Vec<Pattern>, ConfigError> {

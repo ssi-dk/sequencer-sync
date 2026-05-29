@@ -24,6 +24,7 @@ use transfer_log::TransferLog;
 use walkdir::WalkDir;
 
 use crate::AppError::Internal;
+use crate::config::UserConfigError;
 use crate::paths::{
     CanonicalChildFileBuf, CanonicalDirBuf, DirEntrySubdirCases, NormalPathSegment,
     NormalPathSegmentBuf, NormalUTF8Segment, RelativePathBuf,
@@ -102,21 +103,24 @@ impl SetupArgs {
                 let canonicalized = match p.canonicalize() {
                     Ok(p) => p,
                     Err(e) if e.kind() == ErrorKind::NotFound => {
-                        return Err(UserError::NotFound { description: "Argument to --tree-check-source".to_owned(), path: p }.into())
-                    },
+                        return Err(UserError::NotFound {
+                            description: "Argument to --tree-check-source".to_owned(),
+                            path: p,
+                        }
+                        .into());
+                    }
                     Err(source) => {
-                        return Err(AppError::Internal(Error::from(source).with_context(|| {
-                            format!("When canonicalizing --tree-check-source given as {:?}", p)
-                        })))
+                        return Err(AppError::Internal(Error::from(source).context(format!(
+                            "When canonicalizing --tree-check-source given as {:?}",
+                            p
+                        ))));
                     }
                 };
                 if !canonicalized.is_dir() {
                     todo!();
                 }
-                unsafe {
-                    TreeCheck::Source(CanonicalDirBuf::new_unchecked(canonicalized))
-                }
-            },
+                unsafe { TreeCheck::Source(CanonicalDirBuf::new_unchecked(canonicalized)) }
+            }
             (None, false) => return Err(UserError::MissingTreeCheckArg.into()),
             (None, true) => TreeCheck::Skipped,
         };
@@ -313,7 +317,9 @@ fn validate_environment(config: &Config, skip_ssh_check: bool) -> Result<(), App
             cat.staging_zone.as_ref().display()
         );
         let segment: NormalPathSegmentBuf = NormalUTF8Segment::from_timestamp().into();
-        let staging_zone_marker_path = cat.staging_zone.join_file_name(&segment)?;
+        let staging_zone_marker_path = cat
+            .staging_zone
+            .join_file_name(&segment, "Staging zone marker file")?;
         OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -327,7 +333,9 @@ fn validate_environment(config: &Config, skip_ssh_check: bool) -> Result<(), App
             })?;
 
         debug!("\tChecking file can be moved to landing_zone");
-        let landing_zone_marker_path = cat.landing_zone.join_file_name(&segment)?;
+        let landing_zone_marker_path = cat
+            .landing_zone
+            .join_file_name(&segment, "Landing zone marker file")?;
         move_from_staging_zone_to_landing_zone(
             staging_zone_marker_path.as_ref(),
             landing_zone_marker_path.as_ref(),
@@ -575,9 +583,13 @@ fn categorize(
         if let Some(classification_glob) = &cat.classification_glob {
             let full_path = run_dir.as_ref().join(classification_glob.as_str());
             let class_glob_display = full_path.display();
-            if !glob_has_match(run_dir.as_ref(), classification_glob)
-                .with_context(|| format!("Failed to match potential run dir to classification glob.\n\
-                    Run dir: {:?}", run_dir.as_ref()))? {
+            if !glob_has_match(run_dir.as_ref(), classification_glob).with_context(|| {
+                format!(
+                    "Failed to match potential run dir to classification glob.\n\
+                    Run dir: {:?}",
+                    run_dir.as_ref()
+                )
+            })? {
                 debug!("\tClassification glob did not match: {class_glob_display}",);
                 continue;
             } else {
@@ -593,7 +605,8 @@ fn categorize(
                 return Err(UserError::YearSubdirectoryInvalidName {
                     dir_name: dir_name.to_owned(),
                     category_regex: cat.regex.to_string(),
-                }.into());
+                }
+                .into());
             }
             // This can't fail because it's guaranteed to just be four ASCII integers
             let segment = NormalPathSegment::new(Path::new(&format!(
@@ -973,9 +986,14 @@ fn create_parent_directories(
 
     for directory in directories {
         let to_create = target_root.as_ref().join(directory.as_ref());
-        fs::create_dir_all(&to_create)
-            .with_context(|| format!("Failed to create sub-directories of root {:?}.\n
-                Failing directory: {:?}", target_root.as_ref(), to_create))?;
+        fs::create_dir_all(&to_create).with_context(|| {
+            format!(
+                "Failed to create sub-directories of root {:?}.\n
+                Failing directory: {:?}",
+                target_root.as_ref(),
+                to_create
+            )
+        })?;
     }
 
     Ok(())
@@ -1179,7 +1197,7 @@ fn check_ssh_access(config: &Config) -> Result<(), AppError> {
         .arg("true")
         .output()
         .context("Failed to execute SSH command")?;
-    
+
     if output.status.success() {
         Ok(())
     } else {
@@ -1330,6 +1348,13 @@ impl AppError {
             Self::Internal(error) => Self::Internal(error.context(context)),
         }
     }
+
+    fn internal_from<E>(error: E) -> Self
+    where
+        E: core::error::Error + Send + Sync + 'static,
+    {
+        Self::Internal(anyhow::Error::from(error))
+    }
 }
 
 impl fmt::Display for AppError {
@@ -1357,14 +1382,9 @@ impl From<Error> for AppError {
 
 #[derive(Debug, Error)]
 enum UserError {
-    // Wraps a ConfigError. We have this because it's useful for testing to have a distinct
-    // ConfigError, but since this is usually a user error, we wrap it.
-    #[error("failed to load config from {}: {source}", path.display())]
-    LoadConfig {
-        path: PathBuf,
-        #[source]
-        source: ConfigError,
-    },
+    #[error("Unsupported config version {found}; this binary supports config version {supported}")]
+    UnsupportedConfigVersion { found: u16, supported: u16 },
+
     #[error("ssh access check failed for {user}@{host}:{port}. Stderr:\n{stderr}")]
     SshAccessDenied {
         user: String,
@@ -1372,8 +1392,19 @@ enum UserError {
         port: u16,
         stderr: BString,
     },
+    #[error("{description} ends in '..', but must be a regular path. Found path: {path:?}")]
+    PathEndsInParent { description: String, path: PathBuf },
+    #[error("{description} has no parent. It could terminate in '/'. Found path: {path:?}")]
+    PathHasNoParent { description: String, path: PathBuf },
     #[error(transparent)]
     PathError(#[from] Box<paths::PathError>),
+    #[error("{description} at {path:?} is a symlink, but must be a regular file.")]
+    IsSymlinkNotRegularFile { description: String, path: PathBuf },
+    #[error(
+        "{description} at {path:?} already exists, and is not a normal file. It could be a directory or a symlink."
+    )]
+    IsNotFileOrMissing { description: String, path: PathBuf },
+
     #[error("failed to rename from staging zone to landing zone.\n\
         \tDirectory in staging zone: {}\n\
         \tDirectory in landing zone: {}",
@@ -1411,21 +1442,50 @@ enum UserError {
         #[source]
         source: glob::GlobError,
     },
+    #[error("In config file, {description} is not a valid regex: {source}")]
+    InvalidConfigRegex {
+        description: String,
+        #[source]
+        source: regex::Error,
+    },
+    #[error(
+        "In config file, {description} must be a relative path/glob inside the run directory: {pattern:?}"
+    )]
+    ConfigGlobOutsideRunDirectory {
+        description: String,
+        pattern: String,
+    },
     #[error("file {} in run {} matches both ignore_globs and checkout_globs", relative_path.display(), run_dir.display())]
     FileStructureConflict {
         run_dir: PathBuf,
         relative_path: PathBuf,
     },
+    #[error(
+        "config fields `{first}` and `{second}` must not point to the same path: {}",
+        path.display()
+    )]
+    DuplicateConfigPath {
+        first: String,
+        second: String,
+        path: PathBuf,
+    },
+    #[error(
+        "In config, {description} is {glob_string}, which is not a valid glob pattern: {source}"
+    )]
+    InvalidConfigGlob {
+        description: String,
+        glob_string: String,
+        #[source]
+        source: glob::PatternError,
+    },
+    #[error("In config gile, category references unknown filestructure `{name}`")]
+    UnknownConfigFileStructure { name: String },
     #[error("{description} at {path:?} is not a directory, but must be.")]
-    NotADirectory {
-        description: String,
-        path: PathBuf,
-    },
+    NotADirectory { description: String, path: PathBuf },
     #[error("File or directory not found: {description} at {path:?}.")]
-    NotFound {
-        description: String,
-        path: PathBuf,
-    },
+    NotFound { description: String, path: PathBuf },
+    #[error("{description} must be an absolute path, but isn't. Got {:?}", path)]
+    PathNotAbsolute { description: String, path: PathBuf },
     #[error("error when reading a directory {description} at {} \
         This directory must be readable \
         Please make sure that you have permissions to read the directory\n\
