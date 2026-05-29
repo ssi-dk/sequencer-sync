@@ -164,7 +164,7 @@ fn setup(raw_args: SetupArgs) -> Result<(), AppError> {
     let config = load_config(&args.config_path)?;
     debug!(
         "Loaded {} configured filestructure(s)",
-        config.filestructures.len()
+        config.file_structures.len()
     );
 
     validate_environment(&config, args.skip_ssh_check)?;
@@ -591,7 +591,7 @@ fn categorize(
             category_index,
             destination,
             staging_zone: cat.staging_zone.clone(),
-            filestructure: cat.filestructure.clone(),
+            filestructure: cat.file_structure.clone(),
         }));
     }
     Ok(None)
@@ -674,11 +674,11 @@ fn transfer_new_directories(
             }
         };
 
-        // Create the intermediate year subdirectory if it exists
+        // Create the intermediate year subdirectory if it does not exists
         let destination = match target.destination {
             TransferDestination::LandingZone(lz) => lz.clone(),
             TransferDestination::YearSubDirectory((lz, segment)) => {
-                lz.create_subdir(segment.as_normal())?
+                lz.create_if_not_exist(segment.as_normal())?
             }
         };
 
@@ -1042,9 +1042,11 @@ fn classify_run_files(
         if !entry.file_type().is_file() {
             continue;
         }
-        // Safety: Since we begin from `run_dir`, and all directories are skipped,
-        // we can't begin at e.g. /, and so I think this can only return a relative path
-        let relative = RelativePathBuf::new(Path::new(&entry.file_name())).unwrap();
+
+        let relative = RelativePathBuf::new(entry.path().strip_prefix(run_dir.as_ref()).expect(
+            "Internal error: Path of entry must start with base path")).expect(
+                "Internal error: Expected path of entry to be normalized"
+            );
         classify_relative_file(run_dir, relative, filestructure, &mut files)?;
     }
 

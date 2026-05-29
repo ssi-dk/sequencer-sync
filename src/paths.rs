@@ -45,7 +45,7 @@ impl NormalPathSegment {
 }
 
 // Owned version of NormalPathSegment, with same invariants
-#[derive(Debug, Hash, PartialEq, Eq, Deserialize, Serialize, Clone)]
+#[derive(Debug, Hash, PartialEq, Eq, Clone)]
 pub struct NormalPathSegmentBuf(OsString);
 
 impl ToOwned for NormalPathSegment {
@@ -147,7 +147,7 @@ pub fn utf8_subdir(entry: &DirEntry) -> DirEntrySubdirCases {
     });
     // This is not entirely safe, because this presupposes the user created the
     // DirEntry from an already canonical path.
-    let canonical = CanonicalDirBuf(entry.path().join(&file_name));
+    let canonical = CanonicalDirBuf(entry.path());
     match file_name.into_string() {
         Ok(s) => DirEntrySubdirCases::UTF8SubDir {
             full_path: canonical,
@@ -205,6 +205,18 @@ impl SubDirectoryResult {
 }
 
 impl CanonicalDirBuf {
+    pub fn create_if_not_exist(&self, subdir: &NormalPathSegment) -> Result<Self, PathError> {
+        let path = self.as_ref().join(subdir.as_ref());
+        match std::fs::create_dir(&path) {
+            Ok(()) => {Ok(CanonicalDirBuf(path))},
+            Err(e) if e.kind() == ErrorKind::AlreadyExists => {Ok(CanonicalDirBuf(path))},
+            Err(source) => Err(PathError::GeneralIOError {
+                path: path.to_owned(),
+                source,
+            }),
+        }
+    }
+    
     pub fn create_subdir(&self, subdir: &NormalPathSegment) -> Result<Self, PathError> {
         let path = self.as_ref().join(subdir.as_ref());
         match std::fs::create_dir(&path) {
@@ -223,7 +235,13 @@ impl CanonicalDirBuf {
     pub fn from_absolute(path: &Path, description: &str) -> Result<Self, PathError> {
         check_absolute(path, description)?;
         match path.canonicalize() {
-            Ok(path) => Ok(Self(path)),
+            Ok(path) => {
+                if path.is_dir() {
+                    Ok(Self(path))
+                } else {
+                    Err(PathError::NotADirectory { description: description.to_owned(), path: path.to_owned() })
+                }
+            },
             Err(source) => match source.kind() {
                 ErrorKind::NotFound => Err(PathError::NotFound {
                     description: description.to_owned(),
@@ -242,16 +260,15 @@ impl CanonicalDirBuf {
         relative: &NormalPathSegment,
     ) -> Result<SubDirectoryResult, PathError> {
         let inner = self.0.join(Path::new(&relative.0));
+        if inner.is_symlink() {
+            return Ok(SubDirectoryResult::IsSymlink);
+        };
         let metadata = inner
             .metadata()
             .map_err(|source| PathError::GeneralIOError {
                 path: inner.to_owned(),
                 source,
             })?;
-        // If this is a symlink, it's not canonicalized
-        if metadata.is_symlink() {
-            return Ok(SubDirectoryResult::IsSymlink);
-        }
         if metadata.is_dir() {
             Ok(SubDirectoryResult::SubDirectory(Self(inner)))
         } else {
@@ -296,15 +313,16 @@ impl RelativePathBuf {
         Some(RelativePathBuf(path.to_owned()))
     }
 
+    // Returns None if there is only one segment in Self
     pub fn parent(&self) -> Option<Self> {
-        self.0.parent().map(|x| {
-            // Not sure why this can happen, but an LLM guarded against this, so just to be sure
-            if x.as_os_str().is_empty() {
-                panic!("Two-component RelativePathBuf should never have empty path");
-            } else {
-                Self(x.to_owned())
-            }
-        })
+        // Safety: Is None if self is empty, or ends in a non-Normal segment.
+        // However, we know from the invariants of Self that cannot happen
+        let s = self.0.parent().unwrap().as_os_str();
+        if s.is_empty() {
+            None
+        } else {
+            Some(Self(Path::new(s).to_owned()))
+        }
     }
 }
 
@@ -416,6 +434,9 @@ pub enum PathError {
         #[source]
         source: std::io::Error,
     },
+
+    #[error("{description} must be a directory, but was not: {}", path.display())]
+    NotADirectory { description: String, path: PathBuf },
 
     #[error("{description} must be an absolute path, but it was {}", path.display())]
     NotAbsolute { description: String, path: PathBuf },

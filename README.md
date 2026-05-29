@@ -21,7 +21,7 @@ When `sequencer-sync run` is invoked, it:
 * For each new directory, matches it against the configured categories by regex
 * Skips directories where any configured completion file glob fails to match (i.e. the sequencing run is still in progress), unless `--transfer-incomplete` is set
 * Stages matching directories directly in the category's landing zone, copying checkout-classified files at their original relative paths and packing all remaining archive-classified files into `archive.tar` unless `--compress` is set
-* Records success/failure in the transfer log; on success, writes a `transfer_successful.txt` marker in the transferred directory
+* Records success/failure in the transfer log.
 
 - Previously failed transfers can be retried with `--retry-failed`
 - If "redo" is manually set to true in the JSONL transfer log, previously transferred directories are re-transferred 
