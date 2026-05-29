@@ -104,9 +104,8 @@ impl SetupArgs {
             (None, true) => TreeCheck::Skipped,
         };
 
-        let config_path = canonicalize_config_path(&self.config_path)?;
         Ok(ValidatedSetupArgs {
-            config_path,
+            config_path: self.config_path,
             skip_ssh_check: self.skip_ssh_check,
             tree_check,
         })
@@ -119,6 +118,8 @@ enum TreeCheck {
 }
 
 struct ValidatedSetupArgs {
+    // We do not check this path exists, since we load it on startup anyway,
+    // loading the file will trigger the error.
     config_path: PathBuf,
     skip_ssh_check: bool,
     tree_check: TreeCheck,
@@ -540,7 +541,7 @@ fn glob_has_match(run_dir: &Path, pattern: &glob::Pattern) -> Result<bool, glob:
 fn categorize(
     run_dir: &CanonicalDirBuf,
     categories: &[config::Category],
-) -> Result<Option<TransferTarget>, UserError> {
+) -> Result<Option<TransferTarget>, AppError> {
     let dir_name = run_dir
         .as_ref()
         .file_name()
@@ -557,12 +558,9 @@ fn categorize(
         if let Some(classification_glob) = &cat.classification_glob {
             let full_path = run_dir.as_ref().join(classification_glob.as_str());
             let class_glob_display = full_path.display();
-            if !glob_has_match(run_dir.as_ref(), classification_glob).map_err(|source| {
-                UserError::ClassificationFileScan {
-                    run_dir: run_dir.as_ref().to_owned(),
-                    source,
-                }
-            })? {
+            if !glob_has_match(run_dir.as_ref(), classification_glob)
+                .with_context(|| format!("Failed to match potential run dir to classification glob.\n\
+                    Run dir: {:?}", run_dir.as_ref()))? {
                 debug!("\tClassification glob did not match: {class_glob_display}",);
                 continue;
             } else {
@@ -578,7 +576,7 @@ fn categorize(
                 return Err(UserError::YearSubdirectoryInvalidName {
                     dir_name: dir_name.to_owned(),
                     category_regex: cat.regex.to_string(),
-                });
+                }.into());
             }
             // This can't fail because it's guaranteed to just be four ASCII integers
             let segment = NormalPathSegment::new(Path::new(&format!(
@@ -941,7 +939,7 @@ fn archive_dir_name_conflicts(name: &OsStr) -> bool {
 fn create_parent_directories(
     target_root: &CanonicalDirBuf,
     relative_paths: &[RelativePathBuf],
-) -> Result<(), UserError> {
+) -> Result<(), AppError> {
     // Use HashSet to deduplicate
     let mut directories = HashSet::<RelativePathBuf>::new();
 
@@ -958,10 +956,9 @@ fn create_parent_directories(
 
     for directory in directories {
         let to_create = target_root.as_ref().join(directory.as_ref());
-        fs::create_dir_all(&to_create).map_err(|source| UserError::CreateDir {
-            path: to_create,
-            source,
-        })?;
+        fs::create_dir_all(&to_create)
+            .with_context(|| format!("Failed to create sub-directories of root {:?}.\n
+                Failing directory: {:?}", target_root.as_ref(), to_create))?;
     }
 
     Ok(())
@@ -1155,7 +1152,7 @@ fn check_ssh_access(config: &Config) -> Result<(), AppError> {
         "Checking SSH access. User name: {} port: {} domain name: {}",
         config.server_user, config.server_port, config.server_host
     );
-    let status = Command::new("ssh")
+    let output = Command::new("ssh")
         .arg("-o")
         .arg("BatchMode=yes")
         .arg("-p")
@@ -1163,16 +1160,17 @@ fn check_ssh_access(config: &Config) -> Result<(), AppError> {
         .arg(format!("{}@{}", config.server_user, config.server_host))
         .arg("--")
         .arg("true")
-        .status()
+        .output()
         .context("Failed to execute SSH command")?;
-
-    if status.success() {
+    
+    if output.status.success() {
         Ok(())
     } else {
         Err(UserError::SshAccessDenied {
             user: config.server_user.clone(),
             host: config.server_host.clone(),
             port: config.server_port,
+            stderr: BString::new(output.stderr),
         }
         .into())
     }
@@ -1187,7 +1185,7 @@ fn check_readable_directory(path: &CanonicalDirBuf, description: &str) -> Result
     Ok(())
 }
 
-fn check_writable_directory(path: &CanonicalDirBuf, description: &str) -> Result<(), UserError> {
+fn check_writable_directory(path: &CanonicalDirBuf, description: &str) -> Result<(), AppError> {
     let segment: NormalPathSegmentBuf = NormalUTF8Segment::from_timestamp().into();
     let temp_path = path.join_file_name(&segment)?;
     OpenOptions::new()
@@ -1200,19 +1198,14 @@ fn check_writable_directory(path: &CanonicalDirBuf, description: &str) -> Result
             source,
         })?;
 
-    fs::remove_file(&temp_path).map_err(|source| UserError::CleanupProbeFile {
-        path: temp_path.as_ref().to_owned(),
-        source,
+    fs::remove_file(&temp_path).with_context(|| {
+        format!(
+            "Failure deleting probe file at {temp_path:?}.\n\
+        This probe file was just created, so we do have write permissions to the directory."
+        )
     })?;
 
     Ok(())
-}
-
-fn canonicalize_config_path(path: &Path) -> Result<PathBuf, UserError> {
-    fs::canonicalize(path).map_err(|source| UserError::CanonicalizeConfigPath {
-        path: path.to_path_buf(),
-        source,
-    })
 }
 
 // NB: config_path is an absolute path to existing config file
@@ -1231,10 +1224,8 @@ fn write_cron_file(logdir: &CanonicalDirBuf, config_path: &Path) -> Result<PathB
         "Writing cron content to cron file at {}",
         cron_path.display()
     );
-    fs::write(&cron_path, contents).map_err(|source| UserError::WriteCronFile {
-        path: cron_path.clone(),
-        source,
-    })?;
+    fs::write(&cron_path, contents)
+        .with_context(|| format!("Failed to write cron file to path {:?}", cron_path))?;
     Ok(cron_path)
 }
 
@@ -1369,36 +1360,19 @@ enum UserError {
         #[source]
         source: ConfigError,
     },
-    #[error("ssh access check failed for {user}@{host}:{port}")]
+    #[error("ssh access check failed for {user}@{host}:{port}. Stderr:\n{stderr}")]
     SshAccessDenied {
         user: String,
         host: String,
         port: u16,
+        stderr: BString,
     },
-    #[error("failed to remove temporary probe file {}: {source}", path.display())]
-    CleanupProbeFile {
-        path: PathBuf,
-        #[source]
-        source: std::io::Error,
-    },
-    #[error("failed to resolve config path {}: {source}", path.display())]
-    CanonicalizeConfigPath {
-        path: PathBuf,
-        #[source]
-        source: std::io::Error,
-    },
-    #[error("failed to write cron file {}: {source}", path.display())]
-    WriteCronFile {
-        path: PathBuf,
-        #[source]
-        source: std::io::Error,
-    },
-    #[error("failed to create directory {}: {source}", path.display())]
-    CreateDir {
-        path: PathBuf,
-        #[source]
-        source: std::io::Error,
-    },
+    // #[error("failed to create directory {}: {source}", path.display())]
+    // CreateDir {
+    //     path: PathBuf,
+    //     #[source]
+    //     source: std::io::Error,
+    // },
     #[error(transparent)]
     PathError(#[from] Box<paths::PathError>),
     #[error("failed to rename from staging zone to landing zone.\n\
@@ -1434,12 +1408,6 @@ enum UserError {
     RunLockHeld { path: PathBuf },
     #[error("failed to scan for completion file in {}: {source}", run_dir.display())]
     CompletionFileScan {
-        run_dir: PathBuf,
-        #[source]
-        source: glob::GlobError,
-    },
-    #[error("failed to scan for classification file in {}: {source}", run_dir.display())]
-    ClassificationFileScan {
         run_dir: PathBuf,
         #[source]
         source: glob::GlobError,

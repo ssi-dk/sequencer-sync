@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -135,6 +136,9 @@ struct UnvalidatedCategory {
 
 #[derive(Debug, Error)]
 pub enum ConfigError {
+    #[error("Config path not found. No file at: {}", path.display())]
+    NotFound{path: PathBuf},
+    
     #[error("Config path {description} must be absolute and should not contain . or ..")]
     NonAbsolutePath { description: String },
     #[error("failed to read config file {}: {source}", path.display())]
@@ -293,11 +297,20 @@ impl ConfigSpec {
 
 impl Config {
     pub fn from_path(path: &Path) -> Result<Self, ConfigError> {
-        let contents = fs::read_to_string(path).map_err(|source| ConfigError::Read {
-            path: path.to_path_buf(),
-            source,
-        })?;
-
+        
+        
+        let contents = match fs::read_to_string(path) {
+            Ok(s) => s,
+            Err(e) if e.kind() == ErrorKind::NotFound => {
+                return Err(ConfigError::NotFound { path: path.to_owned() })
+            },
+            Err(source) => {
+                return Err(ConfigError::Read {
+                path: path.to_path_buf(),
+                source,
+                })
+            },
+        };
         let config = Self::resolve_from_yaml_str(&contents)?;
         Ok(config)
     }
