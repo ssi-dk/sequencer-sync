@@ -1,6 +1,6 @@
 [package]
 name = "sequencer-sync"
-version = "2.0.1"
+version = "3.0.0"
 edition = "2024"
 rust-version = "1.87"
 build = "build.rs"
