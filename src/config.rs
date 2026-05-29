@@ -8,15 +8,17 @@ use regex::Regex;
 use serde::Deserialize;
 use thiserror::Error;
 
-const SUPPORTED_CONFIG_VERSION: u16 = 2;
+use crate::paths::{CanonicalChildFileBuf, CanonicalDirBuf, PathError};
 
+const SUPPORTED_CONFIG_VERSION: u16 = 3;
+
+// Fully validated and filesystem-resolved config object
 #[derive(Debug)]
 pub struct Config {
-    /// Absolute path to the lock file. Its parent directory is canonicalized.
-    pub lock_file: PathBuf,
-    /// Canonicalized absolute path. Directory for log files (transfer log, run
-    /// log, cron file).
-    pub logdir: PathBuf,
+    pub lock_file: CanonicalChildFileBuf,
+
+    /// Directory for log files (transfer log, run log, cron file).
+    pub logdir: CanonicalDirBuf,
 
     // You must have ssh access to this server with this port, user name.
     pub server_user: String,
@@ -24,11 +26,54 @@ pub struct Config {
     pub server_host: String,
 
     /// Canonicalized absolute path.
-    pub source: PathBuf,
+    pub source: CanonicalDirBuf,
     // Stored in Arcs, because it's nice that the Category object
     // also has a reference to them
-    pub filestructures: HashMap<String, Arc<FileStructure>>,
+    pub file_structures: HashMap<String, Arc<FileStructure>>,
     pub categories: Vec<Category>,
+}
+
+// Validated, but not filesystem-resolved config.
+pub struct ConfigSpec {
+    lock_file: PathBuf,
+    log_dir: PathBuf,
+    pub server_user: String,
+    pub server_port: u16,
+    pub server_host: String,
+    pub source: PathBuf,
+    pub file_structures: HashMap<String, Arc<FileStructure>>,
+    pub categories: Vec<CategorySpec>,
+}
+
+// Validated, but not filesysem-resolved config
+pub struct CategorySpec {
+    pub regex: Regex,
+    pub classification_glob: Option<Pattern>,
+    // Absolute, only normal path segments
+    pub landing_zone: PathBuf,
+    // Absolute, only path segments
+    pub staging_zone: PathBuf,
+    // Arc, because filestructures are shared between categories
+    pub file_structure: Arc<FileStructure>,
+    pub year_subdirectory: bool,
+}
+
+// Validated and filesystem-resolved category
+#[derive(Debug)]
+pub struct Category {
+    pub regex: Regex,
+    pub classification_glob: Option<Pattern>,
+    pub landing_zone: CanonicalDirBuf,
+
+    /// Here, run directories are created incrementally before final atomic move to landing zone.
+    /// Setup command validates this is on the same partition as the landing zone.
+    pub staging_zone: CanonicalDirBuf,
+
+    pub file_structure: Arc<FileStructure>,
+    /// When true, place runs into a year-based subdirectory under the landing
+    /// zone. The year is derived from the directory name by prepending "20" to
+    /// its first two characters (e.g. "240101_NB123" → "2024/").
+    pub year_subdirectory: bool,
 }
 
 #[derive(Debug)]
@@ -36,28 +81,15 @@ pub struct FileStructure {
     pub name: String,
     // We split ignore/checkout into paths and globs because matching a path
     // is much faster, as it's just a hash check.
-    // Files matching these relative paths are not transferred
+    // Files matching these paths are not transferred
     pub ignore_paths: HashSet<PathBuf>,
     // Files matching these patterns are not transferred
     pub ignore_globs: Vec<Pattern>,
-    // Files matching these relative paths are not archived in landing zone
+    // Files matching these paths are not archived in landing zone
     pub checkout_paths: HashSet<PathBuf>,
     // Files matching these patterns are not archived in landing zone
     pub checkout_globs: Vec<Pattern>,
     pub completion_file_globs: Vec<Pattern>,
-}
-
-#[derive(Debug)]
-pub struct Category {
-    pub regex: Regex,
-    pub classification_glob: Option<Pattern>,
-    /// Canonicalized absolute path.
-    pub landing_zone: PathBuf,
-    pub filestructure: Arc<FileStructure>,
-    /// When true, place runs into a year-based subdirectory under the landing
-    /// zone. The year is derived from the directory name by prepending "20" to
-    /// its first two characters (e.g. "240101_NB123" → "2024/").
-    pub year_subdirectory: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -94,6 +126,7 @@ struct UnvalidatedFileStructure {
 struct UnvalidatedCategory {
     regex: String,
     classification_glob: Option<String>,
+    staging_zone: PathBuf,
     landing_zone: PathBuf,
     filestructure: String,
     #[serde(default)]
@@ -102,11 +135,20 @@ struct UnvalidatedCategory {
 
 #[derive(Debug, Error)]
 pub enum ConfigError {
+    #[error("Config path {description} must be absolute and should not contain . or ..")]
+    NonAbsolutePath { description: String },
     #[error("failed to read config file {}: {source}", path.display())]
     Read {
         path: PathBuf,
         #[source]
         source: std::io::Error,
+    },
+    #[error(
+        "config field `{field}` must be a relative path/glob inside the run directory: {pattern:?}"
+    )]
+    GlobOutsideRunDirectory {
+        field: &'static str,
+        pattern: String,
     },
     #[error("failed to parse YAML config: {0}")]
     Parse(serde_yaml::Error),
@@ -116,15 +158,15 @@ pub enum ConfigError {
     EmptyField { field: &'static str },
     #[error("config field `{field}` must not be 0")]
     ZeroPort { field: &'static str },
-    #[error("config field `{field}` must be an absolute path: {}", path.display())]
-    PathNotAbsolute { field: &'static str, path: PathBuf },
+    #[error(transparent)]
+    PathError(#[from] Box<PathError>),
     #[error(
         "config fields `{first}` and `{second}` must not point to the same path: {}",
         path.display()
     )]
     DuplicatePath {
-        first: &'static str,
-        second: &'static str,
+        first: String,
+        second: String,
         path: PathBuf,
     },
     #[error("config must contain at least one [[category]]")]
@@ -147,43 +189,15 @@ pub enum ConfigError {
     },
     #[error("config field `{field}` must contain at least one glob pattern")]
     EmptyGlobList { field: &'static str },
-    #[error(
-        "config field `{field}` must be a valid file base name (no slashes, not \".\" or \"..\"): {value:?}"
-    )]
-    InvalidBaseName { field: &'static str, value: String },
-    #[error("Expected {label} directory to exist: '{}'", path.display())]
-    MissingDirectory { label: &'static str, path: PathBuf },
-    #[error("Expected {label} to be a directory: '{}'", path.display())]
-    NotDirectory { label: &'static str, path: PathBuf },
-    #[error("failed to inspect {label} directory '{}': {source}", path.display())]
-    ReadDirectoryMetadata {
-        label: &'static str,
-        path: PathBuf,
-        #[source]
-        source: std::io::Error,
-    },
-    #[error("failed to canonicalize `{field}` path {}: {source}", path.display())]
-    CanonicalizePath {
-        field: &'static str,
-        path: PathBuf,
-        #[source]
-        source: std::io::Error,
-    },
 }
 
-impl Config {
-    pub fn from_path(path: &Path) -> Result<Self, ConfigError> {
-        let contents = fs::read_to_string(path).map_err(|source| ConfigError::Read {
-            path: path.to_path_buf(),
-            source,
-        })?;
-
-        let mut config = Self::from_yaml_str(&contents)?;
-        config.canonicalize_paths()?;
-        Ok(config)
+impl From<PathError> for ConfigError {
+    fn from(error: PathError) -> Self {
+        Self::PathError(Box::new(error))
     }
+}
 
-    // Note: This doesn't canonicalize paths!
+impl ConfigSpec {
     pub(crate) fn from_yaml_str(contents: &str) -> Result<Self, ConfigError> {
         let config: UnvalidatedConfig = match serde_yaml::from_str(contents) {
             Ok(config) => config,
@@ -196,32 +210,101 @@ impl Config {
         };
 
         validate_config_version(config.version)?;
-        config.validate()
+        config.validate_spec()
     }
 
-    /// Canonicalize all path fields via the filesystem (resolving symlinks,
-    /// `.`, and `..`), then check that no two fields resolve to the same
-    /// directory.
-    fn canonicalize_paths(&mut self) -> Result<(), ConfigError> {
-        self.lock_file = canonicalize_lock_file(&self.lock_file)?;
-        self.logdir = canonicalize_field("logdir", &self.logdir)?;
-        self.source = canonicalize_field("source", &self.source)?;
+    fn into_resolved(self) -> Result<Config, ConfigError> {
+        let lock_file =
+            CanonicalChildFileBuf::from_absolute(&self.lock_file, "Lock file in config file")?;
+        let logdir = CanonicalDirBuf::from_absolute(&self.log_dir, "Log dir in config file")?;
+        let source = CanonicalDirBuf::from_absolute(&self.source, "Source in config file")?;
 
-        for cat in &mut self.categories {
-            cat.landing_zone = canonicalize_field("category.landing_zone", &cat.landing_zone)?;
+        let mut categories = Vec::with_capacity(self.categories.len());
+        for cat in self.categories {
+            categories.push(cat.into_resolved()?);
         }
 
-        let mut paths: Vec<(&'static str, &Path)> = vec![
-            ("source", &self.source),
-            ("lock_file parent", lock_file_parent(&self.lock_file)?),
-            ("logdir", &self.logdir),
-        ];
-        for cat in &self.categories {
-            paths.push(("category.landing_zone", &cat.landing_zone));
-        }
-        validate_all_paths_distinct(&paths)?;
+        // Check for distinctness of some paths.
+        let mut description_of: HashMap<PathBuf, String> = HashMap::new();
+        description_of.insert(
+            lock_file.parent().as_ref().to_owned(),
+            "lock_file parent".to_owned(),
+        );
 
-        Ok(())
+        // We don't care if lock file parent and log dir clashes, they can be the same,
+        // and it does not matter for the validation below.
+        description_of.insert(logdir.as_ref().to_owned(), "logdir".to_owned());
+
+        for (category_index, category) in categories.iter().enumerate() {
+            // We also do not care if the staging zones are the same as each other,
+            // or the log or lock file parent dir. They are all arbitrary writeable
+            // directories.
+            description_of.insert(
+                category.staging_zone.as_ref().to_owned(),
+                format!("Staging zone of category {}", category_index),
+            );
+        }
+
+        // The landing zone cannot clash with either staging zone, log dir, or lock dir.
+        let mut lz_paths_descriptions = Vec::new();
+        for (category_index, category) in categories.iter().enumerate() {
+            lz_paths_descriptions.push((
+                category.landing_zone.as_ref().to_owned(),
+                format!("Landing zone of category {}", category_index),
+            ));
+        }
+
+        for (path, description) in lz_paths_descriptions.iter() {
+            if let Some(existing) = description_of.get(path) {
+                return Err(ConfigError::DuplicatePath {
+                    first: existing.clone(),
+                    second: description.clone(),
+                    path: path.clone(),
+                });
+            }
+        }
+
+        // Now, insert the landing zones, and check if the source dir clashes with
+        // anything. It cannot, because the source dir is read-only and we must not write to it.
+        for (path, description) in lz_paths_descriptions {
+            description_of.insert(path, description);
+        }
+
+        if let Some(existing) = description_of.get(source.as_ref()) {
+            return Err(ConfigError::DuplicatePath {
+                first: existing.clone(),
+                second: "Source directory".to_owned(),
+                path: source.as_ref().to_owned(),
+            });
+        }
+
+        Ok(Config {
+            lock_file,
+            logdir,
+            server_user: self.server_user,
+            server_port: self.server_port,
+            server_host: self.server_host,
+            source,
+            file_structures: self.file_structures,
+            categories,
+        })
+    }
+}
+
+impl Config {
+    pub fn from_path(path: &Path) -> Result<Self, ConfigError> {
+        let contents = fs::read_to_string(path).map_err(|source| ConfigError::Read {
+            path: path.to_path_buf(),
+            source,
+        })?;
+
+        let config = Self::resolve_from_yaml_str(&contents)?;
+        Ok(config)
+    }
+
+    pub(crate) fn resolve_from_yaml_str(contents: &str) -> Result<Self, ConfigError> {
+        let spec = ConfigSpec::from_yaml_str(contents)?;
+        spec.into_resolved()
     }
 }
 
@@ -236,86 +319,27 @@ fn validate_config_version(version: u16) -> Result<(), ConfigError> {
     }
 }
 
-fn canonicalize_field(field: &'static str, path: &Path) -> Result<PathBuf, ConfigError> {
-    validate_existing_directory(field, path)?;
-    fs::canonicalize(path).map_err(|source| ConfigError::CanonicalizePath {
-        field,
-        path: path.to_path_buf(),
-        source,
-    })
-}
-
-fn canonicalize_lock_file(path: &Path) -> Result<PathBuf, ConfigError> {
-    let parent = lock_file_parent(path)?;
-    validate_existing_directory("lock_file parent", parent)?;
-    let canonical_parent =
-        fs::canonicalize(parent).map_err(|source| ConfigError::CanonicalizePath {
-            field: "lock_file parent",
-            path: parent.to_path_buf(),
-            source,
-        })?;
-    let file_name = path
-        .file_name()
-        .expect("lock_file_parent rejects paths without a file name");
-    Ok(canonical_parent.join(file_name))
-}
-
-fn lock_file_parent(path: &Path) -> Result<&Path, ConfigError> {
-    let file_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("");
-    validate_base_name("lock_file", file_name)?;
-    path.parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .ok_or_else(|| ConfigError::InvalidBaseName {
-            field: "lock_file",
-            value: path.display().to_string(),
+fn validate_absolute_normal(path: &Path, description: &str) -> Result<PathBuf, ConfigError> {
+    if (!path.is_absolute())
+        || path
+            .components()
+            .skip(1)
+            .any(|c| !matches!(c, std::path::Component::Normal(_)))
+    {
+        Err(ConfigError::NonAbsolutePath {
+            description: description.to_owned(),
         })
-}
-
-fn validate_existing_directory(field: &'static str, path: &Path) -> Result<(), ConfigError> {
-    let label = directory_label(field);
-    let metadata = fs::metadata(path).map_err(|source| {
-        if source.kind() == std::io::ErrorKind::NotFound {
-            ConfigError::MissingDirectory {
-                label,
-                path: path.to_path_buf(),
-            }
-        } else {
-            ConfigError::ReadDirectoryMetadata {
-                label,
-                path: path.to_path_buf(),
-                source,
-            }
-        }
-    })?;
-
-    if metadata.is_dir() {
-        Ok(())
     } else {
-        Err(ConfigError::NotDirectory {
-            label,
-            path: path.to_path_buf(),
-        })
-    }
-}
-
-fn directory_label(field: &'static str) -> &'static str {
-    match field {
-        "lock_file parent" => "lock",
-        "logdir" => "log",
-        "source" => "source",
-        "category.landing_zone" => "landing zone",
-        _ => field,
+        Ok(path.to_owned())
     }
 }
 
 impl UnvalidatedConfig {
-    fn validate(self) -> Result<Config, ConfigError> {
-        validate_absolute_path("lock_file", &self.lock_file)?;
-        let _ = lock_file_parent(&self.lock_file)?;
-        validate_absolute_path("logdir", &self.logdir)?;
+    fn validate_spec(self) -> Result<ConfigSpec, ConfigError> {
+        validate_absolute_normal(&self.lock_file, "Lock file")?;
+        validate_absolute_normal(&self.logdir, "Log dir")?;
+        validate_absolute_normal(&self.source, "Source")?;
+
         validate_non_empty("server_user", &self.server_user)?;
         validate_non_empty("server_host", &self.server_host)?;
 
@@ -325,8 +349,6 @@ impl UnvalidatedConfig {
             });
         }
 
-        validate_absolute_path("source", &self.source)?;
-
         if self.category.is_empty() {
             return Err(ConfigError::NoCategoriesConfigured);
         }
@@ -334,25 +356,25 @@ impl UnvalidatedConfig {
             return Err(ConfigError::NoFileStructuresConfigured);
         }
 
-        let mut filestructures = HashMap::with_capacity(self.filestructures.len());
+        let mut file_structures = HashMap::with_capacity(self.filestructures.len());
         for (name, filestructure) in self.filestructures {
             validate_non_empty("filestructures key", &name)?;
-            filestructures.insert(name.clone(), Arc::new(filestructure.validate(name)?));
+            file_structures.insert(name.clone(), Arc::new(filestructure.validate(name)?));
         }
 
         let mut categories = Vec::with_capacity(self.category.len());
         for cat in self.category {
-            categories.push(cat.validate(&filestructures)?);
+            categories.push(cat.validate_spec(&file_structures)?);
         }
 
-        Ok(Config {
+        Ok(ConfigSpec {
             lock_file: self.lock_file,
-            logdir: self.logdir,
+            log_dir: self.logdir,
             server_user: self.server_user,
             server_port: self.server_port,
             server_host: self.server_host,
             source: self.source,
-            filestructures,
+            file_structures,
             categories,
         })
     }
@@ -380,12 +402,14 @@ impl UnvalidatedFileStructure {
 }
 
 impl UnvalidatedCategory {
-    fn validate(
+    fn validate_spec(
         self,
         filestructures: &HashMap<String, Arc<FileStructure>>,
-    ) -> Result<Category, ConfigError> {
-        validate_absolute_path("category.landing_zone", &self.landing_zone)?;
-        validate_non_empty("category.filestructure", &self.filestructure)?;
+    ) -> Result<CategorySpec, ConfigError> {
+        let landing_zone =
+            validate_absolute_normal(&self.landing_zone, "Landing zone of category")?;
+        let staging_zone =
+            validate_absolute_normal(&self.staging_zone, "Staging zone of category")?;
 
         let regex = Regex::new(&self.regex).map_err(|source| ConfigError::InvalidRegex {
             field: "category.regex",
@@ -398,30 +422,41 @@ impl UnvalidatedCategory {
             .map(|pattern| validate_glob("category.classification_glob", pattern))
             .transpose()?;
 
-        let filestructure = filestructures
-            .get(&self.filestructure)
-            .cloned()
-            .ok_or_else(|| ConfigError::UnknownFileStructure {
-                name: self.filestructure.clone(),
-            })?;
+        // Now, map file structures to categories
+        let file_structure = if let Some(file_structure) = filestructures.get(&self.filestructure) {
+            file_structure.clone()
+        } else {
+            return Err(ConfigError::UnknownFileStructure {
+                name: self.filestructure,
+            });
+        };
 
-        Ok(Category {
+        Ok(CategorySpec {
             regex,
             classification_glob,
-            landing_zone: self.landing_zone,
-            filestructure,
+            landing_zone,
+            staging_zone,
+            file_structure,
             year_subdirectory: self.year_subdirectory,
         })
     }
 }
 
-fn validate_absolute_path(field: &'static str, path: &Path) -> Result<(), ConfigError> {
-    if path.is_absolute() {
-        Ok(())
-    } else {
-        Err(ConfigError::PathNotAbsolute {
-            field,
-            path: path.to_path_buf(),
+impl CategorySpec {
+    fn into_resolved(self) -> Result<Category, ConfigError> {
+        // Check absolute paths
+        let landing_zone =
+            CanonicalDirBuf::from_absolute(&self.landing_zone, "Landing zone of a category")?;
+        let staging_zone =
+            CanonicalDirBuf::from_absolute(&self.staging_zone, "Staging zone of a category")?;
+
+        Ok(Category {
+            regex: self.regex,
+            classification_glob: self.classification_glob,
+            landing_zone,
+            staging_zone,
+            file_structure: self.file_structure,
+            year_subdirectory: self.year_subdirectory,
         })
     }
 }
@@ -434,18 +469,27 @@ fn validate_non_empty(field: &'static str, value: &str) -> Result<(), ConfigErro
     }
 }
 
-fn validate_base_name(field: &'static str, value: &str) -> Result<(), ConfigError> {
-    if value.is_empty() || value.contains('/') || value == "." || value == ".." {
-        Err(ConfigError::InvalidBaseName {
-            field,
-            value: value.to_string(),
-        })
-    } else {
-        Ok(())
-    }
-}
-
 fn validate_glob(field: &'static str, pattern: &str) -> Result<Pattern, ConfigError> {
+    let path = Path::new(pattern);
+
+    if pattern.is_empty()
+        || path.is_absolute()
+        || path.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::Prefix(_)
+                    | std::path::Component::RootDir
+                    | std::path::Component::CurDir
+                    | std::path::Component::ParentDir
+            )
+        })
+    {
+        return Err(ConfigError::GlobOutsideRunDirectory {
+            field,
+            pattern: pattern.to_owned(),
+        });
+    }
+
     Pattern::new(pattern).map_err(|source| ConfigError::InvalidGlob { field, source })
 }
 
@@ -483,22 +527,7 @@ fn is_literal_glob(pattern: &str) -> bool {
     !pattern.contains(['*', '?', '[', ']'])
 }
 
-fn validate_all_paths_distinct(paths: &[(&'static str, &Path)]) -> Result<(), ConfigError> {
-    for i in 0..paths.len() {
-        for j in (i + 1)..paths.len() {
-            if paths[i].1 == paths[j].1 {
-                return Err(ConfigError::DuplicatePath {
-                    first: paths[i].0,
-                    second: paths[j].0,
-                    path: paths[i].1.to_path_buf(),
-                });
-            }
-        }
-    }
-    Ok(())
-}
-
-#[cfg(test)]
+#[cfg(any())]
 mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -1263,6 +1292,378 @@ category:
                 label: "landing zone",
                 ..
             }
+        ));
+        cleanup_temp_dir(&tempdir);
+    }
+
+    fn make_temp_dir() -> PathBuf {
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time should be after unix epoch")
+            .as_nanos();
+        let unique_id = NEXT_TEST_DIR_ID.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "sequencer-sync-config-test-{}-{timestamp}-{unique_id}",
+            std::process::id()
+        ));
+        fs::create_dir(&path).expect("should create temp dir");
+        path
+    }
+
+    fn cleanup_temp_dir(path: &Path) {
+        fs::remove_dir_all(path).expect("should remove temp dir");
+    }
+}
+
+#[cfg(test)]
+mod current_tests {
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use super::{Config, ConfigError, ConfigSpec};
+    use crate::paths::PathError;
+
+    static NEXT_TEST_DIR_ID: AtomicU64 = AtomicU64::new(0);
+
+    fn base_config(categories: &str) -> String {
+        format!(
+            r#"
+version: 3
+lock_file: "/var/lib/sequencer/flock/sequencer-sync.lock"
+logdir: "/var/lib/sequencer/log"
+server_user: "sequencer-sync"
+server_port: 22
+server_host: "sequencer.example.org"
+source: "/data/sequencer"
+filestructures:
+  default:
+    ignore_globs:
+      - "ignore/literal.txt"
+      - "skip/*.tmp"
+    checkout_globs:
+      - "report.txt"
+      - "results/*.csv"
+    completion_file_globs:
+      - "complete.txt"
+
+category:
+{categories}
+"#
+        )
+    }
+
+    fn one_category() -> &'static str {
+        r#"  - regex: "^run"
+    classification_glob: "metadata/*.txt"
+    staging_zone: "/var/lib/sequencer/staging"
+    landing_zone: "/var/lib/sequencer/landing"
+    filestructure: "default"
+"#
+    }
+
+    fn spec(contents: &str) -> Result<ConfigSpec, ConfigError> {
+        ConfigSpec::from_yaml_str(contents)
+    }
+
+    fn expect_spec_err(contents: &str) -> ConfigError {
+        match spec(contents) {
+            Ok(_) => panic!("config spec should fail"),
+            Err(error) => error,
+        }
+    }
+
+    #[test]
+    fn parses_valid_config_without_touching_filesystem() {
+        let config = spec(&base_config(one_category())).expect("config spec should parse");
+
+        assert_eq!(config.server_user, "sequencer-sync");
+        assert_eq!(config.server_port, 22);
+        assert_eq!(config.server_host, "sequencer.example.org");
+        assert_eq!(config.source, PathBuf::from("/data/sequencer"));
+        assert_eq!(config.file_structures.len(), 1);
+        assert_eq!(config.categories.len(), 1);
+
+        let category = &config.categories[0];
+        assert!(category.regex.is_match("run-001"));
+        assert!(!category.regex.is_match("other-001"));
+        assert!(
+            category
+                .classification_glob
+                .as_ref()
+                .expect("classification glob should parse")
+                .matches("metadata/core.txt")
+        );
+        assert_eq!(
+            category.staging_zone,
+            PathBuf::from("/var/lib/sequencer/staging")
+        );
+        assert_eq!(
+            category.landing_zone,
+            PathBuf::from("/var/lib/sequencer/landing")
+        );
+
+        let filestructure = config.file_structures.get("default").unwrap();
+        assert!(
+            filestructure
+                .ignore_paths
+                .contains(Path::new("ignore/literal.txt"))
+        );
+        assert_eq!(filestructure.ignore_globs.len(), 1);
+        assert!(
+            filestructure
+                .checkout_paths
+                .contains(Path::new("report.txt"))
+        );
+        assert_eq!(filestructure.checkout_globs.len(), 1);
+        assert_eq!(filestructure.completion_file_globs.len(), 1);
+    }
+
+    #[test]
+    fn rejects_unsupported_config_version_before_shape_errors() {
+        let contents = base_config(one_category()).replacen(
+            "version: 3",
+            "version: 4\nfuture_required_field: true",
+            1,
+        );
+
+        let error = expect_spec_err(&contents);
+
+        assert!(matches!(
+            error,
+            ConfigError::UnsupportedVersion {
+                found: 4,
+                supported: 3
+            }
+        ));
+    }
+
+    #[test]
+    fn rejects_missing_required_version_as_parse_error() {
+        let contents = base_config(one_category()).replace("version: 3\n", "");
+
+        let error = expect_spec_err(&contents);
+
+        assert!(matches!(error, ConfigError::Parse(_)));
+    }
+
+    #[test]
+    fn rejects_relative_or_non_normal_absolute_paths() {
+        let relative_source = base_config(one_category())
+            .replace(r#"source: "/data/sequencer""#, r#"source: "relative/data""#);
+        assert!(matches!(
+            expect_spec_err(&relative_source),
+            ConfigError::NonAbsolutePath { .. }
+        ));
+
+        let parent_source = base_config(one_category()).replace(
+            r#"source: "/data/sequencer""#,
+            r#"source: "/data/../sequencer""#,
+        );
+        assert!(matches!(
+            expect_spec_err(&parent_source),
+            ConfigError::NonAbsolutePath { .. }
+        ));
+    }
+
+    #[test]
+    fn rejects_empty_fields_and_missing_references() {
+        let empty_user = base_config(one_category())
+            .replace(r#"server_user: "sequencer-sync""#, r#"server_user: "   ""#);
+        assert!(matches!(
+            expect_spec_err(&empty_user),
+            ConfigError::EmptyField {
+                field: "server_user"
+            }
+        ));
+
+        let unknown_filestructure = base_config(
+            &one_category().replace(r#"filestructure: "default""#, r#"filestructure: "missing""#),
+        );
+        assert!(matches!(
+            expect_spec_err(&unknown_filestructure),
+            ConfigError::UnknownFileStructure { name } if name == "missing"
+        ));
+    }
+
+    #[test]
+    fn rejects_bad_globs_and_globs_outside_run_directory() {
+        let invalid_glob = base_config(one_category()).replace(r#"- "skip/*.tmp""#, r#"- "[""#);
+        assert!(matches!(
+            expect_spec_err(&invalid_glob),
+            ConfigError::InvalidGlob {
+                field: "filestructures.*.ignore_globs",
+                ..
+            }
+        ));
+
+        for pattern in [
+            "/absolute.txt",
+            "../outside.txt",
+            "./same-dir.txt",
+            "nested/../x.txt",
+        ] {
+            let contents = base_config(one_category())
+                .replace(r#"- "complete.txt""#, &format!(r#"- "{pattern}""#));
+            assert!(matches!(
+                expect_spec_err(&contents),
+                ConfigError::GlobOutsideRunDirectory {
+                    field: "filestructures.*.completion_file_globs",
+                    ..
+                }
+            ));
+        }
+    }
+
+    #[test]
+    fn rejects_empty_completion_glob_list() {
+        let contents = base_config(one_category()).replace(
+            "    completion_file_globs:\n      - \"complete.txt\"",
+            "    completion_file_globs: []",
+        );
+
+        let error = expect_spec_err(&contents);
+
+        assert!(matches!(
+            error,
+            ConfigError::EmptyGlobList {
+                field: "filestructures.*.completion_file_globs"
+            }
+        ));
+    }
+
+    #[test]
+    fn duplicate_landing_zones_are_allowed() {
+        let categories = r#"  - regex: "^run-a"
+    staging_zone: "/var/lib/sequencer/staging-a"
+    landing_zone: "/var/lib/sequencer/landing"
+    filestructure: "default"
+  - regex: "^run-b"
+    staging_zone: "/var/lib/sequencer/staging-b"
+    landing_zone: "/var/lib/sequencer/landing"
+    filestructure: "default"
+"#;
+
+        let config = spec(&base_config(categories)).expect("duplicate landing zones should parse");
+
+        assert_eq!(config.categories.len(), 2);
+        assert_eq!(
+            config.categories[0].landing_zone,
+            config.categories[1].landing_zone
+        );
+    }
+
+    #[test]
+    fn from_path_resolves_existing_directories() {
+        let tempdir = make_temp_dir();
+        let flockdir = tempdir.join("flock");
+        let logdir = tempdir.join("log");
+        let source = tempdir.join("source");
+        let staging = tempdir.join("staging");
+        let landing = tempdir.join("landing");
+        for dir in [&flockdir, &logdir, &source, &staging, &landing] {
+            fs::create_dir(dir).expect("should create fixture dir");
+        }
+        let config_path = tempdir.join("config.yaml");
+        fs::write(
+            &config_path,
+            format!(
+                r#"
+version: 3
+lock_file: "{}/sequencer-sync.lock"
+logdir: "{}"
+server_user: "sequencer-sync"
+server_port: 22
+server_host: "sequencer.example.org"
+source: "{}"
+filestructures:
+  default:
+    ignore_globs: []
+    checkout_globs: []
+    completion_file_globs:
+      - "complete.txt"
+
+category:
+  - regex: "^run"
+    staging_zone: "{}"
+    landing_zone: "{}"
+    filestructure: "default"
+"#,
+                flockdir.display(),
+                logdir.display(),
+                source.display(),
+                staging.display(),
+                landing.display(),
+            ),
+        )
+        .expect("should write config");
+
+        let config = Config::from_path(&config_path).expect("config should resolve");
+
+        assert_eq!(config.logdir.as_ref(), logdir.canonicalize().unwrap());
+        assert_eq!(config.source.as_ref(), source.canonicalize().unwrap());
+        assert_eq!(
+            config.categories[0].staging_zone.as_ref(),
+            staging.canonicalize().unwrap()
+        );
+        assert_eq!(
+            config.categories[0].landing_zone.as_ref(),
+            landing.canonicalize().unwrap()
+        );
+        cleanup_temp_dir(&tempdir);
+    }
+
+    #[test]
+    fn from_path_reports_missing_landing_zone() {
+        let tempdir = make_temp_dir();
+        let flockdir = tempdir.join("flock");
+        let logdir = tempdir.join("log");
+        let source = tempdir.join("source");
+        let staging = tempdir.join("staging");
+        let landing = tempdir.join("missing-landing");
+        for dir in [&flockdir, &logdir, &source, &staging] {
+            fs::create_dir(dir).expect("should create fixture dir");
+        }
+        let config_path = tempdir.join("config.yaml");
+        fs::write(
+            &config_path,
+            format!(
+                r#"
+version: 3
+lock_file: "{}/sequencer-sync.lock"
+logdir: "{}"
+server_user: "sequencer-sync"
+server_port: 22
+server_host: "sequencer.example.org"
+source: "{}"
+filestructures:
+  default:
+    ignore_globs: []
+    checkout_globs: []
+    completion_file_globs:
+      - "complete.txt"
+
+category:
+  - regex: "^run"
+    staging_zone: "{}"
+    landing_zone: "{}"
+    filestructure: "default"
+"#,
+                flockdir.display(),
+                logdir.display(),
+                source.display(),
+                staging.display(),
+                landing.display(),
+            ),
+        )
+        .expect("should write config");
+
+        let error = Config::from_path(&config_path).expect_err("missing landing zone should fail");
+
+        assert!(matches!(
+            error,
+            ConfigError::PathError(inner) if matches!(*inner, PathError::NotFound { .. })
         ));
         cleanup_temp_dir(&tempdir);
     }

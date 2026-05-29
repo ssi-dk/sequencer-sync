@@ -29,8 +29,8 @@ jobs:
       - name: Cache cargo artifacts
         uses: Swatinem/rust-cache@v2
 
-      - name: Run tests (Rust 1.85.0)
-        if: matrix.toolchain == '1.85.0'
+      - name: Run tests (Rust 1.87.0)
+        if: matrix.toolchain == '1.87.0'
         run: cargo test --all-targets
 
       - name: Run tests (stable)

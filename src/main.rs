@@ -1,12 +1,14 @@
 use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use bstr::{BStr, BString, ByteSlice};
 use clap::{Args, Parser, Subcommand};
 use config::{Config, ConfigError};
 use flate2::Compression;
@@ -18,7 +20,13 @@ use thiserror::Error;
 use transfer_log::TransferLog;
 use walkdir::WalkDir;
 
+use crate::paths::{
+    CanonicalChildFileBuf, CanonicalDirBuf, DirEntrySubdirCases, NormalPathSegment,
+    NormalPathSegmentBuf, NormalUTF8Segment, PathError, RelativePathBuf,
+};
+
 mod config;
+mod paths;
 mod run_log;
 mod transfer_log;
 
@@ -86,14 +94,14 @@ impl SetupArgs {
     fn validate(self) -> Result<ValidatedSetupArgs, AppError> {
         let tree_check = match (self.tree_check_source, self.skip_tree_check) {
             (Some(_), true) => return Err(AppError::ConflictingTreeCheckArgs),
-            (Some(p), false) => TreeCheck::Source(p),
+            (Some(p), false) => TreeCheck::Source(CanonicalDirBuf::from_absolute(
+                &p,
+                "--tree-check-source path",
+            )?),
             (None, false) => return Err(AppError::MissingTreeCheckArg),
             (None, true) => TreeCheck::Skipped,
         };
-        debug!(
-            "Canonicalizing config path: Path given from CLI: {}",
-            self.config_path.display()
-        );
+
         let config_path = canonicalize_config_path(&self.config_path)?;
         Ok(ValidatedSetupArgs {
             config_path,
@@ -104,7 +112,7 @@ impl SetupArgs {
 }
 
 enum TreeCheck {
-    Source(PathBuf),
+    Source(CanonicalDirBuf),
     Skipped,
 }
 
@@ -157,7 +165,7 @@ fn setup(raw_args: SetupArgs) -> Result<(), AppError> {
     let config = load_config(&args.config_path)?;
     debug!(
         "Loaded {} configured filestructure(s)",
-        config.filestructures.len()
+        config.file_structures.len()
     );
 
     validate_environment(&config, args.skip_ssh_check)?;
@@ -178,6 +186,11 @@ fn setup(raw_args: SetupArgs) -> Result<(), AppError> {
     Ok(())
 }
 
+enum TransferDestination {
+    LandingZone(CanonicalDirBuf),
+    YearSubDirectory((CanonicalDirBuf, NormalUTF8Segment)),
+}
+
 // We might want to have distinct transfer targets e.g. from operational runs
 // versus projects. Perhaps these need different file subsets.
 // A TransferTarget stores information about source and destination once we have
@@ -185,7 +198,8 @@ fn setup(raw_args: SetupArgs) -> Result<(), AppError> {
 struct TransferTarget {
     // Zero-based index of which category
     category_index: usize,
-    destination: PathBuf,
+    destination: TransferDestination,
+    staging_zone: CanonicalDirBuf,
     filestructure: Arc<config::FileStructure>,
 }
 
@@ -203,19 +217,25 @@ impl ScanSummary {
     }
 }
 
+struct PlannedTransfer {
+    run_dir: NormalUTF8Segment,
+    reason: TransferReason,
+    target: TransferTarget,
+}
+
 // Scanning returns both the work to perform and the operator-facing summary so
 // the caller can decide whether to log anything at all before starting transfer.
 // I.e. we don't want to log on noop calls since then running this program via
 // a cron job would flood the log, making it useless.
 struct ScanResult {
-    planned_transfers: Vec<(fs::DirEntry, TransferReason, TransferTarget)>,
+    planned_transfers: Vec<PlannedTransfer>,
     incomplete_messages: Vec<String>,
     summary: ScanSummary,
 }
 
 fn run_command(args: RunArgs) -> Result<(), AppError> {
     let config = load_config(&args.config_path)?;
-    let mut run_log = RunLog::new(&config.logdir);
+    let mut run_log = RunLog::new(&config.logdir)?;
 
     let _lock = match acquire_run_lock(&config.lock_file)? {
         Some(lock) => lock,
@@ -258,34 +278,62 @@ fn run_command(args: RunArgs) -> Result<(), AppError> {
 }
 
 fn validate_environment(config: &Config, skip_ssh_check: bool) -> Result<(), AppError> {
+    debug!(
+        "Checking that source directory is readable: {}",
+        config.source.as_ref().display()
+    );
+    check_readable_directory(&config.source, "source")?;
+    for (category_index, cat) in config.categories.iter().enumerate() {
+        debug!("Checking category {}", category_index + 1);
+
+        debug!(
+            "\tChecking files can be created in staging zone {}",
+            cat.staging_zone.as_ref().display()
+        );
+        let field = "category.staging_zone";
+        let segment: NormalPathSegmentBuf = NormalUTF8Segment::from_timestamp().into();
+        let staging_zone_marker_path = cat.staging_zone.join_file_name(&segment)?;
+        OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&staging_zone_marker_path)
+            .map_err(|source| AppError::WriteDirectory {
+                field,
+                path: staging_zone_marker_path.as_ref().to_owned(),
+                source,
+            })?;
+
+        debug!("\tChecking file can be moved to landing_zone");
+        let landing_zone_marker_path = cat.landing_zone.join_file_name(&segment)?;
+        move_from_staging_zone_to_landing_zone(
+            staging_zone_marker_path.as_ref(),
+            landing_zone_marker_path.as_ref(),
+        )?;
+
+        debug!("Removing marker file from landing zone");
+
+        fs::remove_file(&landing_zone_marker_path).map_err(|e| AppError::RemoveMarker {
+            path: landing_zone_marker_path.as_ref().to_owned(),
+            source: e,
+        })?;
+
+        check_writable_directory(&cat.landing_zone, "category.landing_zone")?;
+    }
+    debug!(
+        "Checking writability of lock file parent directory: {}",
+        config.lock_file.parent().as_ref().display()
+    );
+    check_writable_directory(&config.lock_file.parent(), "lock_file parent")?;
+    debug!(
+        "Checking writability of logdir: {}",
+        config.logdir.as_ref().display()
+    );
+    check_writable_directory(&config.logdir, "logdir")?;
     if !skip_ssh_check {
         check_ssh_access(config)?;
     } else {
         debug!("SSH check skipped due to command line flag.")
     }
-    debug!(
-        "Checking that source directory is readable: {}",
-        config.source.display()
-    );
-    check_readable_directory(&config.source, "source")?;
-    for (category_index, cat) in config.categories.iter().enumerate() {
-        debug!(
-            "Checking writability of category {} landing zone: {}",
-            category_index + 1,
-            cat.landing_zone.display()
-        );
-        check_writable_directory(&cat.landing_zone, "category.landing_zone")?;
-    }
-    debug!(
-        "Checking writability of lock file parent directory: {}",
-        lock_file_parent(&config.lock_file)?.display()
-    );
-    check_writable_directory(lock_file_parent(&config.lock_file)?, "lock_file parent")?;
-    debug!(
-        "Checking writability of logdir: {}",
-        config.logdir.display()
-    );
-    check_writable_directory(&config.logdir, "logdir")?;
     Ok(())
 }
 
@@ -314,17 +362,20 @@ enum TransferAction {
 }
 
 fn scan_directories(
-    source: &Path,
+    source: &CanonicalDirBuf,
     categories: &[config::Category],
     transfer_log: &TransferLog,
     retry_failed: bool,
     transfer_incomplete: bool,
 ) -> Result<ScanResult, AppError> {
-    debug!("Searching for new directories in {}", source.display());
+    debug!(
+        "Searching for new directories in {}",
+        &source.as_ref().display()
+    );
 
     let entries = fs::read_dir(source).map_err(|e| AppError::ReadDirectory {
         field: "source",
-        path: source.to_path_buf(),
+        path: source.as_ref().to_path_buf(),
         source: e,
     })?;
 
@@ -342,31 +393,50 @@ fn scan_directories(
     for entry in entries {
         let entry = entry.map_err(|e| AppError::ReadDirectory {
             field: "source",
-            path: source.to_path_buf(),
+            path: source.as_ref().to_path_buf(),
             source: e,
         })?;
 
-        let file_type = entry.file_type().map_err(|e| AppError::ReadMetadata {
-            field: "source",
-            path: entry.path(),
-            source: e,
-        })?;
-        if !file_type.is_dir() {
-            continue;
-        }
-        let dir_name = entry.file_name();
+        let (entry_path, segment) = match paths::utf8_subdir(&entry) {
+            DirEntrySubdirCases::UTF8SubDir {
+                full_path,
+                last_segment,
+            } => (full_path, last_segment),
+            DirEntrySubdirCases::IOError(e) => {
+                return Err(AppError::ReadDirectory {
+                    field: "Run dir",
+                    path: entry.path(),
+                    source: e,
+                });
+            }
+            DirEntrySubdirCases::IsSymlink => {
+                warn!(
+                    "Found symlink when traversing source directory: {:?}, skipping",
+                    &entry.file_name()
+                );
+                continue;
+            }
+            DirEntrySubdirCases::NotUTF8 => {
+                warn!(
+                    "Found non-UTF8 entry in source {}: {}. Skipping",
+                    source.as_ref().display(),
+                    entry.file_name().display()
+                );
+                continue;
+            }
+            DirEntrySubdirCases::IsNotDir => continue,
+        };
 
-        debug!("Classifying {}", entry.path().display());
+        let relative = segment.as_normal();
 
-        let Some(dir_name) = dir_name.to_str() else {
+        debug!("Classifying {}", entry_path.as_ref().display());
+
+        let Some(dir_name) = relative.as_ref().to_str() else {
             warn!("\tSkipping directory with non-UTF-8 name; glob matching requires UTF-8");
             continue;
         };
 
-        let key = transfer_log::relative_directory_key(source, &entry.path())
-            .map_err(AppError::TransferLog)?;
-
-        let action = transfer_log.transfer_action(&key, retry_failed);
+        let action = transfer_log.transfer_action(&segment, retry_failed);
         let reason: TransferReason = match action {
             TransferAction::Skip(SkipReason::AlreadyTranferred) => {
                 debug!("\tDirectory already transferred; skipping");
@@ -379,13 +449,21 @@ fn scan_directories(
             TransferAction::Tranfer(reason) => reason,
         };
 
-        let target = match classify(&entry.path(), categories)? {
+        let sub_dir_path = source
+            .try_from_existing_subdirectory(relative)?
+            .expect_normal_dir("We just checked it was a non-symlink dir");
+
+        let target = match categorize(&sub_dir_path, categories)? {
             Some(t) => {
+                let lz = match &t.destination {
+                    TransferDestination::LandingZone(lz) => lz,
+                    TransferDestination::YearSubDirectory((lz, _)) => lz,
+                };
                 debug!(
                     "\tClassified: Category {} with filestructure {} and landing zone {}",
                     &t.category_index + 1,
                     &t.filestructure.name,
-                    &t.destination.display()
+                    &lz.as_ref().display()
                 );
                 t
             }
@@ -408,7 +486,11 @@ fn scan_directories(
             }
         }
 
-        planned_transfers.push((entry, reason, target));
+        planned_transfers.push(PlannedTransfer {
+            run_dir: segment,
+            reason,
+            target,
+        });
     }
     summary.planned = planned_transfers.len() as u32;
 
@@ -454,11 +536,12 @@ fn glob_has_match(run_dir: &Path, pattern: &glob::Pattern) -> Result<bool, glob:
     }
 }
 
-fn classify(
-    run_dir: &Path,
+fn categorize(
+    run_dir: &CanonicalDirBuf,
     categories: &[config::Category],
 ) -> Result<Option<TransferTarget>, AppError> {
     let dir_name = run_dir
+        .as_ref()
         .file_name()
         .and_then(|name| name.to_str())
         .expect("Unreachable: scan_directories should skip non-UTF-8 run directory names");
@@ -471,11 +554,11 @@ fn classify(
         }
 
         if let Some(classification_glob) = &cat.classification_glob {
-            let full_path = run_dir.join(classification_glob.as_str());
+            let full_path = run_dir.as_ref().join(classification_glob.as_str());
             let class_glob_display = full_path.display();
-            if !glob_has_match(run_dir, classification_glob).map_err(|source| {
+            if !glob_has_match(run_dir.as_ref(), classification_glob).map_err(|source| {
                 AppError::ClassificationFileScan {
-                    run_dir: run_dir.to_path_buf(),
+                    run_dir: run_dir.as_ref().to_owned(),
                     source,
                 }
             })? {
@@ -486,7 +569,9 @@ fn classify(
             }
         }
 
-        let destination = if cat.year_subdirectory {
+        // Landing zone must be PathBuf, because if year_subdirectory, the directory
+        // may not exist yet.
+        let destination: TransferDestination = if cat.year_subdirectory {
             let bytes = dir_name.as_bytes();
             if bytes.len() < 2 || !bytes[0].is_ascii_digit() || !bytes[1].is_ascii_digit() {
                 return Err(AppError::YearSubdirectoryInvalidName {
@@ -494,29 +579,43 @@ fn classify(
                     category_regex: cat.regex.to_string(),
                 });
             }
-            cat.landing_zone
-                .join(format!("20{}{}", bytes[0] as char, bytes[1] as char))
+            // This can't fail because it's guaranteed to just be four ASCII integers
+            let segment = NormalPathSegment::new(Path::new(&format!(
+                "20{}{}",
+                bytes[0] as char, bytes[1] as char
+            )))
+            .unwrap()
+            .try_into()
+            .unwrap();
+            TransferDestination::YearSubDirectory((cat.landing_zone.clone(), segment))
         } else {
-            cat.landing_zone.clone()
+            TransferDestination::LandingZone(cat.landing_zone.clone())
         };
         return Ok(Some(TransferTarget {
             category_index,
             destination,
-            filestructure: cat.filestructure.clone(),
+            staging_zone: cat.staging_zone.clone(),
+            filestructure: cat.file_structure.clone(),
         }));
     }
     Ok(None)
 }
 
 fn transfer_new_directories(
-    source: &Path,
+    source: &CanonicalDirBuf,
     categories: &[config::Category],
     transfer_log: &mut TransferLog,
     run_log: &mut RunLog,
     args: &RunArgs,
 ) -> Result<(), AppError> {
     let (mut succeeded, mut failed) = (0u32, 0u32);
-    let scan = scan_directories(
+
+    // Scan directories to classify them
+    let ScanResult {
+        planned_transfers,
+        incomplete_messages,
+        summary,
+    } = scan_directories(
         source,
         categories,
         transfer_log,
@@ -524,20 +623,11 @@ fn transfer_new_directories(
         args.transfer_incomplete,
     )?;
 
-    debug!(
-        "Total directories to transfer: {}",
-        scan.planned_transfers.len()
-    );
+    debug!("Total directories to transfer: {}", planned_transfers.len());
 
-    if !scan.summary.has_noteworthy_activity() {
+    if !summary.has_noteworthy_activity() {
         return Ok(());
     }
-
-    let ScanResult {
-        planned_transfers,
-        incomplete_messages,
-        summary,
-    } = scan;
 
     if !args.dry_run {
         run_log.info(&run_started_message(args));
@@ -550,63 +640,82 @@ fn transfer_new_directories(
         }
     }
 
-    for (entry, reason, target) in planned_transfers {
-        let dir_name = entry.file_name();
-        let dir_name_display = dir_name
-            .to_str()
-            .expect("scan_directories should skip non-UTF-8 run directory names");
+    for PlannedTransfer {
+        run_dir,
+        reason,
+        target,
+    } in planned_transfers
+    {
+        let source_run_dir = source
+            .try_from_existing_subdirectory(run_dir.as_normal())?
+            .expect_normal_dir("Run dir should be directory");
+        let classification = classify_run_files(&source_run_dir, &target.filestructure)?;
 
-        let transferred_dir = target.destination.join(entry.file_name());
+        let destination_to_create = {
+            let lz: PathBuf = match &target.destination {
+                TransferDestination::LandingZone(lz) => lz.as_ref().to_owned(),
+                TransferDestination::YearSubDirectory((lz, subdir)) => {
+                    lz.as_ref().join(subdir.as_normal().as_ref())
+                }
+            };
+            lz.join(run_dir.as_normal().as_ref())
+        };
 
-        if landing_zone_marker_exists(&transferred_dir)? {
+        if destination_to_create.exists() {
             let message = format!(
-                "Skipped {dir_name_display} because transfer marker is unexpectedly already present in landing zone: {}",
-                transferred_dir.display()
+                "Skipped directory because it is unexpectedly still present in landing zone: at: {}",
+                destination_to_create.display()
             );
             warn!("{message}");
             if !args.dry_run {
                 run_log.info(&message);
             }
             continue;
-        }
+        } else {
+            if args.dry_run {
+                print_dry_run(&run_dir, &destination_to_create, &target.filestructure);
+                continue;
+            }
+        };
 
-        if args.dry_run {
-            print_dry_run(&entry.path(), &transferred_dir, &target.filestructure);
-            continue;
-        }
+        // Create the intermediate year subdirectory if it does not exists
+        let destination = match target.destination {
+            TransferDestination::LandingZone(lz) => lz.clone(),
+            TransferDestination::YearSubDirectory((lz, segment)) => {
+                lz.create_if_not_exist(segment.as_normal())?
+            }
+        };
 
-        let destination_display = transferred_dir.display();
         let transfer_result = transfer_run_to_landing_zone(
-            &entry.path(),
-            &transferred_dir,
-            &target.filestructure,
+            &run_dir,
+            &source_run_dir,
+            &target.staging_zone,
+            &destination,
+            classification,
             args.compress,
         );
 
-        let key = transfer_log::relative_directory_key(source, &entry.path())
-            .map_err(AppError::TransferLog)?;
         transfer_log
-            .record_transfer(&key, transfer_result.is_ok())
+            .record_transfer(&run_dir, transfer_result.is_ok())
             .map_err(AppError::TransferLog)?;
 
         match transfer_result {
             Ok(()) => {
                 succeeded += 1;
                 run_log.info(&format!(
-                    "Transferred {} {dir_name_display} -> {destination_display}",
-                    transfer_reason_label(reason)
+                    "Transferred {} {} -> {}",
+                    transfer_reason_label(reason),
+                    run_dir.into_inner(),
+                    destination.as_ref().display()
                 ));
-                if let Err(error) = touch_transfer_marker(&transferred_dir) {
-                    run_log.error(&format!(
-                        "Warning: failed to write transfer marker: {error}"
-                    ));
-                }
             }
             Err(error) => {
                 failed += 1;
                 run_log.error(&format!(
-                    "FAILED transfer {} {dir_name_display} -> {destination_display}: {error}",
-                    transfer_reason_label(reason)
+                    "FAILED transfer {} {} -> {}: {error}",
+                    transfer_reason_label(reason),
+                    run_dir.into_inner(),
+                    destination.as_ref().display()
                 ));
             }
         }
@@ -648,32 +757,20 @@ fn transfer_reason_label(reason: TransferReason) -> &'static str {
 // This marker is useful because once the data has been transferred from the
 // landing zone to the remote server, someone on the server can check for this
 // file to see if the transfer to the landing zone was complete.
-const TRANSFER_MARKER_FILE_NAME: &str = "transfer_successful.txt";
 const ARCHIVE_DIR_NAME: &str = "sequencer-sync-archive";
 
-fn touch_transfer_marker(transferred_dir: &Path) -> Result<(), AppError> {
-    let marker = transferred_dir.join(TRANSFER_MARKER_FILE_NAME);
-    File::create(&marker).map_err(|source| AppError::WriteTransferMarker {
-        path: marker,
-        source,
-    })?;
-    Ok(())
-}
-
-fn landing_zone_marker_exists(transferred_dir: &Path) -> Result<bool, AppError> {
-    let marker = transferred_dir.join(TRANSFER_MARKER_FILE_NAME);
-    match fs::metadata(&marker) {
-        Ok(_) => Ok(true),
-        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(source) => Err(AppError::ReadTransferMarker {
-            path: marker,
-            source,
-        }),
-    }
-}
-
-fn print_dry_run(source: &Path, destination: &Path, filestructure: &config::FileStructure) {
-    println!("{} -> {}", source.display(), destination.display());
+fn print_dry_run(
+    segment: &NormalUTF8Segment,
+    // This need not exist due to year_subdirectory. The landing zone must exist,
+    // but year_subdirectory can make the destination be a non-existing subdir
+    destination: &Path,
+    filestructure: &config::FileStructure,
+) {
+    println!(
+        "{} -> {}",
+        segment.as_normal().as_ref().display(),
+        destination.display()
+    );
     for path in &filestructure.ignore_paths {
         println!("  ignore: {}", path.display());
     }
@@ -690,80 +787,114 @@ fn print_dry_run(source: &Path, destination: &Path, filestructure: &config::File
 
 #[derive(Default)]
 struct ClassifiedFiles {
-    ignored: Vec<PathBuf>,
-    archived: Vec<PathBuf>,
-    checkout: Vec<PathBuf>,
+    // These are all relative to the run dir when they are discovered
+    ignored: Vec<RelativePathBuf>,
+    archived: Vec<RelativePathBuf>,
+    checkout: Vec<RelativePathBuf>,
 }
 
 fn transfer_run_to_landing_zone(
-    run_dir: &Path,
-    transferred_dir: &Path,
-    filestructure: &config::FileStructure,
+    run_dir: &NormalUTF8Segment,
+    directory_to_transfer: &CanonicalDirBuf,
+    staging_zone: &CanonicalDirBuf,
+    landing_zone: &CanonicalDirBuf,
+    classified_files: ClassifiedFiles,
     compress: bool,
 ) -> Result<(), AppError> {
-    let classified_files = classify_run_files(run_dir, filestructure)?;
-    ensure_no_archive_dir_checkout_conflict(run_dir, &classified_files.checkout)?;
+    ensure_no_archive_dir_checkout_conflict(directory_to_transfer, &classified_files.checkout)?;
 
-    // create_dir_all because transferred_dir may not exist
-    fs::create_dir_all(transferred_dir).map_err(|source| AppError::CreateTransferDir {
-        path: transferred_dir.to_path_buf(),
-        source,
-    })?;
-    debug!(
-        "Classified {} file(s) for checkout, {} file(s) for archive, and ignored {} file(s)",
-        classified_files.checkout.len(),
-        classified_files.archived.len(),
-        classified_files.ignored.len()
-    );
+    let staging_run_dir = staging_run_dir_segment(run_dir);
+    let canonical_staging_run_dir = staging_zone.create_subdir(staging_run_dir.as_normal())?;
 
     // Create parent directories once, so we can create files without worrying
     // about whether their parent exists
-    create_parent_directories(transferred_dir, &classified_files.checkout)?;
+    create_parent_directories(&canonical_staging_run_dir, &classified_files.checkout)?;
 
     for relative_path in &classified_files.checkout {
-        copy_classified_file(run_dir, relative_path, transferred_dir)?;
+        copy_classified_file(
+            relative_path,
+            directory_to_transfer,
+            &canonical_staging_run_dir,
+        )?;
     }
 
     // Create the tarball only if there are files to be archived.
     if !classified_files.archived.is_empty() {
-        let archive_dir = transferred_dir.join(ARCHIVE_DIR_NAME);
-        fs::create_dir(&archive_dir).map_err(|source| AppError::CreateTransferDir {
-            path: archive_dir.clone(),
-            source,
-        })?;
+        // Safety: We know that ARCHIVE_DIR_NAME is a normal path segment
+        let archive_segment = NormalPathSegment::new(Path::new(ARCHIVE_DIR_NAME)).unwrap();
+        let archive_dir = canonical_staging_run_dir.create_subdir(archive_segment)?;
+
         create_parent_directories(&archive_dir, &classified_files.archived)?;
         for relative_path in &classified_files.archived {
-            copy_classified_file(run_dir, relative_path, &archive_dir)?;
+            copy_classified_file(relative_path, directory_to_transfer, &archive_dir)?;
         }
 
-        let archive_path = if compress {
-            transferred_dir.join("archive.tar.gz")
+        let archive_segment = if compress {
+            NormalPathSegment::new(Path::new("archive.tar.gz")).unwrap()
         } else {
-            transferred_dir.join("archive.tar")
+            NormalPathSegment::new(Path::new("archive.tar")).unwrap()
         };
-        create_archive_tar(&archive_dir, &archive_path, compress)?;
+        let archive_path = canonical_staging_run_dir.join_file_name(archive_segment)?;
+
+        create_archive_tar(&archive_path, &archive_dir, compress)?;
         fs::remove_dir_all(&archive_dir).map_err(|source| AppError::RemoveArchiveDir {
-            path: archive_dir,
+            path: archive_dir.as_ref().to_owned(),
             source,
         })?;
     }
 
+    move_from_staging_zone_to_landing_zone(
+        canonical_staging_run_dir.as_ref(),
+        &landing_zone.as_ref().join(run_dir.as_normal().as_ref()),
+    )?;
     Ok(())
 }
 
+fn move_from_staging_zone_to_landing_zone(
+    source: &Path,
+    destination: &Path,
+) -> Result<(), AppError> {
+    match fs::rename(source, destination) {
+        Ok(_) => Ok(()),
+        Err(error) => match error.kind() {
+            std::io::ErrorKind::CrossesDevices => Err(AppError::StagingZoneNotOnRightDevice {
+                from: source.to_owned(),
+                to: destination.to_owned(),
+            }),
+            _ => Err(AppError::RenameFailed {
+                from: source.to_owned(),
+                to: destination.to_owned(),
+            }),
+        },
+    }
+}
+
+fn staging_run_dir_segment(run_dir: &NormalUTF8Segment) -> NormalUTF8Segment {
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after unix epoch")
+        .as_nanos();
+    let segment = format!("{}-{timestamp}", run_dir.clone().into_inner(),);
+    NormalPathSegment::new(Path::new(&segment))
+        .expect("staging run directory should be a normal path segment")
+        .try_into()
+        .expect("staging run directory should be valid UTF-8")
+}
+
 fn ensure_no_archive_dir_checkout_conflict(
-    run_dir: &Path,
-    checkout_paths: &[PathBuf],
+    run_dir: &CanonicalDirBuf,
+    checkout_paths: &[RelativePathBuf],
 ) -> Result<(), AppError> {
     for relative_path in checkout_paths {
-        if relative_path
+        let first_component = relative_path
+            .as_ref()
             .components()
             .next()
-            .is_some_and(|component| archive_dir_name_conflicts(component.as_os_str()))
-        {
+            .expect("Relative paths must have at least one component");
+        if archive_dir_name_conflicts(first_component.as_os_str()) {
             return Err(AppError::ArchiveDirCheckoutConflict {
-                run_dir: run_dir.to_path_buf(),
-                relative_path: relative_path.clone(),
+                run_dir: run_dir.as_ref().to_owned(),
+                relative_path: relative_path.as_ref().to_owned(),
                 archive_dir_name: ARCHIVE_DIR_NAME,
             });
         }
@@ -809,26 +940,27 @@ fn archive_dir_name_conflicts(name: &OsStr) -> bool {
 }
 
 fn create_parent_directories(
-    target_root: &Path,
-    relative_paths: &[PathBuf],
+    target_root: &CanonicalDirBuf,
+    relative_paths: &[RelativePathBuf],
 ) -> Result<(), AppError> {
-    let mut directories = HashSet::new();
+    // Use HashSet to deduplicate
+    let mut directories = HashSet::<RelativePathBuf>::new();
 
     for relative_path in relative_paths {
-        // Check whether the relative file has a directory
-        // (the root already exists)
-        let Some(parent) = relative_path.parent() else {
+        // We need to create all directories. The target root must already exist,
+        // so we can skip that
+        let parent = if let Some(parent) = relative_path.parent() {
+            parent
+        } else {
             continue;
         };
-        if parent.as_os_str().is_empty() {
-            continue;
-        }
-        directories.insert(target_root.join(parent));
+        directories.insert(parent);
     }
 
     for directory in directories {
-        fs::create_dir_all(&directory).map_err(|source| AppError::CreateTransferDir {
-            path: directory,
+        let to_create = target_root.as_ref().join(directory.as_ref());
+        fs::create_dir_all(&to_create).map_err(|source| AppError::CreateDir {
+            path: to_create,
             source,
         })?;
     }
@@ -837,27 +969,27 @@ fn create_parent_directories(
 }
 
 fn copy_classified_file(
-    run_dir: &Path, // source root dir
-    relative_path: &Path,
-    target_root: &Path,
+    relative_path: &RelativePathBuf,
+    source: &CanonicalDirBuf,
+    target: &CanonicalDirBuf,
 ) -> Result<(), AppError> {
-    let source_path = run_dir.join(relative_path);
-    let destination = target_root.join(relative_path);
-    fs::copy(&source_path, &destination).map_err(|source| AppError::CopyTransferFile {
+    let source_path = source.as_ref().join(relative_path.as_ref());
+    let target_path = target.as_ref().join(relative_path.as_ref());
+    fs::copy(&source_path, &target_path).map_err(|source| AppError::CopyTransferFile {
         source_path,
-        destination,
+        destination: target_path,
         source,
     })?;
     Ok(())
 }
 
 fn create_archive_tar(
-    archive_dir: &Path,
-    archive_path: &Path,
+    archive_path: &CanonicalChildFileBuf,
+    archive_dir: &CanonicalDirBuf,
     compress: bool,
 ) -> Result<(), AppError> {
     let file = File::create(archive_path).map_err(|source| AppError::CreateArchiveTar {
-        path: archive_path.to_path_buf(),
+        path: archive_path.as_ref().to_path_buf(),
         source,
     })?;
     if compress {
@@ -867,15 +999,15 @@ fn create_archive_tar(
         let encoder = builder
             .into_inner()
             .map_err(|source| AppError::WriteArchiveTar {
-                archive_dir: archive_dir.to_path_buf(),
-                archive_tar: archive_path.to_path_buf(),
+                archive_dir: archive_dir.as_ref().to_path_buf(),
+                archive_tar: archive_path.as_ref().to_path_buf(),
                 source,
             })?;
         encoder
             .finish()
             .map_err(|source| AppError::WriteArchiveTar {
-                archive_dir: archive_dir.to_path_buf(),
-                archive_tar: archive_path.to_path_buf(),
+                archive_dir: archive_dir.as_ref().to_path_buf(),
+                archive_tar: archive_path.as_ref().to_path_buf(),
                 source,
             })?;
         Ok(())
@@ -886,120 +1018,147 @@ fn create_archive_tar(
 }
 
 fn write_archive_tar<W: std::io::Write>(
-    archive_dir: &Path,
-    archive_path: &Path,
+    archive_dir: &CanonicalDirBuf,
+    archive_path: &CanonicalChildFileBuf, // exists at this point
     builder: &mut tar::Builder<W>,
 ) -> Result<(), AppError> {
     builder
         .append_dir_all(".", archive_dir)
         .map_err(|source| AppError::WriteArchiveTar {
-            archive_dir: archive_dir.to_path_buf(),
-            archive_tar: archive_path.to_path_buf(),
+            archive_dir: archive_dir.as_ref().to_owned(),
+            archive_tar: archive_path.as_ref().to_owned(),
             source,
         })?;
     builder
         .finish()
         .map_err(|source| AppError::WriteArchiveTar {
-            archive_dir: archive_dir.to_path_buf(),
-            archive_tar: archive_path.to_path_buf(),
+            archive_dir: archive_dir.as_ref().to_owned(),
+            archive_tar: archive_path.as_ref().to_owned(),
             source,
         })
 }
 
 fn classify_run_files(
-    run_dir: &Path,
+    run_dir: &CanonicalDirBuf,
     filestructure: &config::FileStructure,
 ) -> Result<ClassifiedFiles, AppError> {
     let mut files = ClassifiedFiles::default();
 
     for entry in WalkDir::new(run_dir).follow_links(false) {
         let entry = entry.map_err(|source| AppError::WalkRunDirectory {
-            run_dir: run_dir.to_path_buf(),
+            run_dir: run_dir.as_ref().to_owned(),
             source,
         })?;
         if !entry.file_type().is_file() {
             continue;
         }
 
-        let path = entry.path();
-        let relative_path = path
-            .strip_prefix(run_dir)
-            .map(Path::to_path_buf)
-            .map_err(|_| AppError::RunFileOutsideRunDir {
-                run_dir: run_dir.to_path_buf(),
-                path: path.to_path_buf(),
-            })?;
-        classify_relative_file(run_dir, relative_path, filestructure, &mut files)?;
+        let relative = RelativePathBuf::new(
+            entry
+                .path()
+                .strip_prefix(run_dir.as_ref())
+                .expect("Internal error: Path of entry must start with base path"),
+        )
+        .expect("Internal error: Expected path of entry to be normalized");
+        classify_relative_file(run_dir, relative, filestructure, &mut files)?;
     }
+
+    debug!(
+        "Classified {} file(s) for checkout, {} file(s) for archive, and ignored {} file(s)",
+        files.checkout.len(),
+        files.archived.len(),
+        files.ignored.len()
+    );
 
     Ok(files)
 }
 
 fn classify_relative_file(
-    run_dir: &Path,
-    relative_path: PathBuf,
+    run_dir: &CanonicalDirBuf,
+    path: RelativePathBuf,
     filestructure: &config::FileStructure,
     files: &mut ClassifiedFiles,
 ) -> Result<(), AppError> {
-    let ignored = filestructure.ignore_paths.contains(&relative_path)
+    let ignored = filestructure.ignore_paths.contains(path.as_ref())
         || filestructure
             .ignore_globs
             .iter()
-            .any(|pattern| pattern.matches_path(&relative_path));
-    let checkout = filestructure.checkout_paths.contains(&relative_path)
+            .any(|pattern| pattern.matches_path(path.as_ref()));
+    let checkout = filestructure.checkout_paths.contains(path.as_ref())
         || filestructure
             .checkout_globs
             .iter()
-            .any(|pattern| pattern.matches_path(&relative_path));
+            .any(|pattern| pattern.matches_path(path.as_ref()));
 
     match (ignored, checkout) {
         (true, true) => Err(AppError::FileStructureConflict {
-            run_dir: run_dir.to_path_buf(),
-            relative_path,
+            run_dir: run_dir.as_ref().to_owned(),
+            relative_path: path.as_ref().to_owned(),
         }),
         (true, false) => {
-            files.ignored.push(relative_path);
+            files.ignored.push(path);
             Ok(())
         }
         (false, true) => {
-            files.checkout.push(relative_path);
+            files.checkout.push(path);
             Ok(())
         }
         (false, false) => {
-            files.archived.push(relative_path);
+            files.archived.push(path);
             Ok(())
         }
     }
 }
 
 fn check_run_trees(
-    tree_check_source: &Path,
+    tree_check_source: &CanonicalDirBuf,
     categories: &[config::Category],
 ) -> Result<(), AppError> {
     check_readable_directory(tree_check_source, "tree_check_source")?;
     let entries = fs::read_dir(tree_check_source).map_err(|source| AppError::ReadDirectory {
         field: "tree_check_source",
-        path: tree_check_source.to_path_buf(),
+        path: tree_check_source.as_ref().to_owned(),
         source,
     })?;
 
     for entry in entries {
         let entry = entry.map_err(|source| AppError::ReadDirectory {
             field: "tree_check_source",
-            path: tree_check_source.to_path_buf(),
+            path: tree_check_source.as_ref().to_owned(),
             source,
         })?;
-        let path = entry.path();
-        let file_type = entry.file_type().map_err(|source| AppError::ReadMetadata {
-            field: "tree_check_source",
-            path: path.clone(),
-            source,
-        })?;
-        if !file_type.is_dir() {
-            continue;
-        }
-        if let Some(target) = classify(&path, categories)? {
-            let _ = classify_run_files(&path, &target.filestructure)?;
+        let (sub_dir, _) = match paths::utf8_subdir(&entry) {
+            DirEntrySubdirCases::UTF8SubDir {
+                full_path,
+                last_segment,
+            } => (full_path, last_segment),
+            DirEntrySubdirCases::IOError(e) => {
+                return Err(AppError::ReadDirectory {
+                    field: "Check run trees",
+                    path: entry.path(),
+                    source: e,
+                });
+            }
+            DirEntrySubdirCases::NotUTF8 => {
+                warn!(
+                    "Found non-UTF8 directory entry: {:?}, skipping",
+                    &entry.file_name()
+                );
+                continue;
+            }
+            DirEntrySubdirCases::IsSymlink => {
+                warn!(
+                    "Found symlink when traversing tun trees: {:?}, skipping",
+                    &entry.file_name()
+                );
+                continue;
+            }
+            DirEntrySubdirCases::IsNotDir => {
+                continue;
+            }
+        };
+        if let Some(target) = categorize(&sub_dir, categories)? {
+            let _ = classify_run_files(&sub_dir, &target.filestructure)?;
         }
     }
 
@@ -1040,66 +1199,34 @@ fn check_ssh_access(config: &Config) -> Result<(), AppError> {
     }
 }
 
-fn check_readable_directory(path: &Path, field: &'static str) -> Result<(), AppError> {
-    ensure_directory_exists(path, field)?;
+fn check_readable_directory(path: &CanonicalDirBuf, field: &'static str) -> Result<(), AppError> {
     fs::read_dir(path).map_err(|source| AppError::ReadDirectory {
         field,
-        path: path.to_path_buf(),
+        path: path.as_ref().to_owned(),
         source,
     })?;
     Ok(())
 }
 
-fn check_writable_directory(path: &Path, field: &'static str) -> Result<(), AppError> {
-    ensure_directory_exists(path, field)?;
-
-    let temp_path = temp_probe_path(path, field);
+fn check_writable_directory(path: &CanonicalDirBuf, tag: &'static str) -> Result<(), AppError> {
+    let segment: NormalPathSegmentBuf = NormalUTF8Segment::from_timestamp().into();
+    let temp_path = path.join_file_name(&segment)?;
     OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(&temp_path)
         .map_err(|source| AppError::WriteDirectory {
-            field,
-            path: path.to_path_buf(),
+            field: tag,
+            path: path.as_ref().to_owned(),
             source,
         })?;
 
     fs::remove_file(&temp_path).map_err(|source| AppError::CleanupProbeFile {
-        path: temp_path,
+        path: temp_path.as_ref().to_owned(),
         source,
     })?;
 
     Ok(())
-}
-
-fn ensure_directory_exists(path: &Path, field: &'static str) -> Result<(), AppError> {
-    let metadata = fs::metadata(path).map_err(|source| AppError::ReadMetadata {
-        field,
-        path: path.to_path_buf(),
-        source,
-    })?;
-
-    if metadata.is_dir() {
-        Ok(())
-    } else {
-        Err(AppError::NotADirectory {
-            field,
-            path: path.to_path_buf(),
-        })
-    }
-}
-
-fn temp_probe_path(directory: &Path, field: &str) -> PathBuf {
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system time should be after unix epoch")
-        .as_nanos();
-    let filename = format!(
-        ".sequencer-sync-{field}-write-probe-{}-{timestamp}",
-        std::process::id()
-    );
-
-    directory.join(filename)
 }
 
 fn canonicalize_config_path(path: &Path) -> Result<PathBuf, AppError> {
@@ -1109,13 +1236,15 @@ fn canonicalize_config_path(path: &Path) -> Result<PathBuf, AppError> {
     })
 }
 
-fn write_cron_file(logdir: &Path, config_path: &Path) -> Result<PathBuf, AppError> {
+// NB: config_path is an absolute path to existing config file
+fn write_cron_file(logdir: &CanonicalDirBuf, config_path: &Path) -> Result<PathBuf, AppError> {
     debug!("Determining cron file content");
     let binary_path = std::env::current_exe()
         .and_then(fs::canonicalize)
         .map_err(|source| AppError::CurrentExe { source })?;
-    let cron_path = cron_file_path(logdir);
-    let contents = render_cron_file(config_path, &binary_path)?;
+
+    let cron_path = logdir.as_ref().join("sequencer-sync.cron");
+    let contents = render_cron_file(config_path, &binary_path);
     debug!(
         "Writing cron content to cron file at {}",
         cron_path.display()
@@ -1127,46 +1256,32 @@ fn write_cron_file(logdir: &Path, config_path: &Path) -> Result<PathBuf, AppErro
     Ok(cron_path)
 }
 
-fn cron_file_path(logdir: &Path) -> PathBuf {
-    logdir.join("sequencer-sync.cron")
+fn render_cron_file(config_path: &Path, binary_path: &Path) -> Vec<u8> {
+    let binary_path_str = shell_quote(BStr::new(binary_path.as_os_str().as_bytes()));
+    let config_path_str = shell_quote(BStr::new(config_path.as_os_str().as_bytes()));
+
+    let mut out = Vec::new();
+    out.extend_from_slice(b"# Install this file into cron manually.\n* * * * * ");
+    out.extend_from_slice(&binary_path_str);
+    out.extend_from_slice(b" run --config-path ");
+    out.extend_from_slice(&config_path_str);
+    out.push(b'\n');
+
+    out
 }
 
-fn render_cron_file(config_path: &Path, binary_path: &Path) -> Result<String, AppError> {
-    let binary_path_str = binary_path
-        .to_str()
-        .ok_or_else(|| AppError::NonUtf8CronPath {
-            field: "current executable",
-            path: binary_path.to_path_buf(),
-        })?;
-    let config_path_str = config_path
-        .to_str()
-        .ok_or_else(|| AppError::NonUtf8CronPath {
-            field: "config path",
-            path: config_path.to_path_buf(),
-        })?;
-    let command = format!(
-        "{} run --config-path {}",
-        shell_quote(binary_path_str),
-        shell_quote(config_path_str),
-    );
-
-    Ok(format!(
-        "# Install this file into cron manually.\n* * * * * {command}\n"
-    ))
-}
-
-fn check_lock_is_available(lock_file: &Path) -> Result<(), AppError> {
+fn check_lock_is_available(lock_file: &CanonicalChildFileBuf) -> Result<(), AppError> {
     debug!(
         "Checking availability of lock file at {}",
-        lock_file.display()
+        lock_file.as_ref().display()
     );
     let _lock = acquire_run_lock(lock_file)?.ok_or_else(|| AppError::RunLockHeld {
-        path: lock_file.to_path_buf(),
+        path: lock_file.as_ref().to_owned(),
     })?;
     Ok(())
 }
 
-fn acquire_run_lock(path: &Path) -> Result<Option<RunLock>, AppError> {
+fn acquire_run_lock(path: &CanonicalChildFileBuf) -> Result<Option<RunLock>, AppError> {
     let file = OpenOptions::new()
         .create(true)
         .read(true)
@@ -1174,7 +1289,7 @@ fn acquire_run_lock(path: &Path) -> Result<Option<RunLock>, AppError> {
         .truncate(false)
         .open(path)
         .map_err(|source| AppError::OpenRunLockFile {
-            path: path.to_path_buf(),
+            path: path.as_ref().to_owned(),
             source,
         })?;
 
@@ -1182,24 +1297,17 @@ fn acquire_run_lock(path: &Path) -> Result<Option<RunLock>, AppError> {
         Ok(()) => Ok(Some(RunLock { file })),
         Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
         Err(source) => Err(AppError::AcquireRunLock {
-            path: path.to_path_buf(),
+            path: path.as_ref().to_owned(),
             source,
         }),
     }
 }
 
-fn lock_file_parent(lock_file: &Path) -> Result<&Path, AppError> {
-    lock_file
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .ok_or_else(|| AppError::MissingLockFileParent {
-            path: lock_file.to_path_buf(),
-        })
-}
-
-fn shell_quote(value: &str) -> String {
-    let escaped = value.replace('\'', r#"'\''"#);
-    format!("'{escaped}'")
+fn shell_quote(value: &BStr) -> BString {
+    let mut s = BString::new(vec![b'\'']);
+    s.append(&mut value.replace(b"\'", b"'\\''").to_vec());
+    s.push(b'\'');
+    s
 }
 
 struct RunLock {
@@ -1220,6 +1328,12 @@ enum AppError {
         #[source]
         source: ConfigError,
     },
+    #[error("failed to remove marker file at landing zone at {path}, got: {source}")]
+    RemoveMarker {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
     #[error("failed to execute ssh: {source}")]
     SpawnSsh {
         #[source]
@@ -1231,15 +1345,6 @@ enum AppError {
         host: String,
         port: u16,
     },
-    #[error("failed to access metadata for `{field}` directory {}: {source}", path.display())]
-    ReadMetadata {
-        field: &'static str,
-        path: PathBuf,
-        #[source]
-        source: std::io::Error,
-    },
-    #[error("config field `{field}` must point to a directory: {}", path.display())]
-    NotADirectory { field: &'static str, path: PathBuf },
     #[error("failed to read `{field}` directory {}: {source}", path.display())]
     ReadDirectory {
         field: &'static str,
@@ -1272,8 +1377,8 @@ enum AppError {
         #[source]
         source: std::io::Error,
     },
-    #[error("failed to create transfer directory {}: {source}", path.display())]
-    CreateTransferDir {
+    #[error("failed to create directory {}: {source}", path.display())]
+    CreateDir {
         path: PathBuf,
         #[source]
         source: std::io::Error,
@@ -1291,6 +1396,23 @@ enum AppError {
         #[source]
         source: std::io::Error,
     },
+    #[error(transparent)]
+    PathError(#[from] Box<PathError>),
+    #[error("failed to rename from staging zone to landing zone.\n\
+        \tDirectory in staging zone: {}\n\
+        \tDirectory in landing zone: {}",
+        from.display(),
+        to.display())]
+    RenameFailed { from: PathBuf, to: PathBuf },
+    #[error(
+        "failed to move from staging zone to landing zone, because they are on separate devices. \
+        Please make sure, for all categories in config file, that their landing zone and \
+        staging zones are on the same device (i.e. file system).\n\
+        \tDirectory in staging zone: {}\n\
+        \tDirectory in landing zone: {}",
+        from.display(),
+        to.display())]
+    StagingZoneNotOnRightDevice { from: PathBuf, to: PathBuf },
     #[error("failed to write archive tar from {} to {}: {source}", archive_dir.display(), archive_tar.display())]
     WriteArchiveTar {
         archive_dir: PathBuf,
@@ -1349,20 +1471,6 @@ enum AppError {
         relative_path: PathBuf,
         archive_dir_name: &'static str,
     },
-    #[error("run file {} is not under run directory {}", path.display(), run_dir.display())]
-    RunFileOutsideRunDir { run_dir: PathBuf, path: PathBuf },
-    #[error("failed to write transfer marker {}: {source}", path.display())]
-    WriteTransferMarker {
-        path: PathBuf,
-        #[source]
-        source: std::io::Error,
-    },
-    #[error("failed to inspect transfer marker {}: {source}", path.display())]
-    ReadTransferMarker {
-        path: PathBuf,
-        #[source]
-        source: std::io::Error,
-    },
     #[error("one or more run log writes failed (see warnings above)")]
     RunLogWriteFailed,
     #[error("failed to determine path to current executable: {source}")]
@@ -1370,10 +1478,6 @@ enum AppError {
         #[source]
         source: std::io::Error,
     },
-    #[error("cannot render cron file because {field} is not valid UTF-8: {}", path.display())]
-    NonUtf8CronPath { field: &'static str, path: PathBuf },
-    #[error("lock file path has no parent directory: {}", path.display())]
-    MissingLockFileParent { path: PathBuf },
     #[error(
         "directory `{dir_name}` matched category regex `{category_regex}` with year_subdirectory enabled, but name does not start with two ASCII digits"
     )]
@@ -1387,7 +1491,13 @@ enum AppError {
     ConflictingTreeCheckArgs,
 }
 
-#[cfg(test)]
+impl From<PathError> for AppError {
+    fn from(error: PathError) -> Self {
+        Self::PathError(Box::new(error))
+    }
+}
+
+#[cfg(any())]
 mod tests {
     use std::collections::HashSet;
     use std::fs;
@@ -1622,6 +1732,261 @@ mod tests {
             line.contains("Skipping directory with non-UTF-8 name")
                 && line.contains("glob matching requires UTF-8")
         }));
+        cleanup_temp_dir(&tempdir);
+    }
+}
+
+#[cfg(test)]
+mod current_tests {
+    use std::collections::HashSet;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use glob::Pattern;
+    use regex::Regex;
+
+    use super::{
+        ClassifiedFiles, TransferDestination, archive_dir_name_conflicts, categorize,
+        classify_run_files, render_cron_file, run_is_complete, staging_run_dir_segment,
+        transfer_run_to_landing_zone,
+    };
+    use crate::config::{Category, FileStructure};
+    use crate::paths::{CanonicalDirBuf, NormalPathSegment, NormalUTF8Segment};
+
+    static NEXT_TEST_DIR_ID: AtomicU64 = AtomicU64::new(0);
+
+    fn make_temp_dir() -> PathBuf {
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time should be after unix epoch")
+            .as_nanos();
+        let unique_id = NEXT_TEST_DIR_ID.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "sequencer-sync-main-test-{}-{timestamp}-{unique_id}",
+            std::process::id()
+        ));
+        fs::create_dir(&path).expect("should create temp dir");
+        path
+    }
+
+    fn cleanup_temp_dir(path: &Path) {
+        fs::remove_dir_all(path).expect("should remove temp dir");
+    }
+
+    fn canonical_dir(path: &Path) -> CanonicalDirBuf {
+        CanonicalDirBuf::from_absolute(path, "test dir").expect("test dir should resolve")
+    }
+
+    fn segment(value: &str) -> NormalUTF8Segment {
+        NormalPathSegment::new(Path::new(value))
+            .expect("test segment should be normal")
+            .try_into()
+            .expect("test segment should be UTF-8")
+    }
+
+    fn file_structure() -> Arc<FileStructure> {
+        Arc::new(FileStructure {
+            name: "test".to_owned(),
+            ignore_paths: HashSet::new(),
+            ignore_globs: Vec::new(),
+            checkout_paths: HashSet::new(),
+            checkout_globs: Vec::new(),
+            completion_file_globs: vec![Pattern::new("complete.txt").unwrap()],
+        })
+    }
+
+    fn category(
+        regex: &str,
+        classification_glob: Option<&str>,
+        landing_zone: &Path,
+        staging_zone: &Path,
+        year_subdirectory: bool,
+    ) -> Category {
+        Category {
+            regex: Regex::new(regex).expect("regex should parse"),
+            classification_glob: classification_glob.map(|pattern| Pattern::new(pattern).unwrap()),
+            landing_zone: canonical_dir(landing_zone),
+            staging_zone: canonical_dir(staging_zone),
+            file_structure: file_structure(),
+            year_subdirectory,
+        }
+    }
+
+    #[test]
+    fn renders_cron_file_with_shell_quoted_paths() {
+        let block = render_cron_file(
+            Path::new("/etc/sequencer sync/config.yaml"),
+            Path::new("/usr/local/bin/sequencer-sync"),
+        );
+        let block = String::from_utf8(block).expect("cron file should be valid UTF-8 here");
+
+        assert!(block.contains("# Install this file into cron manually."));
+        assert!(block.contains("'/usr/local/bin/sequencer-sync' run"));
+        assert!(block.contains("--config-path '/etc/sequencer sync/config.yaml'"));
+    }
+
+    #[test]
+    fn run_is_complete_requires_all_completion_globs() {
+        let tempdir = make_temp_dir();
+        fs::write(tempdir.join("complete.txt"), "").expect("should write completion file");
+
+        assert!(run_is_complete(&tempdir, &[Pattern::new("complete.txt").unwrap()]).unwrap());
+        assert!(
+            !run_is_complete(
+                &tempdir,
+                &[
+                    Pattern::new("complete.txt").unwrap(),
+                    Pattern::new("missing.txt").unwrap(),
+                ],
+            )
+            .unwrap()
+        );
+
+        cleanup_temp_dir(&tempdir);
+    }
+
+    #[test]
+    fn categorize_falls_through_when_classification_glob_is_missing() {
+        let tempdir = make_temp_dir();
+        let run_dir = tempdir.join("run-001");
+        let landing_a = tempdir.join("landing-a");
+        let landing_b = tempdir.join("landing-b");
+        let staging = tempdir.join("staging");
+        for dir in [&run_dir, &landing_a, &landing_b, &staging] {
+            fs::create_dir(dir).expect("should create fixture dir");
+        }
+
+        let categories = vec![
+            category("^run", Some("marker.txt"), &landing_a, &staging, false),
+            category("^run", None, &landing_b, &staging, false),
+        ];
+        let target = categorize(&canonical_dir(&run_dir), &categories)
+            .expect("categorization should succeed")
+            .expect("fallback category should match");
+
+        match target.destination {
+            TransferDestination::LandingZone(path) => {
+                assert_eq!(path.as_ref(), landing_b.canonicalize().unwrap())
+            }
+            TransferDestination::YearSubDirectory(_) => panic!("unexpected year destination"),
+        }
+
+        cleanup_temp_dir(&tempdir);
+    }
+
+    #[test]
+    fn categorize_creates_year_destination_from_run_name_prefix() {
+        let tempdir = make_temp_dir();
+        let run_dir = tempdir.join("240101_RUN");
+        let landing = tempdir.join("landing");
+        let staging = tempdir.join("staging");
+        for dir in [&run_dir, &landing, &staging] {
+            fs::create_dir(dir).expect("should create fixture dir");
+        }
+
+        let categories = vec![category("^24", None, &landing, &staging, true)];
+        let target = categorize(&canonical_dir(&run_dir), &categories)
+            .expect("categorization should succeed")
+            .expect("category should match");
+
+        match target.destination {
+            TransferDestination::YearSubDirectory((base, year)) => {
+                assert_eq!(base.as_ref(), landing.canonicalize().unwrap());
+                assert_eq!(year.into_inner(), "2024");
+            }
+            TransferDestination::LandingZone(_) => panic!("unexpected plain landing zone"),
+        }
+
+        cleanup_temp_dir(&tempdir);
+    }
+
+    #[test]
+    fn classify_run_files_preserves_nested_relative_paths() {
+        let tempdir = make_temp_dir();
+        let run_dir = tempdir.join("run-001");
+        fs::create_dir(&run_dir).expect("should create run dir");
+        fs::create_dir(run_dir.join("nested")).expect("should create nested dir");
+        fs::write(run_dir.join("nested/report.txt"), "").expect("should write report");
+        fs::write(run_dir.join("other.bin"), "").expect("should write archived file");
+
+        let filestructure = FileStructure {
+            name: "test".to_owned(),
+            ignore_paths: HashSet::new(),
+            ignore_globs: Vec::new(),
+            checkout_paths: HashSet::from([PathBuf::from("nested/report.txt")]),
+            checkout_globs: Vec::new(),
+            completion_file_globs: vec![Pattern::new("complete.txt").unwrap()],
+        };
+
+        let files = classify_run_files(&canonical_dir(&run_dir), &filestructure)
+            .expect("classification should succeed");
+
+        assert!(
+            files
+                .checkout
+                .iter()
+                .any(|path| path.as_ref() == Path::new("nested/report.txt"))
+        );
+        assert!(
+            files
+                .archived
+                .iter()
+                .any(|path| path.as_ref() == Path::new("other.bin"))
+        );
+        cleanup_temp_dir(&tempdir);
+    }
+
+    #[test]
+    fn archive_dir_conflict_detects_archive_names_and_tar_variants() {
+        assert!(archive_dir_name_conflicts(
+            "sequencer-sync-archive".as_ref()
+        ));
+        assert!(archive_dir_name_conflicts(
+            "sequencer-sync-archive.tar".as_ref()
+        ));
+        assert!(archive_dir_name_conflicts(
+            "sequencer-sync-archive.tar.gz".as_ref()
+        ));
+        assert!(!archive_dir_name_conflicts(
+            "sequencer-sync-archive-extra".as_ref()
+        ));
+    }
+
+    #[test]
+    fn staging_run_dir_keeps_original_name_and_adds_suffix() {
+        let run_dir = segment("run-001");
+        let staging = staging_run_dir_segment(&run_dir).into_inner();
+
+        assert!(staging.starts_with("run-001-"));
+        assert_ne!(staging, "run-001");
+    }
+
+    #[test]
+    fn transfer_renames_timestamped_staging_dir_to_plain_landing_dir() {
+        let tempdir = make_temp_dir();
+        let source = tempdir.join("source");
+        let staging = tempdir.join("staging");
+        let landing = tempdir.join("landing");
+        let run = source.join("run-001");
+        for dir in [&source, &staging, &landing, &run] {
+            fs::create_dir(dir).expect("should create fixture dir");
+        }
+
+        transfer_run_to_landing_zone(
+            &segment("run-001"),
+            &canonical_dir(&run),
+            &canonical_dir(&staging),
+            &canonical_dir(&landing),
+            ClassifiedFiles::default(),
+            false,
+        )
+        .expect("transfer should succeed");
+
+        assert!(landing.join("run-001").is_dir());
+        assert_eq!(fs::read_dir(&staging).unwrap().count(), 0);
         cleanup_temp_dir(&tempdir);
     }
 }

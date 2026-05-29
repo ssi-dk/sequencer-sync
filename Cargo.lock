@@ -952,9 +952,10 @@ dependencies = [
 
 [[package]]
 name = "sequencer-sync"
-version = "2.0.1"
+version = "3.0.0"
 dependencies = [
  "assert_cmd",
+ "bstr",
  "chrono",
  "clap",
  "env_logger",
