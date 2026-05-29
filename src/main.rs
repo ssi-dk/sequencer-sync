@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 use std::ffi::OsStr;
+use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
@@ -8,6 +9,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use anyhow::{Context, Error};
 use bstr::{BStr, BString, ByteSlice};
 use clap::{Args, Parser, Subcommand};
 use config::{Config, ConfigError};
@@ -22,7 +24,7 @@ use walkdir::WalkDir;
 
 use crate::paths::{
     CanonicalChildFileBuf, CanonicalDirBuf, DirEntrySubdirCases, NormalPathSegment,
-    NormalPathSegmentBuf, NormalUTF8Segment, PathError, RelativePathBuf,
+    NormalPathSegmentBuf, NormalUTF8Segment, RelativePathBuf,
 };
 
 mod config;
@@ -91,14 +93,14 @@ struct SetupArgs {
 }
 
 impl SetupArgs {
-    fn validate(self) -> Result<ValidatedSetupArgs, AppError> {
+    fn validate(self) -> Result<ValidatedSetupArgs, UserError> {
         let tree_check = match (self.tree_check_source, self.skip_tree_check) {
-            (Some(_), true) => return Err(AppError::ConflictingTreeCheckArgs),
+            (Some(_), true) => return Err(UserError::ConflictingTreeCheckArgs),
             (Some(p), false) => TreeCheck::Source(CanonicalDirBuf::from_absolute(
                 &p,
                 "--tree-check-source path",
             )?),
-            (None, false) => return Err(AppError::MissingTreeCheckArg),
+            (None, false) => return Err(UserError::MissingTreeCheckArg),
             (None, true) => TreeCheck::Skipped,
         };
 
@@ -144,7 +146,7 @@ fn main() -> ExitCode {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
     debug!("sequencer-sync starting");
     if let Err(error) = try_main() {
-        eprintln!("Error: {error}");
+        eprintln!("{error}");
         return ExitCode::FAILURE;
     }
     ExitCode::SUCCESS
@@ -154,9 +156,11 @@ fn try_main() -> Result<(), AppError> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Setup(args) => setup(args),
-        Commands::Run(args) => run_command(args),
+        Commands::Setup(args) => setup(args)?,
+        Commands::Run(args) => run_command(args)?,
     }
+
+    Ok(())
 }
 
 fn setup(raw_args: SetupArgs) -> Result<(), AppError> {
@@ -174,8 +178,8 @@ fn setup(raw_args: SetupArgs) -> Result<(), AppError> {
         TreeCheck::Skipped => {}
     }
     check_lock_is_available(&config.lock_file)?;
-    let _ = TransferLog::load(&config.logdir).map_err(AppError::TransferLog)?;
-    transfer_log::initialize_if_absent(&config.logdir).map_err(AppError::TransferLog)?;
+    let _ = TransferLog::load(&config.logdir).map_err(UserError::TransferLog)?;
+    transfer_log::initialize_if_absent(&config.logdir).map_err(UserError::TransferLog)?;
     eprintln!("Setup successful!");
     let cron_path = write_cron_file(&config.logdir, &args.config_path)?;
     eprintln!(
@@ -243,13 +247,13 @@ fn run_command(args: RunArgs) -> Result<(), AppError> {
             run_log.info("Run skipped: file lock already held");
             run_log.finish();
             if run_log.had_error() {
-                return Err(AppError::RunLogWriteFailed);
+                return Err(UserError::RunLogWriteFailed.into());
             }
             return Ok(());
         }
     };
 
-    let mut transfer_log = TransferLog::load(&config.logdir).map_err(AppError::TransferLog)?;
+    let mut transfer_log = TransferLog::load(&config.logdir).map_err(UserError::TransferLog)?;
 
     let result = transfer_new_directories(
         &config.source,
@@ -267,11 +271,11 @@ fn run_command(args: RunArgs) -> Result<(), AppError> {
             run_log.error(&format!("Run aborted: {error}"));
             run_log.finish();
         }
-        return Err(error);
+        return Err(error.into());
     }
 
     if !args.dry_run && run_log.had_error() {
-        return Err(AppError::RunLogWriteFailed);
+        return Err(UserError::RunLogWriteFailed.into());
     }
 
     Ok(())
@@ -297,7 +301,7 @@ fn validate_environment(config: &Config, skip_ssh_check: bool) -> Result<(), App
             .write(true)
             .create_new(true)
             .open(&staging_zone_marker_path)
-            .map_err(|source| AppError::WriteDirectory {
+            .map_err(|source| UserError::WriteDirectory {
                 field,
                 path: staging_zone_marker_path.as_ref().to_owned(),
                 source,
@@ -312,9 +316,11 @@ fn validate_environment(config: &Config, skip_ssh_check: bool) -> Result<(), App
 
         debug!("Removing marker file from landing zone");
 
-        fs::remove_file(&landing_zone_marker_path).map_err(|e| AppError::RemoveMarker {
-            path: landing_zone_marker_path.as_ref().to_owned(),
-            source: e,
+        fs::remove_file(&landing_zone_marker_path).with_context(|| {
+            format!(
+                "Failed to remove marker file from landing zone at {}",
+                landing_zone_marker_path.as_ref().display(),
+            )
         })?;
 
         check_writable_directory(&cat.landing_zone, "category.landing_zone")?;
@@ -367,13 +373,13 @@ fn scan_directories(
     transfer_log: &TransferLog,
     retry_failed: bool,
     transfer_incomplete: bool,
-) -> Result<ScanResult, AppError> {
+) -> Result<ScanResult, UserError> {
     debug!(
         "Searching for new directories in {}",
         &source.as_ref().display()
     );
 
-    let entries = fs::read_dir(source).map_err(|e| AppError::ReadDirectory {
+    let entries = fs::read_dir(source).map_err(|e| UserError::ReadDirectory {
         field: "source",
         path: source.as_ref().to_path_buf(),
         source: e,
@@ -391,7 +397,7 @@ fn scan_directories(
     }
 
     for entry in entries {
-        let entry = entry.map_err(|e| AppError::ReadDirectory {
+        let entry = entry.map_err(|e| UserError::ReadDirectory {
             field: "source",
             path: source.as_ref().to_path_buf(),
             source: e,
@@ -403,7 +409,7 @@ fn scan_directories(
                 last_segment,
             } => (full_path, last_segment),
             DirEntrySubdirCases::IOError(e) => {
-                return Err(AppError::ReadDirectory {
+                return Err(UserError::ReadDirectory {
                     field: "Run dir",
                     path: entry.path(),
                     source: e,
@@ -504,10 +510,10 @@ fn scan_directories(
 fn run_is_complete(
     run_dir: &Path,
     completion_file_globs: &[glob::Pattern],
-) -> Result<bool, AppError> {
+) -> Result<bool, UserError> {
     for completion_file_glob in completion_file_globs {
         if !glob_has_match(run_dir, completion_file_glob).map_err(|source| {
-            AppError::CompletionFileScan {
+            UserError::CompletionFileScan {
                 run_dir: run_dir.to_path_buf(),
                 source,
             }
@@ -539,7 +545,7 @@ fn glob_has_match(run_dir: &Path, pattern: &glob::Pattern) -> Result<bool, glob:
 fn categorize(
     run_dir: &CanonicalDirBuf,
     categories: &[config::Category],
-) -> Result<Option<TransferTarget>, AppError> {
+) -> Result<Option<TransferTarget>, UserError> {
     let dir_name = run_dir
         .as_ref()
         .file_name()
@@ -557,7 +563,7 @@ fn categorize(
             let full_path = run_dir.as_ref().join(classification_glob.as_str());
             let class_glob_display = full_path.display();
             if !glob_has_match(run_dir.as_ref(), classification_glob).map_err(|source| {
-                AppError::ClassificationFileScan {
+                UserError::ClassificationFileScan {
                     run_dir: run_dir.as_ref().to_owned(),
                     source,
                 }
@@ -574,7 +580,7 @@ fn categorize(
         let destination: TransferDestination = if cat.year_subdirectory {
             let bytes = dir_name.as_bytes();
             if bytes.len() < 2 || !bytes[0].is_ascii_digit() || !bytes[1].is_ascii_digit() {
-                return Err(AppError::YearSubdirectoryInvalidName {
+                return Err(UserError::YearSubdirectoryInvalidName {
                     dir_name: dir_name.to_owned(),
                     category_regex: cat.regex.to_string(),
                 });
@@ -607,7 +613,7 @@ fn transfer_new_directories(
     transfer_log: &mut TransferLog,
     run_log: &mut RunLog,
     args: &RunArgs,
-) -> Result<(), AppError> {
+) -> Result<(), UserError> {
     let (mut succeeded, mut failed) = (0u32, 0u32);
 
     // Scan directories to classify them
@@ -697,7 +703,7 @@ fn transfer_new_directories(
 
         transfer_log
             .record_transfer(&run_dir, transfer_result.is_ok())
-            .map_err(AppError::TransferLog)?;
+            .map_err(UserError::TransferLog)?;
 
         match transfer_result {
             Ok(()) => {
@@ -800,7 +806,7 @@ fn transfer_run_to_landing_zone(
     landing_zone: &CanonicalDirBuf,
     classified_files: ClassifiedFiles,
     compress: bool,
-) -> Result<(), AppError> {
+) -> Result<(), UserError> {
     ensure_no_archive_dir_checkout_conflict(directory_to_transfer, &classified_files.checkout)?;
 
     let staging_run_dir = staging_run_dir_segment(run_dir);
@@ -837,7 +843,7 @@ fn transfer_run_to_landing_zone(
         let archive_path = canonical_staging_run_dir.join_file_name(archive_segment)?;
 
         create_archive_tar(&archive_path, &archive_dir, compress)?;
-        fs::remove_dir_all(&archive_dir).map_err(|source| AppError::RemoveArchiveDir {
+        fs::remove_dir_all(&archive_dir).map_err(|source| UserError::RemoveArchiveDir {
             path: archive_dir.as_ref().to_owned(),
             source,
         })?;
@@ -853,15 +859,15 @@ fn transfer_run_to_landing_zone(
 fn move_from_staging_zone_to_landing_zone(
     source: &Path,
     destination: &Path,
-) -> Result<(), AppError> {
+) -> Result<(), UserError> {
     match fs::rename(source, destination) {
         Ok(_) => Ok(()),
         Err(error) => match error.kind() {
-            std::io::ErrorKind::CrossesDevices => Err(AppError::StagingZoneNotOnRightDevice {
+            std::io::ErrorKind::CrossesDevices => Err(UserError::StagingZoneNotOnRightDevice {
                 from: source.to_owned(),
                 to: destination.to_owned(),
             }),
-            _ => Err(AppError::RenameFailed {
+            _ => Err(UserError::RenameFailed {
                 from: source.to_owned(),
                 to: destination.to_owned(),
             }),
@@ -884,7 +890,7 @@ fn staging_run_dir_segment(run_dir: &NormalUTF8Segment) -> NormalUTF8Segment {
 fn ensure_no_archive_dir_checkout_conflict(
     run_dir: &CanonicalDirBuf,
     checkout_paths: &[RelativePathBuf],
-) -> Result<(), AppError> {
+) -> Result<(), UserError> {
     for relative_path in checkout_paths {
         let first_component = relative_path
             .as_ref()
@@ -892,7 +898,7 @@ fn ensure_no_archive_dir_checkout_conflict(
             .next()
             .expect("Relative paths must have at least one component");
         if archive_dir_name_conflicts(first_component.as_os_str()) {
-            return Err(AppError::ArchiveDirCheckoutConflict {
+            return Err(UserError::ArchiveDirCheckoutConflict {
                 run_dir: run_dir.as_ref().to_owned(),
                 relative_path: relative_path.as_ref().to_owned(),
                 archive_dir_name: ARCHIVE_DIR_NAME,
@@ -942,7 +948,7 @@ fn archive_dir_name_conflicts(name: &OsStr) -> bool {
 fn create_parent_directories(
     target_root: &CanonicalDirBuf,
     relative_paths: &[RelativePathBuf],
-) -> Result<(), AppError> {
+) -> Result<(), UserError> {
     // Use HashSet to deduplicate
     let mut directories = HashSet::<RelativePathBuf>::new();
 
@@ -959,7 +965,7 @@ fn create_parent_directories(
 
     for directory in directories {
         let to_create = target_root.as_ref().join(directory.as_ref());
-        fs::create_dir_all(&to_create).map_err(|source| AppError::CreateDir {
+        fs::create_dir_all(&to_create).map_err(|source| UserError::CreateDir {
             path: to_create,
             source,
         })?;
@@ -972,10 +978,10 @@ fn copy_classified_file(
     relative_path: &RelativePathBuf,
     source: &CanonicalDirBuf,
     target: &CanonicalDirBuf,
-) -> Result<(), AppError> {
+) -> Result<(), UserError> {
     let source_path = source.as_ref().join(relative_path.as_ref());
     let target_path = target.as_ref().join(relative_path.as_ref());
-    fs::copy(&source_path, &target_path).map_err(|source| AppError::CopyTransferFile {
+    fs::copy(&source_path, &target_path).map_err(|source| UserError::CopyTransferFile {
         source_path,
         destination: target_path,
         source,
@@ -987,8 +993,8 @@ fn create_archive_tar(
     archive_path: &CanonicalChildFileBuf,
     archive_dir: &CanonicalDirBuf,
     compress: bool,
-) -> Result<(), AppError> {
-    let file = File::create(archive_path).map_err(|source| AppError::CreateArchiveTar {
+) -> Result<(), UserError> {
+    let file = File::create(archive_path).map_err(|source| UserError::CreateArchiveTar {
         path: archive_path.as_ref().to_path_buf(),
         source,
     })?;
@@ -998,14 +1004,14 @@ fn create_archive_tar(
         write_archive_tar(archive_dir, archive_path, &mut builder)?;
         let encoder = builder
             .into_inner()
-            .map_err(|source| AppError::WriteArchiveTar {
+            .map_err(|source| UserError::WriteArchiveTar {
                 archive_dir: archive_dir.as_ref().to_path_buf(),
                 archive_tar: archive_path.as_ref().to_path_buf(),
                 source,
             })?;
         encoder
             .finish()
-            .map_err(|source| AppError::WriteArchiveTar {
+            .map_err(|source| UserError::WriteArchiveTar {
                 archive_dir: archive_dir.as_ref().to_path_buf(),
                 archive_tar: archive_path.as_ref().to_path_buf(),
                 source,
@@ -1021,17 +1027,17 @@ fn write_archive_tar<W: std::io::Write>(
     archive_dir: &CanonicalDirBuf,
     archive_path: &CanonicalChildFileBuf, // exists at this point
     builder: &mut tar::Builder<W>,
-) -> Result<(), AppError> {
+) -> Result<(), UserError> {
     builder
         .append_dir_all(".", archive_dir)
-        .map_err(|source| AppError::WriteArchiveTar {
+        .map_err(|source| UserError::WriteArchiveTar {
             archive_dir: archive_dir.as_ref().to_owned(),
             archive_tar: archive_path.as_ref().to_owned(),
             source,
         })?;
     builder
         .finish()
-        .map_err(|source| AppError::WriteArchiveTar {
+        .map_err(|source| UserError::WriteArchiveTar {
             archive_dir: archive_dir.as_ref().to_owned(),
             archive_tar: archive_path.as_ref().to_owned(),
             source,
@@ -1041,11 +1047,11 @@ fn write_archive_tar<W: std::io::Write>(
 fn classify_run_files(
     run_dir: &CanonicalDirBuf,
     filestructure: &config::FileStructure,
-) -> Result<ClassifiedFiles, AppError> {
+) -> Result<ClassifiedFiles, UserError> {
     let mut files = ClassifiedFiles::default();
 
     for entry in WalkDir::new(run_dir).follow_links(false) {
-        let entry = entry.map_err(|source| AppError::WalkRunDirectory {
+        let entry = entry.map_err(|source| UserError::WalkRunDirectory {
             run_dir: run_dir.as_ref().to_owned(),
             source,
         })?;
@@ -1078,7 +1084,7 @@ fn classify_relative_file(
     path: RelativePathBuf,
     filestructure: &config::FileStructure,
     files: &mut ClassifiedFiles,
-) -> Result<(), AppError> {
+) -> Result<(), UserError> {
     let ignored = filestructure.ignore_paths.contains(path.as_ref())
         || filestructure
             .ignore_globs
@@ -1091,7 +1097,7 @@ fn classify_relative_file(
             .any(|pattern| pattern.matches_path(path.as_ref()));
 
     match (ignored, checkout) {
-        (true, true) => Err(AppError::FileStructureConflict {
+        (true, true) => Err(UserError::FileStructureConflict {
             run_dir: run_dir.as_ref().to_owned(),
             relative_path: path.as_ref().to_owned(),
         }),
@@ -1113,16 +1119,16 @@ fn classify_relative_file(
 fn check_run_trees(
     tree_check_source: &CanonicalDirBuf,
     categories: &[config::Category],
-) -> Result<(), AppError> {
+) -> Result<(), UserError> {
     check_readable_directory(tree_check_source, "tree_check_source")?;
-    let entries = fs::read_dir(tree_check_source).map_err(|source| AppError::ReadDirectory {
+    let entries = fs::read_dir(tree_check_source).map_err(|source| UserError::ReadDirectory {
         field: "tree_check_source",
         path: tree_check_source.as_ref().to_owned(),
         source,
     })?;
 
     for entry in entries {
-        let entry = entry.map_err(|source| AppError::ReadDirectory {
+        let entry = entry.map_err(|source| UserError::ReadDirectory {
             field: "tree_check_source",
             path: tree_check_source.as_ref().to_owned(),
             source,
@@ -1133,7 +1139,7 @@ fn check_run_trees(
                 last_segment,
             } => (full_path, last_segment),
             DirEntrySubdirCases::IOError(e) => {
-                return Err(AppError::ReadDirectory {
+                return Err(UserError::ReadDirectory {
                     field: "Check run trees",
                     path: entry.path(),
                     source: e,
@@ -1165,14 +1171,14 @@ fn check_run_trees(
     Ok(())
 }
 
-fn load_config(config_path: &Path) -> Result<Config, AppError> {
-    Config::from_path(config_path).map_err(|source| AppError::LoadConfig {
+fn load_config(config_path: &Path) -> Result<Config, UserError> {
+    Config::from_path(config_path).map_err(|source| UserError::LoadConfig {
         path: config_path.to_path_buf(),
         source,
     })
 }
 
-fn check_ssh_access(config: &Config) -> Result<(), AppError> {
+fn check_ssh_access(config: &Config) -> Result<(), UserError> {
     debug!(
         "Checking SSH access. User name: {} port: {} domain name: {}",
         config.server_user, config.server_port, config.server_host
@@ -1186,12 +1192,12 @@ fn check_ssh_access(config: &Config) -> Result<(), AppError> {
         .arg("--")
         .arg("true")
         .status()
-        .map_err(|source| AppError::SpawnSsh { source })?;
+        .map_err(|source| UserError::SpawnSsh { source })?;
 
     if status.success() {
         Ok(())
     } else {
-        Err(AppError::SshAccessDenied {
+        Err(UserError::SshAccessDenied {
             user: config.server_user.clone(),
             host: config.server_host.clone(),
             port: config.server_port,
@@ -1199,8 +1205,8 @@ fn check_ssh_access(config: &Config) -> Result<(), AppError> {
     }
 }
 
-fn check_readable_directory(path: &CanonicalDirBuf, field: &'static str) -> Result<(), AppError> {
-    fs::read_dir(path).map_err(|source| AppError::ReadDirectory {
+fn check_readable_directory(path: &CanonicalDirBuf, field: &'static str) -> Result<(), UserError> {
+    fs::read_dir(path).map_err(|source| UserError::ReadDirectory {
         field,
         path: path.as_ref().to_owned(),
         source,
@@ -1208,20 +1214,20 @@ fn check_readable_directory(path: &CanonicalDirBuf, field: &'static str) -> Resu
     Ok(())
 }
 
-fn check_writable_directory(path: &CanonicalDirBuf, tag: &'static str) -> Result<(), AppError> {
+fn check_writable_directory(path: &CanonicalDirBuf, tag: &'static str) -> Result<(), UserError> {
     let segment: NormalPathSegmentBuf = NormalUTF8Segment::from_timestamp().into();
     let temp_path = path.join_file_name(&segment)?;
     OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(&temp_path)
-        .map_err(|source| AppError::WriteDirectory {
+        .map_err(|source| UserError::WriteDirectory {
             field: tag,
             path: path.as_ref().to_owned(),
             source,
         })?;
 
-    fs::remove_file(&temp_path).map_err(|source| AppError::CleanupProbeFile {
+    fs::remove_file(&temp_path).map_err(|source| UserError::CleanupProbeFile {
         path: temp_path.as_ref().to_owned(),
         source,
     })?;
@@ -1229,19 +1235,19 @@ fn check_writable_directory(path: &CanonicalDirBuf, tag: &'static str) -> Result
     Ok(())
 }
 
-fn canonicalize_config_path(path: &Path) -> Result<PathBuf, AppError> {
-    fs::canonicalize(path).map_err(|source| AppError::CanonicalizeConfigPath {
+fn canonicalize_config_path(path: &Path) -> Result<PathBuf, UserError> {
+    fs::canonicalize(path).map_err(|source| UserError::CanonicalizeConfigPath {
         path: path.to_path_buf(),
         source,
     })
 }
 
 // NB: config_path is an absolute path to existing config file
-fn write_cron_file(logdir: &CanonicalDirBuf, config_path: &Path) -> Result<PathBuf, AppError> {
+fn write_cron_file(logdir: &CanonicalDirBuf, config_path: &Path) -> Result<PathBuf, UserError> {
     debug!("Determining cron file content");
     let binary_path = std::env::current_exe()
         .and_then(fs::canonicalize)
-        .map_err(|source| AppError::CurrentExe { source })?;
+        .map_err(|source| UserError::CurrentExe { source })?;
 
     let cron_path = logdir.as_ref().join("sequencer-sync.cron");
     let contents = render_cron_file(config_path, &binary_path);
@@ -1249,7 +1255,7 @@ fn write_cron_file(logdir: &CanonicalDirBuf, config_path: &Path) -> Result<PathB
         "Writing cron content to cron file at {}",
         cron_path.display()
     );
-    fs::write(&cron_path, contents).map_err(|source| AppError::WriteCronFile {
+    fs::write(&cron_path, contents).map_err(|source| UserError::WriteCronFile {
         path: cron_path.clone(),
         source,
     })?;
@@ -1270,25 +1276,25 @@ fn render_cron_file(config_path: &Path, binary_path: &Path) -> Vec<u8> {
     out
 }
 
-fn check_lock_is_available(lock_file: &CanonicalChildFileBuf) -> Result<(), AppError> {
+fn check_lock_is_available(lock_file: &CanonicalChildFileBuf) -> Result<(), UserError> {
     debug!(
         "Checking availability of lock file at {}",
         lock_file.as_ref().display()
     );
-    let _lock = acquire_run_lock(lock_file)?.ok_or_else(|| AppError::RunLockHeld {
+    let _lock = acquire_run_lock(lock_file)?.ok_or_else(|| UserError::RunLockHeld {
         path: lock_file.as_ref().to_owned(),
     })?;
     Ok(())
 }
 
-fn acquire_run_lock(path: &CanonicalChildFileBuf) -> Result<Option<RunLock>, AppError> {
+fn acquire_run_lock(path: &CanonicalChildFileBuf) -> Result<Option<RunLock>, UserError> {
     let file = OpenOptions::new()
         .create(true)
         .read(true)
         .write(true)
         .truncate(false)
         .open(path)
-        .map_err(|source| AppError::OpenRunLockFile {
+        .map_err(|source| UserError::OpenRunLockFile {
             path: path.as_ref().to_owned(),
             source,
         })?;
@@ -1296,7 +1302,7 @@ fn acquire_run_lock(path: &CanonicalChildFileBuf) -> Result<Option<RunLock>, App
     match file.try_lock_exclusive() {
         Ok(()) => Ok(Some(RunLock { file })),
         Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
-        Err(source) => Err(AppError::AcquireRunLock {
+        Err(source) => Err(UserError::AcquireRunLock {
             path: path.as_ref().to_owned(),
             source,
         }),
@@ -1320,19 +1326,72 @@ impl Drop for RunLock {
     }
 }
 
-#[derive(Debug, Error)]
+#[derive(Debug)]
 enum AppError {
+    // User-facing error which, when displayed, simply prints a message to
+    // the user and exists.
+    User(UserError),
+    // Internal errors which uses Anyhow, and contains context, and displays
+    // in a complex, stack-trace-like manner
+    Internal(Error),
+}
+
+impl AppError {
+    fn internal_context<C>(self, context: C) -> Self
+    where
+        C: fmt::Display + Send + Sync + 'static,
+    {
+        match self {
+            Self::User(error) => Self::User(error),
+            Self::Internal(error) => Self::Internal(error.context(context)),
+        }
+    }
+}
+
+impl fmt::Display for AppError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            AppError::User(error) => write!(f, "Error: {error}"),
+            AppError::Internal(error) => write!(f, "Internal error in sequencer-sync: {error:?}"),
+        }
+    }
+}
+
+impl std::error::Error for AppError {}
+
+impl From<UserError> for AppError {
+    fn from(error: UserError) -> Self {
+        Self::User(error)
+    }
+}
+
+impl From<paths::PathError> for AppError {
+    fn from(error: paths::PathError) -> Self {
+        Self::User(UserError::PathError(Box::new(error)))
+    }
+}
+
+impl From<paths::PathError> for UserError {
+    fn from(error: paths::PathError) -> Self {
+        Self::PathError(Box::new(error))
+    }
+}
+
+impl From<Error> for AppError {
+    fn from(error: Error) -> Self {
+        Self::Internal(error)
+    }
+}
+
+#[derive(Debug, Error)]
+enum UserError {
+    // Wraps a ConfigError. We have this because it's useful for testing to have a distinct
+    // ConfigError, but since this is usually a user error, we wrap it.
     #[error("failed to load config from {}: {source}", path.display())]
     LoadConfig {
         path: PathBuf,
         #[source]
         source: ConfigError,
-    },
-    #[error("failed to remove marker file at landing zone at {path}, got: {source}")]
-    RemoveMarker {
-        path: PathBuf,
-        #[source]
-        source: std::io::Error,
     },
     #[error("failed to execute ssh: {source}")]
     SpawnSsh {
@@ -1397,7 +1456,7 @@ enum AppError {
         source: std::io::Error,
     },
     #[error(transparent)]
-    PathError(#[from] Box<PathError>),
+    PathError(#[from] Box<paths::PathError>),
     #[error("failed to rename from staging zone to landing zone.\n\
         \tDirectory in staging zone: {}\n\
         \tDirectory in landing zone: {}",
@@ -1489,12 +1548,6 @@ enum AppError {
     MissingTreeCheckArg,
     #[error("setup cannot use both --tree-check-source and --skip-tree-check")]
     ConflictingTreeCheckArgs,
-}
-
-impl From<PathError> for AppError {
-    fn from(error: PathError) -> Self {
-        Self::PathError(Box::new(error))
-    }
 }
 
 #[cfg(any())]

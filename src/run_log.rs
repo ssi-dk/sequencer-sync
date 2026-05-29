@@ -4,7 +4,7 @@ use std::io::Write;
 use chrono::Local;
 
 use crate::{
-    AppError,
+    UserError,
     paths::{CanonicalChildFileBuf, CanonicalDirBuf, NormalPathSegment},
 };
 
@@ -26,7 +26,7 @@ pub struct RunLog {
 }
 
 impl RunLog {
-    pub fn new(logdir: &CanonicalDirBuf) -> Result<Self, AppError> {
+    pub fn new(logdir: &CanonicalDirBuf) -> Result<Self, UserError> {
         Ok(Self {
             full_log_path: logdir
                 .join_file_name(NormalPathSegment::new("sequencer-sync.log".as_ref()).unwrap())?,

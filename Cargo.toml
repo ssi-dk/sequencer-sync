@@ -21,6 +21,7 @@ tar = "0.4.45"
 walkdir = "2.5"
 flate2 = {version = "1.1.9", features = ["zlib-rs"] }
 bstr = "1.12.1"
+anyhow = "1.0.102"
 
 [dev-dependencies]
 assert_cmd = "2"
