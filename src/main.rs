@@ -976,13 +976,14 @@ fn copy_classified_file(
     relative_path: &RelativePathBuf,
     source: &CanonicalDirBuf,
     target: &CanonicalDirBuf,
-) -> Result<(), UserError> {
+) -> Result<(), AppError> {
     let source_path = source.as_ref().join(relative_path.as_ref());
     let target_path = target.as_ref().join(relative_path.as_ref());
-    fs::copy(&source_path, &target_path).map_err(|source| UserError::CopyTransferFile {
-        source_path,
-        destination: target_path,
-        source,
+    fs::copy(&source_path, &target_path).with_context(|| {
+        format!(
+            "Failed to copy transferred file to staging area.\nFrom {:?}\nTo {:?}",
+            source_path, target_path
+        )
     })?;
     Ok(())
 }
@@ -992,10 +993,8 @@ fn create_archive_tar(
     archive_dir: &CanonicalDirBuf,
     compress: bool,
 ) -> Result<(), AppError> {
-    let file = File::create(archive_path).map_err(|source| UserError::CreateArchiveTar {
-        path: archive_path.as_ref().to_path_buf(),
-        source,
-    })?;
+    let file = File::create(archive_path)
+        .with_context(|| format!("Archive tar already exists at {:?}", archive_path.as_ref()))?;
     if compress {
         let encoder = GzEncoder::new(file, Compression::default());
         let mut builder = tar::Builder::new(encoder);
@@ -1225,11 +1224,14 @@ fn canonicalize_config_path(path: &Path) -> Result<PathBuf, UserError> {
 }
 
 // NB: config_path is an absolute path to existing config file
-fn write_cron_file(logdir: &CanonicalDirBuf, config_path: &Path) -> Result<PathBuf, UserError> {
+fn write_cron_file(logdir: &CanonicalDirBuf, config_path: &Path) -> Result<PathBuf, AppError> {
     debug!("Determining cron file content");
     let binary_path = std::env::current_exe()
-        .and_then(fs::canonicalize)
-        .map_err(|source| UserError::CurrentExe { source })?;
+        .context("Failed to determine path of current executable")
+        .and_then(|path| {
+            path.canonicalize()
+                .context("Failed to canonicalize path of current executable")
+        })?;
 
     let cron_path = logdir.as_ref().join("sequencer-sync.cron");
     let contents = render_cron_file(config_path, &binary_path);
@@ -1419,19 +1421,6 @@ enum UserError {
         #[source]
         source: std::io::Error,
     },
-    #[error("failed to copy transfer file {} to {}: {source}", source_path.display(), destination.display())]
-    CopyTransferFile {
-        source_path: PathBuf,
-        destination: PathBuf,
-        #[source]
-        source: std::io::Error,
-    },
-    #[error("failed to create archive tar file {}: {source}", path.display())]
-    CreateArchiveTar {
-        path: PathBuf,
-        #[source]
-        source: std::io::Error,
-    },
     #[error(transparent)]
     PathError(#[from] Box<paths::PathError>),
     #[error("failed to rename from staging zone to landing zone.\n\
@@ -1490,11 +1479,6 @@ enum UserError {
     },
     #[error("one or more run log writes failed (see warnings above)")]
     RunLogWriteFailed,
-    #[error("failed to determine path to current executable: {source}")]
-    CurrentExe {
-        #[source]
-        source: std::io::Error,
-    },
     #[error(
         "directory `{dir_name}` matched category regex `{category_regex}` with year_subdirectory enabled, but name does not start with two ASCII digits"
     )]
