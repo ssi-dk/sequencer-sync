@@ -2,6 +2,7 @@ use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
+use std::io::ErrorKind;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -22,6 +23,7 @@ use thiserror::Error;
 use transfer_log::TransferLog;
 use walkdir::WalkDir;
 
+use crate::AppError::Internal;
 use crate::paths::{
     CanonicalChildFileBuf, CanonicalDirBuf, DirEntrySubdirCases, NormalPathSegment,
     NormalPathSegmentBuf, NormalUTF8Segment, RelativePathBuf,
@@ -93,14 +95,29 @@ struct SetupArgs {
 }
 
 impl SetupArgs {
-    fn validate(self) -> Result<ValidatedSetupArgs, UserError> {
+    fn validate(self) -> Result<ValidatedSetupArgs, AppError> {
         let tree_check = match (self.tree_check_source, self.skip_tree_check) {
-            (Some(_), true) => return Err(UserError::ConflictingTreeCheckArgs),
-            (Some(p), false) => TreeCheck::Source(CanonicalDirBuf::from_absolute(
-                &p,
-                "--tree-check-source path",
-            )?),
-            (None, false) => return Err(UserError::MissingTreeCheckArg),
+            (Some(_), true) => return Err(UserError::ConflictingTreeCheckArgs.into()),
+            (Some(p), false) => {
+                let canonicalized = match p.canonicalize() {
+                    Ok(p) => p,
+                    Err(e) if e.kind() == ErrorKind::NotFound => {
+                        return Err(UserError::NotFound { description: "Argument to --tree-check-source".to_owned(), path: p }.into())
+                    },
+                    Err(source) => {
+                        return Err(AppError::Internal(Error::from(source).with_context(|| {
+                            format!("When canonicalizing --tree-check-source given as {:?}", p)
+                        })))
+                    }
+                };
+                if !canonicalized.is_dir() {
+                    todo!();
+                }
+                unsafe {
+                    TreeCheck::Source(CanonicalDirBuf::new_unchecked(canonicalized))
+                }
+            },
+            (None, false) => return Err(UserError::MissingTreeCheckArg.into()),
             (None, true) => TreeCheck::Skipped,
         };
 
@@ -1332,18 +1349,6 @@ impl From<UserError> for AppError {
     }
 }
 
-impl From<paths::PathError> for AppError {
-    fn from(error: paths::PathError) -> Self {
-        Self::User(UserError::PathError(Box::new(error)))
-    }
-}
-
-impl From<paths::PathError> for UserError {
-    fn from(error: paths::PathError) -> Self {
-        Self::PathError(Box::new(error))
-    }
-}
-
 impl From<Error> for AppError {
     fn from(error: Error) -> Self {
         Self::Internal(error)
@@ -1367,12 +1372,6 @@ enum UserError {
         port: u16,
         stderr: BString,
     },
-    // #[error("failed to create directory {}: {source}", path.display())]
-    // CreateDir {
-    //     path: PathBuf,
-    //     #[source]
-    //     source: std::io::Error,
-    // },
     #[error(transparent)]
     PathError(#[from] Box<paths::PathError>),
     #[error("failed to rename from staging zone to landing zone.\n\
@@ -1416,6 +1415,16 @@ enum UserError {
     FileStructureConflict {
         run_dir: PathBuf,
         relative_path: PathBuf,
+    },
+    #[error("{description} at {path:?} is not a directory, but must be.")]
+    NotADirectory {
+        description: String,
+        path: PathBuf,
+    },
+    #[error("File or directory not found: {description} at {path:?}.")]
+    NotFound {
+        description: String,
+        path: PathBuf,
     },
     #[error("error when reading a directory {description} at {} \
         This directory must be readable \

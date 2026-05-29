@@ -13,6 +13,7 @@ use std::{
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
+
 use thiserror::Error;
 
 // This type represents a single, normal path segment. That is, an element of the path, which:
@@ -226,6 +227,10 @@ impl SubDirectoryResult {
 }
 
 impl CanonicalDirBuf {
+    pub unsafe fn new_unchecked(p: PathBuf) -> Self {
+        Self(p)
+    }
+    
     pub fn create_if_not_exist(&self, subdir: &NormalPathSegment) -> Result<Self, PathError> {
         let path = self.as_ref().join(subdir.as_ref());
         match std::fs::create_dir(&path) {
