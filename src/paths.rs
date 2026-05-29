@@ -2,7 +2,8 @@
 // There is plenty of opportunities for TOCTOU issues, but we don't want to anticipiate those
 // in this program.
 
-use serde::{Deserialize, Serialize};
+use serde::de::Error as _;
+use serde::{Deserialize, Deserializer, Serialize};
 use std::{
     borrow::Borrow,
     ffi::{OsStr, OsString},
@@ -85,29 +86,48 @@ impl AsRef<OsStr> for NormalPathSegment {
 
 // This has the same invariants as NormalPathSegment, but also guarantees
 // that the segment is UTF8.
-#[derive(Serialize, Deserialize, Clone, Debug, Hash, PartialEq, Eq)]
+#[derive(Serialize, Clone, Debug, Hash, PartialEq, Eq)]
 pub struct NormalUTF8Segment(String);
 
 impl NormalUTF8Segment {
+    pub fn new(value: String) -> Option<Self> {
+        NormalPathSegment::new(Path::new(&value))?;
+        Some(Self(value))
+    }
+
     pub fn into_inner(self) -> String {
         self.0
     }
 
-    pub fn from_timestamp(tag: &str) -> Self {
+    pub fn from_timestamp() -> Self {
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("system time should be after unix epoch")
             .as_nanos();
         let s = format!(
-            ".sequencer-sync-{tag}-write-probe-{}-{timestamp}",
+            ".sequencer-sync-write-probe-{}-{timestamp}",
             std::process::id()
         );
+        // Safety: Since timestamp is ASCII digits, this is alphanumerical,
+        // except the leading dot and dashes, and so upholds the invariant.
         Self(s)
     }
 
     pub fn as_normal(&self) -> &NormalPathSegment {
         // Safety: Self's invariants are a superset of NormalPathSegment
         unsafe { NormalPathSegment::from_os_str(OsStr::from_bytes(self.0.as_bytes())) }
+    }
+}
+
+impl<'de> Deserialize<'de> for NormalUTF8Segment {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::new(value).ok_or_else(|| {
+                 D::Error::custom("expected a normal UTF-8 path segment: non-empty, not '.', not '..', and no path separators")
+            })
     }
 }
 
@@ -132,6 +152,7 @@ pub fn utf8_subdir(entry: &DirEntry) -> DirEntrySubdirCases {
         Ok(md) => md,
         Err(e) => return DirEntrySubdirCases::IOError(e),
     };
+
     if md.is_symlink() {
         return DirEntrySubdirCases::IsSymlink;
     }
@@ -208,15 +229,27 @@ impl CanonicalDirBuf {
     pub fn create_if_not_exist(&self, subdir: &NormalPathSegment) -> Result<Self, PathError> {
         let path = self.as_ref().join(subdir.as_ref());
         match std::fs::create_dir(&path) {
-            Ok(()) => {Ok(CanonicalDirBuf(path))},
-            Err(e) if e.kind() == ErrorKind::AlreadyExists => {Ok(CanonicalDirBuf(path))},
+            Ok(()) => Ok(CanonicalDirBuf(path)),
+            Err(e) if e.kind() == ErrorKind::AlreadyExists => {
+                match self.try_from_existing_subdirectory(subdir)? {
+                    SubDirectoryResult::SubDirectory(s) => Ok(s),
+                    SubDirectoryResult::IsSymlink => Err(PathError::NotADirectory {
+                        description: "".to_owned(),
+                        path,
+                    }),
+                    SubDirectoryResult::IsNotDirectory => Err(PathError::NotADirectory {
+                        description: "".to_owned(),
+                        path,
+                    }),
+                }
+            }
             Err(source) => Err(PathError::GeneralIOError {
                 path: path.to_owned(),
                 source,
             }),
         }
     }
-    
+
     pub fn create_subdir(&self, subdir: &NormalPathSegment) -> Result<Self, PathError> {
         let path = self.as_ref().join(subdir.as_ref());
         match std::fs::create_dir(&path) {
@@ -239,9 +272,12 @@ impl CanonicalDirBuf {
                 if path.is_dir() {
                     Ok(Self(path))
                 } else {
-                    Err(PathError::NotADirectory { description: description.to_owned(), path: path.to_owned() })
+                    Err(PathError::NotADirectory {
+                        description: description.to_owned(),
+                        path: path.to_owned(),
+                    })
                 }
-            },
+            }
             Err(source) => match source.kind() {
                 ErrorKind::NotFound => Err(PathError::NotFound {
                     description: description.to_owned(),

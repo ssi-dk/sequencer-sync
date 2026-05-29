@@ -34,7 +34,7 @@ pub struct Config {
 }
 
 // Validated, but not filesystem-resolved config.
-pub  struct ConfigSpec {
+pub struct ConfigSpec {
     lock_file: PathBuf,
     log_dir: PathBuf,
     pub server_user: String,
@@ -143,7 +143,9 @@ pub enum ConfigError {
         #[source]
         source: std::io::Error,
     },
-    #[error("config field `{field}` must be a relative path/glob inside the run directory: {pattern:?}")]
+    #[error(
+        "config field `{field}` must be a relative path/glob inside the run directory: {pattern:?}"
+    )]
     GlobOutsideRunDirectory {
         field: &'static str,
         pattern: String,

@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::process::ExitCode;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use bstr::{BStr, BString, ByteSlice};
 use clap::{Args, Parser, Subcommand};
@@ -290,26 +291,29 @@ fn validate_environment(config: &Config, skip_ssh_check: bool) -> Result<(), App
             cat.staging_zone.as_ref().display()
         );
         let field = "category.staging_zone";
-        let segment: NormalPathSegmentBuf = NormalUTF8Segment::from_timestamp("probe").into();
-        let temp_path = cat.staging_zone.join_file_name(&segment)?;
+        let segment: NormalPathSegmentBuf = NormalUTF8Segment::from_timestamp().into();
+        let staging_zone_marker_path = cat.staging_zone.join_file_name(&segment)?;
         OpenOptions::new()
             .write(true)
             .create_new(true)
-            .open(&temp_path)
+            .open(&staging_zone_marker_path)
             .map_err(|source| AppError::WriteDirectory {
                 field,
-                path: temp_path.as_ref().to_owned(),
+                path: staging_zone_marker_path.as_ref().to_owned(),
                 source,
             })?;
 
         debug!("\tChecking file can be moved to landing_zone");
-        let landing_zone_marker_path =
-            move_from_staging_zone_to_landing_zone(&segment, &cat.staging_zone, &cat.landing_zone)?;
+        let landing_zone_marker_path = cat.landing_zone.join_file_name(&segment)?;
+        move_from_staging_zone_to_landing_zone(
+            staging_zone_marker_path.as_ref(),
+            landing_zone_marker_path.as_ref(),
+        )?;
 
         debug!("Removing marker file from landing zone");
 
         fs::remove_file(&landing_zone_marker_path).map_err(|e| AppError::RemoveMarker {
-            path: landing_zone_marker_path,
+            path: landing_zone_marker_path.as_ref().to_owned(),
             source: e,
         })?;
 
@@ -803,8 +807,8 @@ fn transfer_run_to_landing_zone(
         .expect_normal_dir("run_dir is known to be a dir");
     ensure_no_archive_dir_checkout_conflict(&canonical_source_run_dir, &classified_files.checkout)?;
 
-    // Create the dir in staging area
-    let canonical_staging_run_dir = staging_zone.create_subdir(run_dir.as_normal())?;
+    let staging_run_dir = staging_run_dir_segment(run_dir);
+    let canonical_staging_run_dir = staging_zone.create_subdir(staging_run_dir.as_normal())?;
 
     // Create parent directories once, so we can create files without worrying
     // about whether their parent exists
@@ -843,32 +847,42 @@ fn transfer_run_to_landing_zone(
         })?;
     }
 
-    move_from_staging_zone_to_landing_zone(run_dir.as_normal(), staging_zone, landing_zone)?;
+    move_from_staging_zone_to_landing_zone(
+        canonical_staging_run_dir.as_ref(),
+        &landing_zone.as_ref().join(run_dir.as_normal().as_ref()),
+    )?;
     Ok(())
 }
 
 fn move_from_staging_zone_to_landing_zone(
-    path: &NormalPathSegment,
-    staging_zone: &CanonicalDirBuf,
-    landing_zone: &CanonicalDirBuf,
-) -> Result<PathBuf, AppError> {
-    let src = staging_zone.as_ref().join(path.as_ref());
-    let dst = landing_zone.as_ref().join(path.as_ref());
-    match fs::rename(&src, &dst) {
-        Ok(_) => Ok(dst),
+    source: &Path,
+    destination: &Path,
+) -> Result<(), AppError> {
+    match fs::rename(source, destination) {
+        Ok(_) => Ok(()),
         Err(error) => match error.kind() {
             std::io::ErrorKind::CrossesDevices => Err(AppError::StagingZoneNotOnRightDevice {
-                relative_path: Path::new(path.as_ref()).to_owned(),
-                staging_zone: staging_zone.as_ref().to_owned(),
-                landing_zone: landing_zone.as_ref().to_owned(),
+                from: source.to_owned(),
+                to: destination.to_owned(),
             }),
             _ => Err(AppError::RenameFailed {
-                relative_path: Path::new(path.as_ref()).to_owned(),
-                staging_zone: staging_zone.as_ref().to_owned(),
-                landing_zone: landing_zone.as_ref().to_owned(),
+                from: source.to_owned(),
+                to: destination.to_owned(),
             }),
         },
     }
+}
+
+fn staging_run_dir_segment(run_dir: &NormalUTF8Segment) -> NormalUTF8Segment {
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after unix epoch")
+        .as_nanos();
+    let segment = format!("{}-{timestamp}", run_dir.clone().into_inner(),);
+    NormalPathSegment::new(Path::new(&segment))
+        .expect("staging run directory should be a normal path segment")
+        .try_into()
+        .expect("staging run directory should be valid UTF-8")
 }
 
 fn ensure_no_archive_dir_checkout_conflict(
@@ -1043,10 +1057,13 @@ fn classify_run_files(
             continue;
         }
 
-        let relative = RelativePathBuf::new(entry.path().strip_prefix(run_dir.as_ref()).expect(
-            "Internal error: Path of entry must start with base path")).expect(
-                "Internal error: Expected path of entry to be normalized"
-            );
+        let relative = RelativePathBuf::new(
+            entry
+                .path()
+                .strip_prefix(run_dir.as_ref())
+                .expect("Internal error: Path of entry must start with base path"),
+        )
+        .expect("Internal error: Expected path of entry to be normalized");
         classify_relative_file(run_dir, relative, filestructure, &mut files)?;
     }
 
@@ -1196,7 +1213,7 @@ fn check_readable_directory(path: &CanonicalDirBuf, field: &'static str) -> Resu
 }
 
 fn check_writable_directory(path: &CanonicalDirBuf, tag: &'static str) -> Result<(), AppError> {
-    let segment: NormalPathSegmentBuf = NormalUTF8Segment::from_timestamp(tag).into();
+    let segment: NormalPathSegmentBuf = NormalUTF8Segment::from_timestamp().into();
     let temp_path = path.join_file_name(&segment)?;
     OpenOptions::new()
         .write(true)
@@ -1386,32 +1403,20 @@ enum AppError {
     #[error(transparent)]
     PathError(#[from] Box<PathError>),
     #[error("failed to rename from staging zone to landing zone.\n\
-        \tFile name: {}\n\
-        \tStaging zone: {}\n\
-        \tLanding zone: {}",
-        relative_path.display(),
-        staging_zone.display(),
-        landing_zone.display())]
-    RenameFailed {
-        relative_path: PathBuf,
-        staging_zone: PathBuf,
-        landing_zone: PathBuf,
-    },
+        \tDirectory in staging zone: {}\n\
+        \tDirectory in landing zone: {}",
+        from.display(),
+        to.display())]
+    RenameFailed { from: PathBuf, to: PathBuf },
     #[error(
         "failed to move from staging zone to landing zone, because they are on separate devices. \
         Please make sure, for all categories in config file, that their landing zone and \
         staging zones are on the same device (i.e. file system).\n\
-        \tFile name: {}\n\
-        \tStaging zone: {}\n\
-        \tLanding zone: {}",
-        relative_path.display(),
-        staging_zone.display(),
-        landing_zone.display())]
-    StagingZoneNotOnRightDevice {
-        relative_path: PathBuf,
-        staging_zone: PathBuf,
-        landing_zone: PathBuf,
-    },
+        \tDirectory in staging zone: {}\n\
+        \tDirectory in landing zone: {}",
+        from.display(),
+        to.display())]
+    StagingZoneNotOnRightDevice { from: PathBuf, to: PathBuf },
     #[error("failed to write archive tar from {} to {}: {source}", archive_dir.display(), archive_tar.display())]
     WriteArchiveTar {
         archive_dir: PathBuf,
