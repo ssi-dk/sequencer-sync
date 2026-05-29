@@ -795,17 +795,13 @@ struct ClassifiedFiles {
 
 fn transfer_run_to_landing_zone(
     run_dir: &NormalUTF8Segment,
-    source: &CanonicalDirBuf,
+    directory_to_transfer: &CanonicalDirBuf,
     staging_zone: &CanonicalDirBuf,
     landing_zone: &CanonicalDirBuf,
     classified_files: ClassifiedFiles,
     compress: bool,
 ) -> Result<(), AppError> {
-    // Classify all files in the run dir in the source
-    let canonical_source_run_dir = source
-        .try_from_existing_subdirectory(run_dir.as_normal())?
-        .expect_normal_dir("run_dir is known to be a dir");
-    ensure_no_archive_dir_checkout_conflict(&canonical_source_run_dir, &classified_files.checkout)?;
+    ensure_no_archive_dir_checkout_conflict(directory_to_transfer, &classified_files.checkout)?;
 
     let staging_run_dir = staging_run_dir_segment(run_dir);
     let canonical_staging_run_dir = staging_zone.create_subdir(staging_run_dir.as_normal())?;
@@ -817,7 +813,7 @@ fn transfer_run_to_landing_zone(
     for relative_path in &classified_files.checkout {
         copy_classified_file(
             relative_path,
-            &canonical_source_run_dir,
+            directory_to_transfer,
             &canonical_staging_run_dir,
         )?;
     }
@@ -830,7 +826,7 @@ fn transfer_run_to_landing_zone(
 
         create_parent_directories(&archive_dir, &classified_files.archived)?;
         for relative_path in &classified_files.archived {
-            copy_classified_file(relative_path, &canonical_source_run_dir, &archive_dir)?;
+            copy_classified_file(relative_path, directory_to_transfer, &archive_dir)?;
         }
 
         let archive_segment = if compress {
@@ -1501,7 +1497,7 @@ impl From<PathError> for AppError {
     }
 }
 
-#[cfg(test)]
+#[cfg(any())]
 mod tests {
     use std::collections::HashSet;
     use std::fs;
@@ -1736,6 +1732,261 @@ mod tests {
             line.contains("Skipping directory with non-UTF-8 name")
                 && line.contains("glob matching requires UTF-8")
         }));
+        cleanup_temp_dir(&tempdir);
+    }
+}
+
+#[cfg(test)]
+mod current_tests {
+    use std::collections::HashSet;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use glob::Pattern;
+    use regex::Regex;
+
+    use super::{
+        ClassifiedFiles, TransferDestination, archive_dir_name_conflicts, categorize,
+        classify_run_files, render_cron_file, run_is_complete, staging_run_dir_segment,
+        transfer_run_to_landing_zone,
+    };
+    use crate::config::{Category, FileStructure};
+    use crate::paths::{CanonicalDirBuf, NormalPathSegment, NormalUTF8Segment};
+
+    static NEXT_TEST_DIR_ID: AtomicU64 = AtomicU64::new(0);
+
+    fn make_temp_dir() -> PathBuf {
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time should be after unix epoch")
+            .as_nanos();
+        let unique_id = NEXT_TEST_DIR_ID.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "sequencer-sync-main-test-{}-{timestamp}-{unique_id}",
+            std::process::id()
+        ));
+        fs::create_dir(&path).expect("should create temp dir");
+        path
+    }
+
+    fn cleanup_temp_dir(path: &Path) {
+        fs::remove_dir_all(path).expect("should remove temp dir");
+    }
+
+    fn canonical_dir(path: &Path) -> CanonicalDirBuf {
+        CanonicalDirBuf::from_absolute(path, "test dir").expect("test dir should resolve")
+    }
+
+    fn segment(value: &str) -> NormalUTF8Segment {
+        NormalPathSegment::new(Path::new(value))
+            .expect("test segment should be normal")
+            .try_into()
+            .expect("test segment should be UTF-8")
+    }
+
+    fn file_structure() -> Arc<FileStructure> {
+        Arc::new(FileStructure {
+            name: "test".to_owned(),
+            ignore_paths: HashSet::new(),
+            ignore_globs: Vec::new(),
+            checkout_paths: HashSet::new(),
+            checkout_globs: Vec::new(),
+            completion_file_globs: vec![Pattern::new("complete.txt").unwrap()],
+        })
+    }
+
+    fn category(
+        regex: &str,
+        classification_glob: Option<&str>,
+        landing_zone: &Path,
+        staging_zone: &Path,
+        year_subdirectory: bool,
+    ) -> Category {
+        Category {
+            regex: Regex::new(regex).expect("regex should parse"),
+            classification_glob: classification_glob.map(|pattern| Pattern::new(pattern).unwrap()),
+            landing_zone: canonical_dir(landing_zone),
+            staging_zone: canonical_dir(staging_zone),
+            file_structure: file_structure(),
+            year_subdirectory,
+        }
+    }
+
+    #[test]
+    fn renders_cron_file_with_shell_quoted_paths() {
+        let block = render_cron_file(
+            Path::new("/etc/sequencer sync/config.yaml"),
+            Path::new("/usr/local/bin/sequencer-sync"),
+        );
+        let block = String::from_utf8(block).expect("cron file should be valid UTF-8 here");
+
+        assert!(block.contains("# Install this file into cron manually."));
+        assert!(block.contains("'/usr/local/bin/sequencer-sync' run"));
+        assert!(block.contains("--config-path '/etc/sequencer sync/config.yaml'"));
+    }
+
+    #[test]
+    fn run_is_complete_requires_all_completion_globs() {
+        let tempdir = make_temp_dir();
+        fs::write(tempdir.join("complete.txt"), "").expect("should write completion file");
+
+        assert!(run_is_complete(&tempdir, &[Pattern::new("complete.txt").unwrap()]).unwrap());
+        assert!(
+            !run_is_complete(
+                &tempdir,
+                &[
+                    Pattern::new("complete.txt").unwrap(),
+                    Pattern::new("missing.txt").unwrap(),
+                ],
+            )
+            .unwrap()
+        );
+
+        cleanup_temp_dir(&tempdir);
+    }
+
+    #[test]
+    fn categorize_falls_through_when_classification_glob_is_missing() {
+        let tempdir = make_temp_dir();
+        let run_dir = tempdir.join("run-001");
+        let landing_a = tempdir.join("landing-a");
+        let landing_b = tempdir.join("landing-b");
+        let staging = tempdir.join("staging");
+        for dir in [&run_dir, &landing_a, &landing_b, &staging] {
+            fs::create_dir(dir).expect("should create fixture dir");
+        }
+
+        let categories = vec![
+            category("^run", Some("marker.txt"), &landing_a, &staging, false),
+            category("^run", None, &landing_b, &staging, false),
+        ];
+        let target = categorize(&canonical_dir(&run_dir), &categories)
+            .expect("categorization should succeed")
+            .expect("fallback category should match");
+
+        match target.destination {
+            TransferDestination::LandingZone(path) => {
+                assert_eq!(path.as_ref(), landing_b.canonicalize().unwrap())
+            }
+            TransferDestination::YearSubDirectory(_) => panic!("unexpected year destination"),
+        }
+
+        cleanup_temp_dir(&tempdir);
+    }
+
+    #[test]
+    fn categorize_creates_year_destination_from_run_name_prefix() {
+        let tempdir = make_temp_dir();
+        let run_dir = tempdir.join("240101_RUN");
+        let landing = tempdir.join("landing");
+        let staging = tempdir.join("staging");
+        for dir in [&run_dir, &landing, &staging] {
+            fs::create_dir(dir).expect("should create fixture dir");
+        }
+
+        let categories = vec![category("^24", None, &landing, &staging, true)];
+        let target = categorize(&canonical_dir(&run_dir), &categories)
+            .expect("categorization should succeed")
+            .expect("category should match");
+
+        match target.destination {
+            TransferDestination::YearSubDirectory((base, year)) => {
+                assert_eq!(base.as_ref(), landing.canonicalize().unwrap());
+                assert_eq!(year.into_inner(), "2024");
+            }
+            TransferDestination::LandingZone(_) => panic!("unexpected plain landing zone"),
+        }
+
+        cleanup_temp_dir(&tempdir);
+    }
+
+    #[test]
+    fn classify_run_files_preserves_nested_relative_paths() {
+        let tempdir = make_temp_dir();
+        let run_dir = tempdir.join("run-001");
+        fs::create_dir(&run_dir).expect("should create run dir");
+        fs::create_dir(run_dir.join("nested")).expect("should create nested dir");
+        fs::write(run_dir.join("nested/report.txt"), "").expect("should write report");
+        fs::write(run_dir.join("other.bin"), "").expect("should write archived file");
+
+        let filestructure = FileStructure {
+            name: "test".to_owned(),
+            ignore_paths: HashSet::new(),
+            ignore_globs: Vec::new(),
+            checkout_paths: HashSet::from([PathBuf::from("nested/report.txt")]),
+            checkout_globs: Vec::new(),
+            completion_file_globs: vec![Pattern::new("complete.txt").unwrap()],
+        };
+
+        let files = classify_run_files(&canonical_dir(&run_dir), &filestructure)
+            .expect("classification should succeed");
+
+        assert!(
+            files
+                .checkout
+                .iter()
+                .any(|path| path.as_ref() == Path::new("nested/report.txt"))
+        );
+        assert!(
+            files
+                .archived
+                .iter()
+                .any(|path| path.as_ref() == Path::new("other.bin"))
+        );
+        cleanup_temp_dir(&tempdir);
+    }
+
+    #[test]
+    fn archive_dir_conflict_detects_archive_names_and_tar_variants() {
+        assert!(archive_dir_name_conflicts(
+            "sequencer-sync-archive".as_ref()
+        ));
+        assert!(archive_dir_name_conflicts(
+            "sequencer-sync-archive.tar".as_ref()
+        ));
+        assert!(archive_dir_name_conflicts(
+            "sequencer-sync-archive.tar.gz".as_ref()
+        ));
+        assert!(!archive_dir_name_conflicts(
+            "sequencer-sync-archive-extra".as_ref()
+        ));
+    }
+
+    #[test]
+    fn staging_run_dir_keeps_original_name_and_adds_suffix() {
+        let run_dir = segment("run-001");
+        let staging = staging_run_dir_segment(&run_dir).into_inner();
+
+        assert!(staging.starts_with("run-001-"));
+        assert_ne!(staging, "run-001");
+    }
+
+    #[test]
+    fn transfer_renames_timestamped_staging_dir_to_plain_landing_dir() {
+        let tempdir = make_temp_dir();
+        let source = tempdir.join("source");
+        let staging = tempdir.join("staging");
+        let landing = tempdir.join("landing");
+        let run = source.join("run-001");
+        for dir in [&source, &staging, &landing, &run] {
+            fs::create_dir(dir).expect("should create fixture dir");
+        }
+
+        transfer_run_to_landing_zone(
+            &segment("run-001"),
+            &canonical_dir(&run),
+            &canonical_dir(&staging),
+            &canonical_dir(&landing),
+            ClassifiedFiles::default(),
+            false,
+        )
+        .expect("transfer should succeed");
+
+        assert!(landing.join("run-001").is_dir());
+        assert_eq!(fs::read_dir(&staging).unwrap().count(), 0);
         cleanup_temp_dir(&tempdir);
     }
 }

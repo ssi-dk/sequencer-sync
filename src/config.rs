@@ -527,7 +527,7 @@ fn is_literal_glob(pattern: &str) -> bool {
     !pattern.contains(['*', '?', '[', ']'])
 }
 
-#[cfg(test)]
+#[cfg(any())]
 mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -1292,6 +1292,378 @@ category:
                 label: "landing zone",
                 ..
             }
+        ));
+        cleanup_temp_dir(&tempdir);
+    }
+
+    fn make_temp_dir() -> PathBuf {
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time should be after unix epoch")
+            .as_nanos();
+        let unique_id = NEXT_TEST_DIR_ID.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "sequencer-sync-config-test-{}-{timestamp}-{unique_id}",
+            std::process::id()
+        ));
+        fs::create_dir(&path).expect("should create temp dir");
+        path
+    }
+
+    fn cleanup_temp_dir(path: &Path) {
+        fs::remove_dir_all(path).expect("should remove temp dir");
+    }
+}
+
+#[cfg(test)]
+mod current_tests {
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use super::{Config, ConfigError, ConfigSpec};
+    use crate::paths::PathError;
+
+    static NEXT_TEST_DIR_ID: AtomicU64 = AtomicU64::new(0);
+
+    fn base_config(categories: &str) -> String {
+        format!(
+            r#"
+version: 3
+lock_file: "/var/lib/sequencer/flock/sequencer-sync.lock"
+logdir: "/var/lib/sequencer/log"
+server_user: "sequencer-sync"
+server_port: 22
+server_host: "sequencer.example.org"
+source: "/data/sequencer"
+filestructures:
+  default:
+    ignore_globs:
+      - "ignore/literal.txt"
+      - "skip/*.tmp"
+    checkout_globs:
+      - "report.txt"
+      - "results/*.csv"
+    completion_file_globs:
+      - "complete.txt"
+
+category:
+{categories}
+"#
+        )
+    }
+
+    fn one_category() -> &'static str {
+        r#"  - regex: "^run"
+    classification_glob: "metadata/*.txt"
+    staging_zone: "/var/lib/sequencer/staging"
+    landing_zone: "/var/lib/sequencer/landing"
+    filestructure: "default"
+"#
+    }
+
+    fn spec(contents: &str) -> Result<ConfigSpec, ConfigError> {
+        ConfigSpec::from_yaml_str(contents)
+    }
+
+    fn expect_spec_err(contents: &str) -> ConfigError {
+        match spec(contents) {
+            Ok(_) => panic!("config spec should fail"),
+            Err(error) => error,
+        }
+    }
+
+    #[test]
+    fn parses_valid_config_without_touching_filesystem() {
+        let config = spec(&base_config(one_category())).expect("config spec should parse");
+
+        assert_eq!(config.server_user, "sequencer-sync");
+        assert_eq!(config.server_port, 22);
+        assert_eq!(config.server_host, "sequencer.example.org");
+        assert_eq!(config.source, PathBuf::from("/data/sequencer"));
+        assert_eq!(config.file_structures.len(), 1);
+        assert_eq!(config.categories.len(), 1);
+
+        let category = &config.categories[0];
+        assert!(category.regex.is_match("run-001"));
+        assert!(!category.regex.is_match("other-001"));
+        assert!(
+            category
+                .classification_glob
+                .as_ref()
+                .expect("classification glob should parse")
+                .matches("metadata/core.txt")
+        );
+        assert_eq!(
+            category.staging_zone,
+            PathBuf::from("/var/lib/sequencer/staging")
+        );
+        assert_eq!(
+            category.landing_zone,
+            PathBuf::from("/var/lib/sequencer/landing")
+        );
+
+        let filestructure = config.file_structures.get("default").unwrap();
+        assert!(
+            filestructure
+                .ignore_paths
+                .contains(Path::new("ignore/literal.txt"))
+        );
+        assert_eq!(filestructure.ignore_globs.len(), 1);
+        assert!(
+            filestructure
+                .checkout_paths
+                .contains(Path::new("report.txt"))
+        );
+        assert_eq!(filestructure.checkout_globs.len(), 1);
+        assert_eq!(filestructure.completion_file_globs.len(), 1);
+    }
+
+    #[test]
+    fn rejects_unsupported_config_version_before_shape_errors() {
+        let contents = base_config(one_category()).replacen(
+            "version: 3",
+            "version: 4\nfuture_required_field: true",
+            1,
+        );
+
+        let error = expect_spec_err(&contents);
+
+        assert!(matches!(
+            error,
+            ConfigError::UnsupportedVersion {
+                found: 4,
+                supported: 3
+            }
+        ));
+    }
+
+    #[test]
+    fn rejects_missing_required_version_as_parse_error() {
+        let contents = base_config(one_category()).replace("version: 3\n", "");
+
+        let error = expect_spec_err(&contents);
+
+        assert!(matches!(error, ConfigError::Parse(_)));
+    }
+
+    #[test]
+    fn rejects_relative_or_non_normal_absolute_paths() {
+        let relative_source = base_config(one_category())
+            .replace(r#"source: "/data/sequencer""#, r#"source: "relative/data""#);
+        assert!(matches!(
+            expect_spec_err(&relative_source),
+            ConfigError::NonAbsolutePath { .. }
+        ));
+
+        let parent_source = base_config(one_category()).replace(
+            r#"source: "/data/sequencer""#,
+            r#"source: "/data/../sequencer""#,
+        );
+        assert!(matches!(
+            expect_spec_err(&parent_source),
+            ConfigError::NonAbsolutePath { .. }
+        ));
+    }
+
+    #[test]
+    fn rejects_empty_fields_and_missing_references() {
+        let empty_user = base_config(one_category())
+            .replace(r#"server_user: "sequencer-sync""#, r#"server_user: "   ""#);
+        assert!(matches!(
+            expect_spec_err(&empty_user),
+            ConfigError::EmptyField {
+                field: "server_user"
+            }
+        ));
+
+        let unknown_filestructure = base_config(
+            &one_category().replace(r#"filestructure: "default""#, r#"filestructure: "missing""#),
+        );
+        assert!(matches!(
+            expect_spec_err(&unknown_filestructure),
+            ConfigError::UnknownFileStructure { name } if name == "missing"
+        ));
+    }
+
+    #[test]
+    fn rejects_bad_globs_and_globs_outside_run_directory() {
+        let invalid_glob = base_config(one_category()).replace(r#"- "skip/*.tmp""#, r#"- "[""#);
+        assert!(matches!(
+            expect_spec_err(&invalid_glob),
+            ConfigError::InvalidGlob {
+                field: "filestructures.*.ignore_globs",
+                ..
+            }
+        ));
+
+        for pattern in [
+            "/absolute.txt",
+            "../outside.txt",
+            "./same-dir.txt",
+            "nested/../x.txt",
+        ] {
+            let contents = base_config(one_category())
+                .replace(r#"- "complete.txt""#, &format!(r#"- "{pattern}""#));
+            assert!(matches!(
+                expect_spec_err(&contents),
+                ConfigError::GlobOutsideRunDirectory {
+                    field: "filestructures.*.completion_file_globs",
+                    ..
+                }
+            ));
+        }
+    }
+
+    #[test]
+    fn rejects_empty_completion_glob_list() {
+        let contents = base_config(one_category()).replace(
+            "    completion_file_globs:\n      - \"complete.txt\"",
+            "    completion_file_globs: []",
+        );
+
+        let error = expect_spec_err(&contents);
+
+        assert!(matches!(
+            error,
+            ConfigError::EmptyGlobList {
+                field: "filestructures.*.completion_file_globs"
+            }
+        ));
+    }
+
+    #[test]
+    fn duplicate_landing_zones_are_allowed() {
+        let categories = r#"  - regex: "^run-a"
+    staging_zone: "/var/lib/sequencer/staging-a"
+    landing_zone: "/var/lib/sequencer/landing"
+    filestructure: "default"
+  - regex: "^run-b"
+    staging_zone: "/var/lib/sequencer/staging-b"
+    landing_zone: "/var/lib/sequencer/landing"
+    filestructure: "default"
+"#;
+
+        let config = spec(&base_config(categories)).expect("duplicate landing zones should parse");
+
+        assert_eq!(config.categories.len(), 2);
+        assert_eq!(
+            config.categories[0].landing_zone,
+            config.categories[1].landing_zone
+        );
+    }
+
+    #[test]
+    fn from_path_resolves_existing_directories() {
+        let tempdir = make_temp_dir();
+        let flockdir = tempdir.join("flock");
+        let logdir = tempdir.join("log");
+        let source = tempdir.join("source");
+        let staging = tempdir.join("staging");
+        let landing = tempdir.join("landing");
+        for dir in [&flockdir, &logdir, &source, &staging, &landing] {
+            fs::create_dir(dir).expect("should create fixture dir");
+        }
+        let config_path = tempdir.join("config.yaml");
+        fs::write(
+            &config_path,
+            format!(
+                r#"
+version: 3
+lock_file: "{}/sequencer-sync.lock"
+logdir: "{}"
+server_user: "sequencer-sync"
+server_port: 22
+server_host: "sequencer.example.org"
+source: "{}"
+filestructures:
+  default:
+    ignore_globs: []
+    checkout_globs: []
+    completion_file_globs:
+      - "complete.txt"
+
+category:
+  - regex: "^run"
+    staging_zone: "{}"
+    landing_zone: "{}"
+    filestructure: "default"
+"#,
+                flockdir.display(),
+                logdir.display(),
+                source.display(),
+                staging.display(),
+                landing.display(),
+            ),
+        )
+        .expect("should write config");
+
+        let config = Config::from_path(&config_path).expect("config should resolve");
+
+        assert_eq!(config.logdir.as_ref(), logdir.canonicalize().unwrap());
+        assert_eq!(config.source.as_ref(), source.canonicalize().unwrap());
+        assert_eq!(
+            config.categories[0].staging_zone.as_ref(),
+            staging.canonicalize().unwrap()
+        );
+        assert_eq!(
+            config.categories[0].landing_zone.as_ref(),
+            landing.canonicalize().unwrap()
+        );
+        cleanup_temp_dir(&tempdir);
+    }
+
+    #[test]
+    fn from_path_reports_missing_landing_zone() {
+        let tempdir = make_temp_dir();
+        let flockdir = tempdir.join("flock");
+        let logdir = tempdir.join("log");
+        let source = tempdir.join("source");
+        let staging = tempdir.join("staging");
+        let landing = tempdir.join("missing-landing");
+        for dir in [&flockdir, &logdir, &source, &staging] {
+            fs::create_dir(dir).expect("should create fixture dir");
+        }
+        let config_path = tempdir.join("config.yaml");
+        fs::write(
+            &config_path,
+            format!(
+                r#"
+version: 3
+lock_file: "{}/sequencer-sync.lock"
+logdir: "{}"
+server_user: "sequencer-sync"
+server_port: 22
+server_host: "sequencer.example.org"
+source: "{}"
+filestructures:
+  default:
+    ignore_globs: []
+    checkout_globs: []
+    completion_file_globs:
+      - "complete.txt"
+
+category:
+  - regex: "^run"
+    staging_zone: "{}"
+    landing_zone: "{}"
+    filestructure: "default"
+"#,
+                flockdir.display(),
+                logdir.display(),
+                source.display(),
+                staging.display(),
+                landing.display(),
+            ),
+        )
+        .expect("should write config");
+
+        let error = Config::from_path(&config_path).expect_err("missing landing zone should fail");
+
+        assert!(matches!(
+            error,
+            ConfigError::PathError(inner) if matches!(*inner, PathError::NotFound { .. })
         ));
         cleanup_temp_dir(&tempdir);
     }

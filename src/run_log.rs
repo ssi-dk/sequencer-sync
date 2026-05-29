@@ -164,6 +164,8 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    use crate::paths::CanonicalDirBuf;
+
     use super::RunLog;
 
     static NEXT_TEST_DIR_ID: AtomicU64 = AtomicU64::new(0);
@@ -182,6 +184,10 @@ mod tests {
         path
     }
 
+    fn canonical_temp_dir(path: &Path) -> CanonicalDirBuf {
+        CanonicalDirBuf::from_absolute(path, "test temp dir").expect("temp dir should resolve")
+    }
+
     fn cleanup_temp_dir(path: &Path) {
         fs::remove_dir_all(path).expect("should remove temp dir");
     }
@@ -189,7 +195,8 @@ mod tests {
     #[test]
     fn creates_log_files_on_first_write() {
         let tempdir = make_temp_dir();
-        let mut log = RunLog::new(&tempdir);
+        let logdir = canonical_temp_dir(&tempdir);
+        let mut log = RunLog::new(&logdir).expect("run log should initialize");
 
         log.info("test message");
         log.finish();
@@ -204,15 +211,16 @@ mod tests {
     #[test]
     fn latest_log_is_truncated_on_new_attempted_transfer() {
         let tempdir = make_temp_dir();
+        let logdir = canonical_temp_dir(&tempdir);
 
         {
-            let mut log = RunLog::new(&tempdir);
+            let mut log = RunLog::new(&logdir).expect("run log should initialize");
             log.info("first run message");
             log.start_latest_attempt();
         }
 
         {
-            let mut log = RunLog::new(&tempdir);
+            let mut log = RunLog::new(&logdir).expect("run log should initialize");
             log.info("second run message");
             log.start_latest_attempt();
         }
@@ -233,7 +241,8 @@ mod tests {
     #[test]
     fn multiple_messages_in_one_run_append_to_latest() {
         let tempdir = make_temp_dir();
-        let mut log = RunLog::new(&tempdir);
+        let logdir = canonical_temp_dir(&tempdir);
+        let mut log = RunLog::new(&logdir).expect("run log should initialize");
 
         log.info("message one");
         log.info("message two");
@@ -250,7 +259,8 @@ mod tests {
     #[test]
     fn no_op_run_does_not_create_files() {
         let tempdir = make_temp_dir();
-        let _log = RunLog::new(&tempdir);
+        let logdir = canonical_temp_dir(&tempdir);
+        let _log = RunLog::new(&logdir).expect("run log should initialize");
 
         assert!(!tempdir.join("sequencer-sync.log").exists());
         assert!(!tempdir.join("sequencer-sync-latest.log").exists());
@@ -260,15 +270,16 @@ mod tests {
     #[test]
     fn non_transfer_run_appends_to_existing_latest_log() {
         let tempdir = make_temp_dir();
+        let logdir = canonical_temp_dir(&tempdir);
 
         {
-            let mut log = RunLog::new(&tempdir);
+            let mut log = RunLog::new(&logdir).expect("run log should initialize");
             log.info("first attempted transfer");
             log.start_latest_attempt();
         }
 
         {
-            let mut log = RunLog::new(&tempdir);
+            let mut log = RunLog::new(&logdir).expect("run log should initialize");
             log.info("file lock already held");
             log.finish();
         }

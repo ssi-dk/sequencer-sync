@@ -309,20 +309,33 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    use crate::paths::{CanonicalDirBuf, NormalPathSegment, NormalUTF8Segment};
     use crate::{SkipReason, TransferAction, TransferReason};
 
-    use super::{TransferLog, TransferLogError, relative_directory_key, transfer_log_path};
+    use super::{TransferLog, TransferLogError, transfer_log_path};
 
     static NEXT_TEST_DIR_ID: AtomicU64 = AtomicU64::new(0);
+
+    fn segment(value: &str) -> NormalUTF8Segment {
+        NormalPathSegment::new(Path::new(value))
+            .expect("test segment should be normal")
+            .try_into()
+            .expect("test segment should be UTF-8")
+    }
+
+    fn canonical_temp_dir(path: &Path) -> CanonicalDirBuf {
+        CanonicalDirBuf::from_absolute(path, "test log dir").expect("temp dir should resolve")
+    }
 
     #[test]
     fn missing_log_loads_empty_state() {
         let tempdir = make_temp_dir();
+        let logdir = canonical_temp_dir(&tempdir);
 
-        let log = TransferLog::load(&tempdir).expect("missing log should load");
+        let log = TransferLog::load(&logdir).expect("missing log should load");
 
         assert!(matches!(
-            log.transfer_action(Path::new("run-001"), false),
+            log.transfer_action(&segment("run-001"), false),
             TransferAction::Tranfer(TransferReason::New)
         ));
         cleanup_temp_dir(&tempdir);
@@ -331,8 +344,9 @@ mod tests {
     #[test]
     fn loads_distinct_directory_records() {
         let tempdir = make_temp_dir();
+        let logdir = canonical_temp_dir(&tempdir);
         fs::write(
-            transfer_log_path(&tempdir),
+            transfer_log_path(&logdir),
             concat!(
                 "{\"directory\":\"run-001\",\"transferred_at\":\"2026-03-13T10:00:00Z\",\"redo\":false}\n",
                 "{\"directory\":\"run-002\",\"transferred_at\":\"2026-03-13T11:00:00Z\",\"redo\":false}\n"
@@ -340,14 +354,14 @@ mod tests {
         )
         .expect("should write log fixture");
 
-        let log = TransferLog::load(&tempdir).expect("log should parse");
+        let log = TransferLog::load(&logdir).expect("log should parse");
 
         assert!(matches!(
-            log.transfer_action(Path::new("run-001"), false),
+            log.transfer_action(&segment("run-001"), false),
             TransferAction::Skip(SkipReason::AlreadyTranferred)
         ));
         assert!(matches!(
-            log.transfer_action(Path::new("run-002"), false),
+            log.transfer_action(&segment("run-002"), false),
             TransferAction::Skip(SkipReason::AlreadyTranferred)
         ));
         cleanup_temp_dir(&tempdir);
@@ -356,8 +370,9 @@ mod tests {
     #[test]
     fn duplicate_directory_entries_are_ignored() {
         let tempdir = make_temp_dir();
+        let logdir = canonical_temp_dir(&tempdir);
         fs::write(
-            transfer_log_path(&tempdir),
+            transfer_log_path(&logdir),
             concat!(
                 "{\"directory\":\"run-001\",\"transferred_at\":\"2026-03-13T10:00:00Z\",\"redo\":false}\n",
                 "{\"directory\":\"run-001\",\"transferred_at\":\"2026-03-13T11:00:00Z\",\"redo\":false}\n"
@@ -365,15 +380,16 @@ mod tests {
         )
         .expect("should write log fixture");
 
-        let _log = TransferLog::load(&tempdir).expect("duplicate directory should not error");
+        let _log = TransferLog::load(&logdir).expect("duplicate directory should not error");
         cleanup_temp_dir(&tempdir);
     }
 
     #[test]
     fn later_entries_override_earlier_state_for_same_directory() {
         let tempdir = make_temp_dir();
+        let logdir = canonical_temp_dir(&tempdir);
         fs::write(
-            transfer_log_path(&tempdir),
+            transfer_log_path(&logdir),
             concat!(
                 "{\"directory\":\"run-001\",\"transferred_at\":\"2026-03-13T10:00:00Z\",\"succeeded\":true,\"redo\":true}\n",
                 "{\"directory\":\"run-001\",\"transferred_at\":\"2026-03-13T11:00:00Z\",\"succeeded\":true,\"redo\":false}\n"
@@ -381,10 +397,10 @@ mod tests {
         )
         .expect("should write log fixture");
 
-        let log = TransferLog::load(&tempdir).expect("duplicate directory should not error");
+        let log = TransferLog::load(&logdir).expect("duplicate directory should not error");
 
         assert!(matches!(
-            log.transfer_action(Path::new("run-001"), false),
+            log.transfer_action(&segment("run-001"), false),
             TransferAction::Skip(SkipReason::AlreadyTranferred)
         ));
         cleanup_temp_dir(&tempdir);
@@ -393,8 +409,9 @@ mod tests {
     #[test]
     fn line_order_does_not_override_newer_timestamp() {
         let tempdir = make_temp_dir();
+        let logdir = canonical_temp_dir(&tempdir);
         fs::write(
-            transfer_log_path(&tempdir),
+            transfer_log_path(&logdir),
             concat!(
                 "{\"directory\":\"run-001\",\"transferred_at\":\"2026-03-13T11:00:00Z\",\"succeeded\":true,\"redo\":false}\n",
                 "{\"directory\":\"run-001\",\"transferred_at\":\"2026-03-13T10:00:00Z\",\"succeeded\":true,\"redo\":true}\n"
@@ -402,10 +419,10 @@ mod tests {
         )
         .expect("should write log fixture");
 
-        let log = TransferLog::load(&tempdir).expect("duplicate directory should not error");
+        let log = TransferLog::load(&logdir).expect("duplicate directory should not error");
 
         assert!(matches!(
-            log.transfer_action(Path::new("run-001"), false),
+            log.transfer_action(&segment("run-001"), false),
             TransferAction::Skip(SkipReason::AlreadyTranferred)
         ));
         cleanup_temp_dir(&tempdir);
@@ -414,8 +431,9 @@ mod tests {
     #[test]
     fn equal_timestamps_keep_existing_state() {
         let tempdir = make_temp_dir();
+        let logdir = canonical_temp_dir(&tempdir);
         fs::write(
-            transfer_log_path(&tempdir),
+            transfer_log_path(&logdir),
             concat!(
                 "{\"directory\":\"run-001\",\"transferred_at\":\"2026-03-13T10:00:00Z\",\"succeeded\":true,\"redo\":false}\n",
                 "{\"directory\":\"run-001\",\"transferred_at\":\"2026-03-13T10:00:00Z\",\"succeeded\":true,\"redo\":true}\n"
@@ -423,10 +441,10 @@ mod tests {
         )
         .expect("should write log fixture");
 
-        let log = TransferLog::load(&tempdir).expect("duplicate directory should not error");
+        let log = TransferLog::load(&logdir).expect("duplicate directory should not error");
 
         assert!(matches!(
-            log.transfer_action(Path::new("run-001"), false),
+            log.transfer_action(&segment("run-001"), false),
             TransferAction::Skip(SkipReason::AlreadyTranferred)
         ));
         cleanup_temp_dir(&tempdir);
@@ -435,8 +453,9 @@ mod tests {
     #[test]
     fn malformed_json_line_reports_line_number() {
         let tempdir = make_temp_dir();
+        let logdir = canonical_temp_dir(&tempdir);
         fs::write(
-            transfer_log_path(&tempdir),
+            transfer_log_path(&logdir),
             concat!(
                 "{\"directory\":\"run-001\",\"transferred_at\":\"2026-03-13T10:00:00Z\",\"redo\":false}\n",
                 "{not-json}\n"
@@ -444,7 +463,7 @@ mod tests {
         )
         .expect("should write log fixture");
 
-        let error = TransferLog::load(&tempdir).expect_err("malformed json should error");
+        let error = TransferLog::load(&logdir).expect_err("malformed json should error");
 
         assert!(matches!(error, TransferLogError::Parse { line: 2, .. }));
         cleanup_temp_dir(&tempdir);
@@ -453,13 +472,14 @@ mod tests {
     #[test]
     fn malformed_timestamp_reports_line_number() {
         let tempdir = make_temp_dir();
+        let logdir = canonical_temp_dir(&tempdir);
         fs::write(
-            transfer_log_path(&tempdir),
+            transfer_log_path(&logdir),
             "{\"directory\":\"run-001\",\"transferred_at\":\"not-a-timestamp\",\"redo\":false}\n",
         )
         .expect("should write log fixture");
 
-        let error = TransferLog::load(&tempdir).expect_err("bad timestamp should error");
+        let error = TransferLog::load(&logdir).expect_err("bad timestamp should error");
 
         assert!(matches!(
             error,
@@ -471,24 +491,25 @@ mod tests {
     #[test]
     fn append_writes_valid_json_line_and_updates_state() {
         let tempdir = make_temp_dir();
-        let mut log = TransferLog::load(&tempdir).expect("missing log should load");
+        let logdir = canonical_temp_dir(&tempdir);
+        let mut log = TransferLog::load(&logdir).expect("missing log should load");
 
-        log.record_transfer(Path::new("run-001"), true)
+        log.record_transfer(&segment("run-001"), true)
             .expect("append should succeed");
 
         assert!(matches!(
-            log.transfer_action(Path::new("run-001"), false),
+            log.transfer_action(&segment("run-001"), false),
             TransferAction::Skip(SkipReason::AlreadyTranferred)
         ));
 
-        let reloaded = TransferLog::load(&tempdir).expect("reloaded log should parse");
+        let reloaded = TransferLog::load(&logdir).expect("reloaded log should parse");
         assert!(matches!(
-            reloaded.transfer_action(Path::new("run-001"), false),
+            reloaded.transfer_action(&segment("run-001"), false),
             TransferAction::Skip(SkipReason::AlreadyTranferred)
         ));
 
         let contents =
-            fs::read_to_string(transfer_log_path(&tempdir)).expect("should read transfer log");
+            fs::read_to_string(transfer_log_path(&logdir)).expect("should read transfer log");
         assert_eq!(contents.lines().count(), 1);
         assert!(contents.contains("\"directory\":\"run-001\""));
         assert!(contents.contains("\"redo\":false"));
@@ -496,37 +517,34 @@ mod tests {
     }
 
     #[test]
-    fn computes_relative_directory_key() {
-        let source = Path::new("/var/lib/sequencer/data");
-        let directory = Path::new("/var/lib/sequencer/data/run-001");
-
-        let key = relative_directory_key(source, directory).expect("key should be relative");
-
-        assert_eq!(key, PathBuf::from("run-001"));
-    }
-
-    #[test]
-    fn rejects_directory_outside_source() {
-        let source = Path::new("/var/lib/sequencer/data");
-        let directory = Path::new("/elsewhere/run-001");
-
-        let error =
-            relative_directory_key(source, directory).expect_err("outside source should error");
-
-        assert!(matches!(
-            error,
-            TransferLogError::DirectoryOutsideSource { .. }
-        ));
-    }
-
-    #[test]
     fn computes_transfer_log_path() {
-        let flockdir = Path::new("/var/lib/sequencer/flock");
+        let tempdir = make_temp_dir();
+        let logdir = canonical_temp_dir(&tempdir);
 
         assert_eq!(
-            transfer_log_path(flockdir),
-            Path::new("/var/lib/sequencer/flock/transferred-directories.jsonl")
+            transfer_log_path(&logdir),
+            tempdir
+                .canonicalize()
+                .unwrap()
+                .join("transferred-directories.jsonl")
         );
+        cleanup_temp_dir(&tempdir);
+    }
+
+    #[test]
+    fn rejects_invalid_directory_segments_in_log() {
+        let tempdir = make_temp_dir();
+        let logdir = canonical_temp_dir(&tempdir);
+        fs::write(
+            transfer_log_path(&logdir),
+            "{\"directory\":\"../run-001\",\"transferred_at\":\"2026-03-13T10:00:00Z\",\"redo\":false}\n",
+        )
+        .expect("should write log fixture");
+
+        let error = TransferLog::load(&logdir).expect_err("invalid directory segment should fail");
+
+        assert!(matches!(error, TransferLogError::Parse { line: 1, .. }));
+        cleanup_temp_dir(&tempdir);
     }
 
     fn make_temp_dir() -> PathBuf {
