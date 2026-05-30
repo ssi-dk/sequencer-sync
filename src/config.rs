@@ -7,9 +7,8 @@ use std::sync::Arc;
 use glob::Pattern;
 use regex::Regex;
 use serde::Deserialize;
-use thiserror::Error;
 
-use crate::paths::{CanonicalChildFileBuf, CanonicalDirBuf, PathError};
+use crate::paths::{CanonicalChildFileBuf, CanonicalDirBuf};
 use crate::{AppError, UserError};
 
 const SUPPORTED_CONFIG_VERSION: u16 = 3;
@@ -133,71 +132,6 @@ struct UnvalidatedCategory {
     filestructure: String,
     #[serde(default)]
     year_subdirectory: bool,
-}
-
-#[derive(Debug, Error)]
-pub enum ConfigError {
-    #[error("Config path not found. No file at: {}", path.display())]
-    NotFound { path: PathBuf },
-    #[error("Config path {description} must be absolute and should not contain . or ..")]
-    NonAbsolutePath { description: String },
-    #[error("failed to read config file {}: {source}", path.display())]
-    Read {
-        path: PathBuf,
-        #[source]
-        source: std::io::Error,
-    },
-    #[error(
-        "config field `{field}` must be a relative path/glob inside the run directory: {pattern:?}"
-    )]
-    GlobOutsideRunDirectory {
-        field: &'static str,
-        pattern: String,
-    },
-    #[error("failed to parse YAML config: {0}")]
-    Parse(serde_yaml::Error),
-
-    #[error("config field `{field}` must not be empty")]
-    EmptyField { field: &'static str },
-    #[error("config field `{field}` must not be 0")]
-    ZeroPort { field: &'static str },
-    #[error(transparent)]
-    PathError(#[from] Box<PathError>),
-    #[error(
-        "config fields `{first}` and `{second}` must not point to the same path: {}",
-        path.display()
-    )]
-    DuplicatePath {
-        first: String,
-        second: String,
-        path: PathBuf,
-    },
-    #[error("config must contain at least one [[category]]")]
-    NoCategoriesConfigured,
-    #[error("config must contain at least one filestructure")]
-    NoFileStructuresConfigured,
-    #[error("config category references unknown filestructure `{name}`")]
-    UnknownFileStructure { name: String },
-    #[error("config field `{field}` is not a valid regex: {source}")]
-    InvalidRegex {
-        field: &'static str,
-        #[source]
-        source: regex::Error,
-    },
-    #[error("config field `{field}` is not a valid glob pattern: {source}")]
-    InvalidGlob {
-        field: &'static str,
-        #[source]
-        source: glob::PatternError,
-    },
-    #[error("config field `{field}` must contain at least one glob pattern")]
-    EmptyGlobList { field: &'static str },
-}
-
-impl From<PathError> for ConfigError {
-    fn from(error: PathError) -> Self {
-        Self::PathError(Box::new(error))
-    }
 }
 
 impl ConfigSpec {
@@ -355,30 +289,28 @@ fn validate_absolute_normal(path: &Path, description: &str) -> Result<PathBuf, U
 }
 
 impl UnvalidatedConfig {
-    fn validate_spec(self) -> Result<ConfigSpec, ConfigError> {
+    fn validate_spec(self) -> Result<ConfigSpec, AppError> {
         validate_absolute_normal(&self.lock_file, "Lock file")?;
         validate_absolute_normal(&self.logdir, "Log dir")?;
         validate_absolute_normal(&self.source, "Source")?;
 
-        validate_non_empty("server_user", &self.server_user)?;
-        validate_non_empty("server_host", &self.server_host)?;
+        validate_string_not_empty(&self.server_user, "In config file, field `server_user`")?;
+        validate_string_not_empty(&self.server_host, "In config file, field `server_host`")?;
 
         if self.server_port == 0 {
-            return Err(ConfigError::ZeroPort {
-                field: "server_port",
-            });
+            return Err(UserError::ZeroPort.into());
         }
 
         if self.category.is_empty() {
-            return Err(ConfigError::NoCategoriesConfigured);
+            return Err(UserError::NoCategories.into());
         }
         if self.filestructures.is_empty() {
-            return Err(ConfigError::NoFileStructuresConfigured);
+            return Err(UserError::NoFileStructures.into());
         }
 
         let mut file_structures = HashMap::with_capacity(self.filestructures.len());
         for (name, filestructure) in self.filestructures {
-            validate_non_empty("filestructures key", &name)?;
+            validate_string_not_empty(&name, "In config file, name of file structure")?;
             file_structures.insert(name.clone(), Arc::new(filestructure.validate(name)?));
         }
 
@@ -400,23 +332,42 @@ impl UnvalidatedConfig {
     }
 }
 
+fn validate_string_not_empty(x: &str, description: &str) -> Result<(), AppError> {
+    if x.is_empty() {
+        Err(UserError::EmptyString {
+            description: description.to_owned(),
+        }
+        .into())
+    } else {
+        Ok(())
+    }
+}
+
 impl UnvalidatedFileStructure {
     fn validate(self, name: String) -> Result<FileStructure, AppError> {
         let (ignore_paths, ignore_globs) =
             validate_file_patterns("filestructures.*.ignore_globs", &self.ignore_globs)?;
         let (checkout_paths, checkout_globs) =
             validate_file_patterns("filestructures.*.checkout_globs", &self.checkout_globs)?;
-        let completion_file_globs = validate_globs(
-            "filestructures.*.completion_file_globs",
-            &self.completion_file_globs,
-        )?;
+
+        if self.completion_file_globs.is_empty() {
+            return Err(UserError::EmptyCompletionFileGlobList { name }.into());
+        }
+
+        let description = format!("completion glob of file structure {name}");
+        let patterns: Result<_, AppError> = self
+            .completion_file_globs
+            .iter()
+            .map(|pattern| validate_glob(&description, pattern))
+            .collect();
+
         Ok(FileStructure {
             name,
             ignore_paths,
             ignore_globs,
             checkout_paths,
             checkout_globs,
-            completion_file_globs,
+            completion_file_globs: patterns?,
         })
     }
 }
@@ -482,7 +433,7 @@ impl CategorySpec {
     }
 }
 
-fn validate_glob(description: &'static str, pattern: &str) -> Result<Pattern, AppError> {
+fn validate_glob(description: &str, pattern: &str) -> Result<Pattern, AppError> {
     let path = Path::new(pattern);
 
     if pattern.is_empty()
@@ -498,7 +449,7 @@ fn validate_glob(description: &'static str, pattern: &str) -> Result<Pattern, Ap
         })
     {
         return Err(UserError::ConfigGlobOutsideRunDirectory {
-            description: desciption.to_owned(),
+            description: description.to_owned(),
             pattern: pattern.to_owned(),
         }
         .into());
@@ -514,26 +465,15 @@ fn validate_glob(description: &'static str, pattern: &str) -> Result<Pattern, Ap
     })
 }
 
-fn validate_globs(field: &'static str, patterns: &[String]) -> Result<Vec<Pattern>, ConfigError> {
-    if patterns.is_empty() {
-        return Err(ConfigError::EmptyGlobList { field });
-    }
-
-    patterns
-        .iter()
-        .map(|pattern| validate_glob(field, pattern))
-        .collect()
-}
-
 fn validate_file_patterns(
-    field: &'static str,
+    description: &str,
     patterns: &[String],
-) -> Result<(HashSet<PathBuf>, Vec<Pattern>), ConfigError> {
+) -> Result<(HashSet<PathBuf>, Vec<Pattern>), AppError> {
     let mut literal_paths = HashSet::new();
     let mut glob_patterns = Vec::new();
 
     for pattern in patterns {
-        let glob = validate_glob(field, pattern)?;
+        let glob = validate_glob(description, pattern)?;
         if is_literal_glob(pattern) {
             literal_paths.insert(PathBuf::from(pattern));
         } else {
@@ -1344,7 +1284,6 @@ mod current_tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{Config, ConfigError, ConfigSpec};
-    use crate::paths::PathError;
 
     static NEXT_TEST_DIR_ID: AtomicU64 = AtomicU64::new(0);
 

@@ -13,7 +13,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Error};
 use bstr::{BStr, BString, ByteSlice};
 use clap::{Args, Parser, Subcommand};
-use config::{Config, ConfigError};
+use config::Config;
 use flate2::Compression;
 use flate2::write::GzEncoder;
 use fs2::FileExt;
@@ -23,8 +23,6 @@ use thiserror::Error;
 use transfer_log::TransferLog;
 use walkdir::WalkDir;
 
-use crate::AppError::Internal;
-use crate::config::UserConfigError;
 use crate::paths::{
     CanonicalChildFileBuf, CanonicalDirBuf, DirEntrySubdirCases, NormalPathSegment,
     NormalPathSegmentBuf, NormalUTF8Segment, RelativePathBuf,
@@ -188,7 +186,7 @@ fn try_main() -> Result<(), AppError> {
 fn setup(raw_args: SetupArgs) -> Result<(), AppError> {
     let args = raw_args.validate()?;
     debug!("Loading config path at {}", args.config_path.display());
-    let config = load_config(&args.config_path)?;
+    let config = Config::from_path(&args.config_path)?;
     debug!(
         "Loaded {} configured filestructure(s)",
         config.file_structures.len()
@@ -260,7 +258,7 @@ struct ScanResult {
 }
 
 fn run_command(args: RunArgs) -> Result<(), AppError> {
-    let config = load_config(&args.config_path)?;
+    let config = Config::from_path(&args.config_path)?;
     let mut run_log = RunLog::new(&config.logdir)?;
 
     let _lock = match acquire_run_lock(&config.lock_file)? {
@@ -293,7 +291,7 @@ fn run_command(args: RunArgs) -> Result<(), AppError> {
             run_log.error(&format!("Run aborted: {error}"));
             run_log.finish();
         }
-        return Err(error.into());
+        return Err(error);
     }
 
     if !args.dry_run && run_log.had_error() {
@@ -476,11 +474,7 @@ fn scan_directories(
             TransferAction::Tranfer(reason) => reason,
         };
 
-        let sub_dir_path = source
-            .try_from_existing_subdirectory(relative)?
-            .expect_normal_dir("We just checked it was a non-symlink dir");
-
-        let target = match categorize(&sub_dir_path, categories)? {
+        let target = match categorize(&entry_path, categories)? {
             Some(t) => {
                 let lz = match &t.destination {
                     TransferDestination::LandingZone(lz) => lz,
@@ -676,7 +670,8 @@ fn transfer_new_directories(
     } in planned_transfers
     {
         let source_run_dir = source
-            .try_from_existing_subdirectory(run_dir.as_normal())?
+            .try_from_existing_subdirectory(run_dir.as_normal())
+            .expect("We obta")
             .expect_normal_dir("Run dir should be directory");
         let classification = classify_run_files(&source_run_dir, &target.filestructure)?;
 
@@ -863,7 +858,10 @@ fn transfer_run_to_landing_zone(
         } else {
             NormalPathSegment::new(Path::new("archive.tar")).unwrap()
         };
-        let archive_path = canonical_staging_run_dir.join_file_name(archive_segment)?;
+        let archive_path = canonical_staging_run_dir.join_file_name(
+            archive_segment,
+            "Auto-generated tar archive path in staging dir",
+        )?;
 
         create_archive_tar(&archive_path, &archive_dir, compress)?;
         fs::remove_dir_all(&archive_dir)
@@ -1175,13 +1173,6 @@ fn check_run_trees(
     Ok(())
 }
 
-fn load_config(config_path: &Path) -> Result<Config, UserError> {
-    Config::from_path(config_path).map_err(|source| UserError::LoadConfig {
-        path: config_path.to_path_buf(),
-        source,
-    })
-}
-
 fn check_ssh_access(config: &Config) -> Result<(), AppError> {
     debug!(
         "Checking SSH access. User name: {} port: {} domain name: {}",
@@ -1222,7 +1213,7 @@ fn check_readable_directory(path: &CanonicalDirBuf, description: &str) -> Result
 
 fn check_writable_directory(path: &CanonicalDirBuf, description: &str) -> Result<(), AppError> {
     let segment: NormalPathSegmentBuf = NormalUTF8Segment::from_timestamp().into();
-    let temp_path = path.join_file_name(&segment)?;
+    let temp_path = path.join_file_name(&segment, description)?;
     OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -1339,16 +1330,6 @@ enum AppError {
 }
 
 impl AppError {
-    fn internal_context<C>(self, context: C) -> Self
-    where
-        C: fmt::Display + Send + Sync + 'static,
-    {
-        match self {
-            Self::User(error) => Self::User(error),
-            Self::Internal(error) => Self::Internal(error.context(context)),
-        }
-    }
-
     fn internal_from<E>(error: E) -> Self
     where
         E: core::error::Error + Send + Sync + 'static,
@@ -1396,8 +1377,6 @@ enum UserError {
     PathEndsInParent { description: String, path: PathBuf },
     #[error("{description} has no parent. It could terminate in '/'. Found path: {path:?}")]
     PathHasNoParent { description: String, path: PathBuf },
-    #[error(transparent)]
-    PathError(#[from] Box<paths::PathError>),
     #[error("{description} at {path:?} is a symlink, but must be a regular file.")]
     IsSymlinkNotRegularFile { description: String, path: PathBuf },
     #[error(
@@ -1469,6 +1448,19 @@ enum UserError {
         second: String,
         path: PathBuf,
     },
+    #[error(
+        "In config file, file structure \"{name}\" has an empty completion file glob list.\n\
+        This is not permitted, because sequencer-sync will not know when the file is ready to transfer."
+    )]
+    EmptyCompletionFileGlobList { name: String },
+    #[error("{description} cannot be the empty string")]
+    EmptyString { description: String },
+    #[error("In config file, port must not be 0")]
+    ZeroPort,
+    #[error("Config file must contain at least one category, but got none")]
+    NoCategories,
+    #[error("Config file must contain at least one file structure, but got none")]
+    NoFileStructures,
     #[error(
         "In config, {description} is {glob_string}, which is not a valid glob pattern: {source}"
     )]

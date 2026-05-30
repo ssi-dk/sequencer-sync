@@ -14,7 +14,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use thiserror::Error;
+use anyhow::{Context, Result, bail};
 
 use crate::{AppError, UserError};
 
@@ -233,31 +233,34 @@ impl CanonicalDirBuf {
         Self(p)
     }
 
-    pub fn create_if_not_exist(&self, subdir: &NormalPathSegment) -> Result<Self, PathError> {
+    pub fn create_if_not_exist(&self, subdir: &NormalPathSegment) -> Result<Self> {
         let path = self.as_ref().join(subdir.as_ref());
         match std::fs::create_dir(&path) {
             Ok(()) => Ok(CanonicalDirBuf(path)),
             Err(e) if e.kind() == ErrorKind::AlreadyExists => {
                 match self.try_from_existing_subdirectory(subdir)? {
                     SubDirectoryResult::SubDirectory(s) => Ok(s),
-                    SubDirectoryResult::IsSymlink => Err(PathError::NotADirectory {
-                        description: "".to_owned(),
-                        path,
-                    }),
-                    SubDirectoryResult::IsNotDirectory => Err(PathError::NotADirectory {
-                        description: "".to_owned(),
-                        path,
-                    }),
+                    SubDirectoryResult::IsSymlink => {
+                        bail!(
+                            "Program logic assumed the following was a directory, but it was a symlink {:?}.\n\
+                            This is probably an internal program error",
+                            path
+                        );
+                    }
+                    SubDirectoryResult::IsNotDirectory => {
+                        bail!(
+                            "Program logic assumed the following was a directory, but it was another type of file: {:?}.\n\
+                            This is probably an internal program error",
+                            path
+                        );
+                    }
                 }
             }
-            Err(source) => Err(PathError::GeneralIOError {
-                path: path.to_owned(),
-                source,
-            }),
+            Err(source) => bail!("{source}"),
         }
     }
 
-    pub fn create_subdir(&self, subdir: &NormalPathSegment) -> Result<Self, PathError> {
+    pub fn create_subdir(&self, subdir: &NormalPathSegment) -> Result<Self> {
         let path = self.as_ref().join(subdir.as_ref());
         match std::fs::create_dir(&path) {
             Ok(()) => {
@@ -265,10 +268,7 @@ impl CanonicalDirBuf {
                 // and the normal segment is already normalized
                 Ok(CanonicalDirBuf(path))
             }
-            Err(source) => Err(PathError::GeneralIOError {
-                path: path.to_owned(),
-                source,
-            }),
+            Err(source) => bail!("Failure to create sub-directory at {:?}, {source}", path),
         }
     }
 
@@ -300,17 +300,17 @@ impl CanonicalDirBuf {
     pub fn try_from_existing_subdirectory(
         &self,
         relative: &NormalPathSegment,
-    ) -> Result<SubDirectoryResult, PathError> {
+    ) -> Result<SubDirectoryResult> {
         let inner = self.0.join(Path::new(&relative.0));
         if inner.is_symlink() {
             return Ok(SubDirectoryResult::IsSymlink);
         };
-        let metadata = inner
-            .metadata()
-            .map_err(|source| PathError::GeneralIOError {
-                path: inner.to_owned(),
-                source,
-            })?;
+        let metadata = inner.metadata().with_context(|| {
+            format!(
+                "Failure to get metadata of supposedly existing sub-directory at {:?}",
+                inner
+            )
+        })?;
         if metadata.is_dir() {
             Ok(SubDirectoryResult::SubDirectory(Self(inner)))
         } else {
@@ -474,31 +474,4 @@ fn check_absolute(path: &Path, description: &str) -> Result<(), UserError> {
         });
     }
     Ok(())
-}
-
-#[derive(Debug, Error)]
-pub enum PathError {
-    #[error("Got an unexpected IO error.\nPath: {}\nError: {source}", path.display())]
-    GeneralIOError {
-        path: PathBuf,
-        #[source]
-        source: std::io::Error,
-    },
-
-    #[error("{description} must be a directory, but was not: {}", path.display())]
-    NotADirectory { description: String, path: PathBuf },
-
-    #[error("{description} must be an absolute path, but it was {}", path.display())]
-    NotAbsolute { description: String, path: PathBuf },
-
-    #[error("{description} at path {} must exist, but was not found", path.display())]
-    NotFound { description: String, path: PathBuf },
-
-    #[error("{description} must be a resolved, canonical path with an existing parent.\n\
-        It cannot be empty, or the root directory, nor end with '..'. Found: '{}'", path.display())]
-    BadChildDirectory { description: String, path: PathBuf },
-
-    #[error("{description} at path {} must be a file or must not exist,\n\
-        but is not a normal file (i.e. maybe a directory?)", path.display())]
-    IsNotFileOrMissing { description: String, path: PathBuf },
 }

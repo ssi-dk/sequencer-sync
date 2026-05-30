@@ -4,7 +4,7 @@ use std::io::Write;
 use chrono::Local;
 
 use crate::{
-    UserError,
+    AppError,
     paths::{CanonicalChildFileBuf, CanonicalDirBuf, NormalPathSegment},
 };
 
@@ -26,12 +26,15 @@ pub struct RunLog {
 }
 
 impl RunLog {
-    pub fn new(logdir: &CanonicalDirBuf) -> Result<Self, UserError> {
+    pub fn new(logdir: &CanonicalDirBuf) -> Result<Self, AppError> {
         Ok(Self {
-            full_log_path: logdir
-                .join_file_name(NormalPathSegment::new("sequencer-sync.log".as_ref()).unwrap())?,
+            full_log_path: logdir.join_file_name(
+                NormalPathSegment::new("sequencer-sync.log".as_ref()).unwrap(),
+                "When attempting to create the log file 'sequencer-sync.log'",
+            )?,
             latest_log_path: logdir.join_file_name(
                 NormalPathSegment::new("sequencer-sync-latest.log".as_ref()).unwrap(),
+                "When attempting to create the log file 'sequencer-sync-latest.log'",
             )?,
             pending_latest_lines: Vec::new(),
             latest_started: false,
