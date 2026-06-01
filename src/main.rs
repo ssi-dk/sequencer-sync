@@ -1489,6 +1489,17 @@ enum UserError {
     NotADirectory { description: String, path: PathBuf },
     #[error("File or directory not found: {description} at {path:?}.")]
     NotFound { description: String, path: PathBuf },
+    #[error(
+        "Bad path in config: {description}\n\
+        Config paths must be absolute, or begin with `~`, and should not contain any non-starting segment equal to `~`.\n\
+       Found path: {path:?}."
+    )]
+    UnacceptableConfigPath { description: String, path: PathBuf },
+    #[error(
+        "In config path, {description} is set to {path:?}, which begins with ~, but the $HOME env var is not set.\n\
+        Please replace it with an absolute path to run in environments where $HOME is not set."
+    )]
+    HomeNotSetForTildePath { description: String, path: PathBuf },
     #[error("{description} must be an absolute path, but isn't. Got {:?}", path)]
     PathNotAbsolute { description: String, path: PathBuf },
     #[error("error when reading a directory {description} at {} \
