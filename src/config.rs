@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::ErrorKind;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
 use glob::Pattern;
@@ -269,27 +269,59 @@ fn validate_config_version(version: u16) -> Result<(), UserError> {
     }
 }
 
-fn validate_absolute_normal(path: &Path, description: &str) -> Result<PathBuf, UserError> {
-    if (!path.is_absolute())
-        || path
-            .components()
-            .skip(1)
-            .any(|c| !matches!(c, std::path::Component::Normal(_)))
-    {
-        Err(UserError::PathNotAbsolute {
+/// Config paths must begin with `/` or `~`, and every later component must be normal.
+fn validate_non_relative_normal(path: &Path, description: &str) -> Result<PathBuf, AppError> {
+    let err = || -> Result<PathBuf, AppError> {
+        Err(UserError::UnacceptableConfigPath {
             description: description.to_owned(),
             path: path.to_owned(),
-        })
-    } else {
-        Ok(path.to_owned())
+        }
+        .into())
+    };
+
+    let mut components = path.components();
+
+    let mut result: Option<PathBuf> = match components.next() {
+        Some(Component::RootDir) => None,
+        Some(Component::Normal(s)) if s == "~" => match std::env::var_os("HOME") {
+            Some(s) => Some(PathBuf::from(s)),
+            None => {
+                return Err(UserError::HomeNotSetForTildePath {
+                    description: description.to_owned(),
+                    path: path.to_owned(),
+                }
+                .into());
+            }
+        },
+        Some(Component::Normal(_)) => return err(),
+        _ => return err(),
+    };
+
+    for component in components {
+        match component {
+            Component::Normal(s) => {
+                if s == "~" {
+                    return err();
+                }
+                if let Some(p) = &mut result {
+                    p.push(s);
+                }
+            }
+            _ => return err(),
+        };
+    }
+
+    match result {
+        Some(p) => Ok(p),
+        None => Ok(path.to_owned()),
     }
 }
 
 impl UnvalidatedConfig {
     fn validate_spec(self) -> Result<ConfigSpec, AppError> {
-        validate_absolute_normal(&self.lock_file, "Lock file")?;
-        validate_absolute_normal(&self.logdir, "Log dir")?;
-        validate_absolute_normal(&self.source, "Source")?;
+        let lock_file = validate_non_relative_normal(&self.lock_file, "Lock file")?;
+        let log_dir = validate_non_relative_normal(&self.logdir, "Log dir")?;
+        let source = validate_non_relative_normal(&self.source, "Source")?;
 
         validate_string_not_empty(&self.server_user, "In config file, field `server_user`")?;
         validate_string_not_empty(&self.server_host, "In config file, field `server_host`")?;
@@ -317,12 +349,12 @@ impl UnvalidatedConfig {
         }
 
         Ok(ConfigSpec {
-            lock_file: self.lock_file,
-            log_dir: self.logdir,
+            lock_file,
+            log_dir,
             server_user: self.server_user,
             server_port: self.server_port,
             server_host: self.server_host,
-            source: self.source,
+            source,
             file_structures,
             categories,
         })
@@ -375,9 +407,9 @@ impl UnvalidatedCategory {
         filestructures: &HashMap<String, Arc<FileStructure>>,
     ) -> Result<CategorySpec, AppError> {
         let landing_zone =
-            validate_absolute_normal(&self.landing_zone, "Landing zone of category")?;
+            validate_non_relative_normal(&self.landing_zone, "Landing zone of category")?;
         let staging_zone =
-            validate_absolute_normal(&self.staging_zone, "Staging zone of category")?;
+            validate_non_relative_normal(&self.staging_zone, "Staging zone of category")?;
 
         let regex = Regex::new(&self.regex).map_err(|source| UserError::InvalidConfigRegex {
             description: "File structure regex".into(),
@@ -642,7 +674,8 @@ category:
             .replace(r#"source: "/data/sequencer""#, r#"source: "relative/data""#);
         assert!(matches!(
             expect_spec_err(&relative_source),
-            AppError::User(UserError::PathNotAbsolute { .. })
+            AppError::User(UserError::UnacceptableConfigPath { description, path })
+                if description == "Source" && path == Path::new("relative/data")
         ));
 
         let parent_source = base_config(one_category()).replace(
@@ -651,8 +684,30 @@ category:
         );
         assert!(matches!(
             expect_spec_err(&parent_source),
-            AppError::User(UserError::PathNotAbsolute { .. })
+            AppError::User(UserError::UnacceptableConfigPath { description, path })
+                if description == "Source" && path == Path::new("/data/../sequencer")
         ));
+
+        let non_starting_tilde = base_config(one_category()).replace(
+            r#"source: "/data/sequencer""#,
+            r#"source: "/data/~/sequencer""#,
+        );
+        assert!(matches!(
+            expect_spec_err(&non_starting_tilde),
+            AppError::User(UserError::UnacceptableConfigPath { description, path })
+                if description == "Source" && path == Path::new("/data/~/sequencer")
+        ));
+    }
+
+    #[test]
+    fn expands_leading_tilde_in_config_paths() {
+        let home = std::env::var_os("HOME").expect("HOME should exist in test environment");
+        let contents = base_config(one_category())
+            .replace(r#"source: "/data/sequencer""#, r#"source: "~/sequencer""#);
+
+        let config = spec(&contents).expect("leading tilde should be accepted");
+
+        assert_eq!(config.source, PathBuf::from(home).join("sequencer"));
     }
 
     #[test]
