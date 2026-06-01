@@ -247,7 +247,7 @@ fn run_command(args: RunArgs) -> Result<(), AppError> {
         Some(lock) => lock,
         None => {
             run_log.info("Run skipped: file lock already held");
-            run_log.finish();
+            run_log.finalize_latest_log();
             if run_log.had_error() {
                 return Err(UserError::RunLogWriteFailed.into());
             }
@@ -265,13 +265,13 @@ fn run_command(args: RunArgs) -> Result<(), AppError> {
         &args,
     );
     if !args.dry_run {
-        run_log.finish();
+        run_log.finalize_latest_log();
     }
 
     if let Err(error) = result {
         if !args.dry_run {
             run_log.error(&format!("Run aborted: {error}"));
-            run_log.finish();
+            run_log.finalize_latest_log();
         }
         return Err(error);
     }
@@ -728,7 +728,7 @@ fn transfer_new_directories(
                     transfer_reason_label(reason),
                     run_dir.into_inner(),
                     destination.as_ref().display()
-                ));
+                ))
             }
         }
     }
@@ -1412,7 +1412,10 @@ enum UserError {
     },
     #[error("run lock is currently held: {}", path.display())]
     RunLockHeld { path: PathBuf },
-    #[error("Config YAML file is not a valid, parseable YAML file: {}", error)]
+    #[error(
+        "Config YAML file is not a valid, parseable YAML file that conforms to the specification of the config file: {}",
+        error
+    )]
     InvalidConfigFormat { error: serde_yaml::Error },
     #[error("In config file, {description} is not a valid regex: {source}")]
     InvalidConfigRegex {
@@ -1446,7 +1449,7 @@ enum UserError {
         This is not permitted, because sequencer-sync will not know when the file is ready to transfer."
     )]
     EmptyCompletionFileGlobList { name: String },
-    #[error("{description} cannot be the empty string")]
+    #[error("{description} cannot be the empty string, or consist only of whitespace")]
     EmptyString { description: String },
     #[error("In config file, port must not be 0")]
     ZeroPort,
@@ -1512,22 +1515,29 @@ enum UserError {
     ConflictingTreeCheckArgs,
 }
 
-#[cfg(any())]
-mod tests {
+#[cfg(test)]
+mod current_tests {
     use std::collections::HashSet;
     use std::fs;
     use std::path::{Path, PathBuf};
-    use std::sync::Arc;
-    use std::sync::{Mutex, Once};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Arc, Mutex, Once};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use glob::Pattern;
     use log::{LevelFilter, Log, Metadata, Record};
     use regex::Regex;
 
-    use super::{classify, cron_file_path, render_cron_file, run_is_complete, scan_directories};
+    use super::{
+        ClassifiedFiles, TransferDestination, archive_dir_name_conflicts, categorize,
+        classify_run_files, render_cron_file, run_is_complete, scan_directories,
+        staging_run_dir_segment, transfer_run_to_landing_zone,
+    };
     use crate::config::{Category, FileStructure};
+    use crate::paths::{CanonicalDirBuf, NormalPathSegment, NormalUTF8Segment};
     use crate::transfer_log::TransferLog;
+
+    static NEXT_TEST_DIR_ID: AtomicU64 = AtomicU64::new(0);
 
     struct TestLogger {
         messages: Mutex<Vec<String>>,
@@ -1576,202 +1586,6 @@ mod tests {
         });
         TEST_LOGGER.clear();
     }
-
-    fn make_temp_dir() -> PathBuf {
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system time should be after unix epoch")
-            .as_nanos();
-        let path = std::env::temp_dir().join(format!(
-            "sequencer-sync-main-test-{}-{timestamp}",
-            std::process::id()
-        ));
-        fs::create_dir(&path).expect("should create temp dir");
-        path
-    }
-
-    fn cleanup_temp_dir(path: &Path) {
-        fs::remove_dir_all(path).expect("should remove temp dir");
-    }
-
-    fn test_category(
-        regex: &str,
-        classification_glob: Option<&str>,
-        landing_zone: &str,
-    ) -> Category {
-        Category {
-            regex: Regex::new(regex).expect("regex should parse"),
-            classification_glob: classification_glob
-                .map(|pattern| Pattern::new(pattern).expect("glob should parse")),
-            landing_zone: PathBuf::from(landing_zone),
-            filestructure: Arc::new(FileStructure {
-                name: "test".to_string(),
-                ignore_paths: HashSet::new(),
-                ignore_globs: Vec::new(),
-                checkout_paths: HashSet::new(),
-                checkout_globs: vec![Pattern::new("**").expect("glob should parse")],
-                completion_file_globs: vec![
-                    Pattern::new("report*.html").expect("glob should parse"),
-                ],
-            }),
-            year_subdirectory: false,
-        }
-    }
-
-    #[test]
-    fn renders_cron_file() {
-        let block = render_cron_file(
-            Path::new("/etc/sequencer-sync/config.yaml"),
-            Path::new("/usr/local/bin/sequencer-sync"),
-        )
-        .expect("cron file should render");
-
-        assert!(block.contains("# Install this file into cron manually."));
-        assert!(
-            regex::Regex::new(r#"(\*/\d+|\*) \* \* \* \*"#)
-                .unwrap()
-                .is_match(&block)
-        );
-        assert!(block.contains("'/usr/local/bin/sequencer-sync' run"));
-        assert!(block.contains("--config-path '/etc/sequencer-sync/config.yaml'"));
-        assert!(!block.contains("--platform"));
-    }
-
-    #[test]
-    fn computes_cron_file_path_in_logdir() {
-        let path = cron_file_path(Path::new("/var/lib/sequencer/log"));
-
-        assert_eq!(
-            path,
-            Path::new("/var/lib/sequencer/log/sequencer-sync.cron")
-        );
-    }
-
-    #[test]
-    fn run_is_complete_logs_full_missing_glob_path() {
-        init_test_logger();
-        let tempdir = make_temp_dir();
-        let glob = Pattern::new("nested/complete.txt").expect("glob should parse");
-
-        let is_complete = run_is_complete(&tempdir, &[glob]).expect("scan should succeed");
-
-        assert!(!is_complete);
-        let expected_path = tempdir.join("nested/complete.txt").display().to_string();
-        assert!(TEST_LOGGER.lines().iter().any(|line| {
-            line.contains("Not found: Completion glob") && line.contains(&expected_path)
-        }));
-
-        cleanup_temp_dir(&tempdir);
-    }
-
-    #[test]
-    fn classify_uses_first_regex_match_without_classification_glob() {
-        let run_dir = Path::new("/tmp/ONT_WGS_run1");
-        let categories = vec![
-            test_category(r"^ONT_", None, "/tmp/first"),
-            test_category(r"^ONT_", None, "/tmp/second"),
-        ];
-
-        let target = classify(run_dir, &categories)
-            .expect("classification should succeed")
-            .expect("directory should match category");
-
-        assert_eq!(target.destination, PathBuf::from("/tmp/first"));
-    }
-
-    #[test]
-    fn classify_falls_through_when_classification_glob_is_missing() {
-        let tempdir = make_temp_dir();
-        let run_dir = tempdir.join("ONT_WGS_run1");
-        fs::create_dir(&run_dir).expect("should create run dir");
-        let categories = vec![
-            test_category(r"^ONT_", Some("core.marker"), "/tmp/core"),
-            test_category(r"^ONT_", None, "/tmp/fallback"),
-        ];
-
-        let target = classify(&run_dir, &categories)
-            .expect("classification should succeed")
-            .expect("directory should match fallback category");
-
-        assert_eq!(target.destination, PathBuf::from("/tmp/fallback"));
-        cleanup_temp_dir(&tempdir);
-    }
-
-    #[test]
-    fn classify_uses_first_regex_match_with_matching_classification_glob() {
-        let tempdir = make_temp_dir();
-        let run_dir = tempdir.join("ONT_WGS_run1");
-        fs::create_dir(&run_dir).expect("should create run dir");
-        fs::write(run_dir.join("core.marker"), "").expect("should write classification marker");
-        let categories = vec![
-            test_category(r"^ONT_", Some("core.marker"), "/tmp/core"),
-            test_category(r"^ONT_", None, "/tmp/fallback"),
-        ];
-
-        let target = classify(&run_dir, &categories)
-            .expect("classification should succeed")
-            .expect("directory should match glob-qualified category");
-
-        assert_eq!(target.destination, PathBuf::from("/tmp/core"));
-        cleanup_temp_dir(&tempdir);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn scan_directories_warns_and_skips_non_utf8_run_dir() {
-        use std::ffi::OsString;
-        use std::os::unix::ffi::OsStringExt;
-
-        init_test_logger();
-        let tempdir = make_temp_dir();
-        let source = tempdir.join("source");
-        let logdir = tempdir.join("log");
-        fs::create_dir(&source).expect("should create source dir");
-        fs::create_dir(&logdir).expect("should create log dir");
-        let run_dir = source.join(OsString::from_vec(b"run_\xff".to_vec()));
-        if let Err(error) = fs::create_dir(&run_dir) {
-            if matches!(error.raw_os_error(), Some(1 | 92)) {
-                cleanup_temp_dir(&tempdir);
-                return;
-            }
-            panic!("should create run dir: {error}");
-        }
-        let transfer_log = TransferLog::load(&logdir).expect("missing transfer log should load");
-        let categories = vec![test_category(r"^run_", None, "/tmp/landing")];
-
-        let result = scan_directories(&source, &categories, &transfer_log, false, false)
-            .expect("scan should succeed");
-
-        assert!(result.planned_transfers.is_empty());
-        assert!(TEST_LOGGER.lines().iter().any(|line| {
-            line.contains("Skipping directory with non-UTF-8 name")
-                && line.contains("glob matching requires UTF-8")
-        }));
-        cleanup_temp_dir(&tempdir);
-    }
-}
-
-#[cfg(test)]
-mod current_tests {
-    use std::collections::HashSet;
-    use std::fs;
-    use std::path::{Path, PathBuf};
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicU64, Ordering};
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    use glob::Pattern;
-    use regex::Regex;
-
-    use super::{
-        ClassifiedFiles, TransferDestination, archive_dir_name_conflicts, categorize,
-        classify_run_files, render_cron_file, run_is_complete, staging_run_dir_segment,
-        transfer_run_to_landing_zone,
-    };
-    use crate::config::{Category, FileStructure};
-    use crate::paths::{CanonicalDirBuf, NormalPathSegment, NormalUTF8Segment};
-
-    static NEXT_TEST_DIR_ID: AtomicU64 = AtomicU64::new(0);
 
     fn make_temp_dir() -> PathBuf {
         let timestamp = SystemTime::now()
@@ -1839,8 +1653,10 @@ mod current_tests {
         let block = String::from_utf8(block).expect("cron file should be valid UTF-8 here");
 
         assert!(block.contains("# Install this file into cron manually."));
+        assert!(block.contains("\n* * * * * "));
         assert!(block.contains("'/usr/local/bin/sequencer-sync' run"));
         assert!(block.contains("--config-path '/etc/sequencer sync/config.yaml'"));
+        assert!(!block.contains("--platform"));
     }
 
     #[test]
@@ -1859,6 +1675,52 @@ mod current_tests {
             )
             .unwrap()
         );
+
+        cleanup_temp_dir(&tempdir);
+    }
+
+    #[test]
+    fn run_is_complete_logs_full_missing_glob_path() {
+        init_test_logger();
+        let tempdir = make_temp_dir();
+        let glob = Pattern::new("nested/complete.txt").expect("glob should parse");
+
+        let is_complete = run_is_complete(&tempdir, &[glob]).expect("scan should succeed");
+
+        assert!(!is_complete);
+        let expected_path = tempdir.join("nested/complete.txt").display().to_string();
+        assert!(TEST_LOGGER.lines().iter().any(|line| {
+            line.contains("Not found: Completion glob") && line.contains(&expected_path)
+        }));
+
+        cleanup_temp_dir(&tempdir);
+    }
+
+    #[test]
+    fn categorize_uses_first_regex_match_without_classification_glob() {
+        let tempdir = make_temp_dir();
+        let run_dir = tempdir.join("run-001");
+        let landing_a = tempdir.join("landing-a");
+        let landing_b = tempdir.join("landing-b");
+        let staging = tempdir.join("staging");
+        for dir in [&run_dir, &landing_a, &landing_b, &staging] {
+            fs::create_dir(dir).expect("should create fixture dir");
+        }
+
+        let categories = vec![
+            category("^run", None, &landing_a, &staging, false),
+            category("^run", None, &landing_b, &staging, false),
+        ];
+        let target = categorize(&canonical_dir(&run_dir), &categories)
+            .expect("categorization should succeed")
+            .expect("first category should match");
+
+        match target.destination {
+            TransferDestination::LandingZone(path) => {
+                assert_eq!(path.as_ref(), landing_a.canonicalize().unwrap())
+            }
+            TransferDestination::YearSubDirectory(_) => panic!("unexpected year destination"),
+        }
 
         cleanup_temp_dir(&tempdir);
     }
@@ -1885,6 +1747,36 @@ mod current_tests {
         match target.destination {
             TransferDestination::LandingZone(path) => {
                 assert_eq!(path.as_ref(), landing_b.canonicalize().unwrap())
+            }
+            TransferDestination::YearSubDirectory(_) => panic!("unexpected year destination"),
+        }
+
+        cleanup_temp_dir(&tempdir);
+    }
+
+    #[test]
+    fn categorize_uses_first_regex_match_with_matching_classification_glob() {
+        let tempdir = make_temp_dir();
+        let run_dir = tempdir.join("run-001");
+        let landing_a = tempdir.join("landing-a");
+        let landing_b = tempdir.join("landing-b");
+        let staging = tempdir.join("staging");
+        for dir in [&run_dir, &landing_a, &landing_b, &staging] {
+            fs::create_dir(dir).expect("should create fixture dir");
+        }
+        fs::write(run_dir.join("marker.txt"), "").expect("should write classification marker");
+
+        let categories = vec![
+            category("^run", Some("marker.txt"), &landing_a, &staging, false),
+            category("^run", None, &landing_b, &staging, false),
+        ];
+        let target = categorize(&canonical_dir(&run_dir), &categories)
+            .expect("categorization should succeed")
+            .expect("glob-qualified category should match");
+
+        match target.destination {
+            TransferDestination::LandingZone(path) => {
+                assert_eq!(path.as_ref(), landing_a.canonicalize().unwrap())
             }
             TransferDestination::YearSubDirectory(_) => panic!("unexpected year destination"),
         }
@@ -2002,6 +1894,53 @@ mod current_tests {
 
         assert!(landing.join("run-001").is_dir());
         assert_eq!(fs::read_dir(&staging).unwrap().count(), 0);
+        cleanup_temp_dir(&tempdir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scan_directories_warns_and_skips_non_utf8_run_dir() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        init_test_logger();
+        let tempdir = make_temp_dir();
+        let source = tempdir.join("source");
+        let logdir = tempdir.join("log");
+        let landing = tempdir.join("landing");
+        let staging = tempdir.join("staging");
+        for dir in [&source, &logdir, &landing, &staging] {
+            fs::create_dir(dir).expect("should create fixture dir");
+        }
+        let run_dir = source.join(OsString::from_vec(b"run_\xff".to_vec()));
+        if let Err(error) = fs::create_dir(&run_dir) {
+            if matches!(error.raw_os_error(), Some(1 | 92)) {
+                cleanup_temp_dir(&tempdir);
+                return;
+            }
+            panic!("should create run dir: {error}");
+        }
+
+        let transfer_log =
+            TransferLog::load(&canonical_dir(&logdir)).expect("missing transfer log should load");
+        let categories = vec![category("^run_", None, &landing, &staging, false)];
+
+        let result = scan_directories(
+            &canonical_dir(&source),
+            &categories,
+            &transfer_log,
+            false,
+            false,
+        )
+        .expect("scan should succeed");
+
+        assert!(result.planned_transfers.is_empty());
+        assert!(
+            TEST_LOGGER
+                .lines()
+                .iter()
+                .any(|line| { line.contains("Found non-UTF8 entry") && line.contains("Skipping") })
+        );
         cleanup_temp_dir(&tempdir);
     }
 }

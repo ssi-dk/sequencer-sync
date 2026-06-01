@@ -3,11 +3,6 @@ version: 3
 # and be writeable.
 lock_file: "/var/lib/sequencer/flock/sequencer-sync.lock"
 
-# Directory to put partially-copied run dirs into before final move to the landing zone.
-# This should be on the same file system as the landing zone to make atomic transfers
-# from the staging zone to the landing zone more likely.
-staging_zone: "/var/lib/sequencer/staging"
-
 # Writeable directory for log files (transfer log, run log, cron file)
 logdir: "/var/lib/sequencer/log"
 
@@ -51,6 +46,12 @@ category:
     regex: "^ONT_"
     classification_glob: "metadata/core_facility.txt"
 
+    # Directory to put partially-copied run dirs into before final move to the landing zone.
+    # This should be on the same file system as the landing zone to make atomic transfers
+    # from the staging zone to the landing zone more likely.
+    staging_zone: "/var/lib/sequencer/staging"
+
+
     # Copy to this directory
     landing_zone: "/var/lib/sequencer/landing-zone-core"
 
@@ -65,4 +66,5 @@ category:
 
   - regex: "^ONT_"
     landing_zone: "/var/lib/sequencer/landing-zone-other"
+    staging_zone: "/var/lib/sequencer/staging"
     filestructure: "nanopore"
