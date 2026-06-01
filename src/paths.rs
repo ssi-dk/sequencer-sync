@@ -13,7 +13,10 @@ use std::{
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
-use thiserror::Error;
+
+use anyhow::{Context, Result, bail};
+
+use crate::{AppError, UserError};
 
 // This type represents a single, normal path segment. That is, an element of the path, which:
 // * Does not contain the root, or a Windows drive segment
@@ -148,6 +151,8 @@ pub enum DirEntrySubdirCases {
 
 // Get last segment of this entry
 pub fn utf8_subdir(entry: &DirEntry) -> DirEntrySubdirCases {
+    // Note that DirEntry::metadata specifically does NOT traverse symlinks, even as the other metadata
+    // functions is Rust normally does
     let md = match entry.metadata() {
         Ok(md) => md,
         Err(e) => return DirEntrySubdirCases::IOError(e),
@@ -226,31 +231,34 @@ impl SubDirectoryResult {
 }
 
 impl CanonicalDirBuf {
-    pub fn create_if_not_exist(&self, subdir: &NormalPathSegment) -> Result<Self, PathError> {
+    pub fn create_if_not_exist(&self, subdir: &NormalPathSegment) -> Result<Self> {
         let path = self.as_ref().join(subdir.as_ref());
         match std::fs::create_dir(&path) {
             Ok(()) => Ok(CanonicalDirBuf(path)),
             Err(e) if e.kind() == ErrorKind::AlreadyExists => {
                 match self.try_from_existing_subdirectory(subdir)? {
                     SubDirectoryResult::SubDirectory(s) => Ok(s),
-                    SubDirectoryResult::IsSymlink => Err(PathError::NotADirectory {
-                        description: "".to_owned(),
-                        path,
-                    }),
-                    SubDirectoryResult::IsNotDirectory => Err(PathError::NotADirectory {
-                        description: "".to_owned(),
-                        path,
-                    }),
+                    SubDirectoryResult::IsSymlink => {
+                        bail!(
+                            "Program logic assumed the following was a directory, but it was a symlink {:?}.\n\
+                            This is probably an internal program error",
+                            path
+                        );
+                    }
+                    SubDirectoryResult::IsNotDirectory => {
+                        bail!(
+                            "Program logic assumed the following was a directory, but it was another type of file: {:?}.\n\
+                            This is probably an internal program error",
+                            path
+                        );
+                    }
                 }
             }
-            Err(source) => Err(PathError::GeneralIOError {
-                path: path.to_owned(),
-                source,
-            }),
+            Err(source) => bail!("{source}"),
         }
     }
 
-    pub fn create_subdir(&self, subdir: &NormalPathSegment) -> Result<Self, PathError> {
+    pub fn create_subdir(&self, subdir: &NormalPathSegment) -> Result<Self> {
         let path = self.as_ref().join(subdir.as_ref());
         match std::fs::create_dir(&path) {
             Ok(()) => {
@@ -258,35 +266,31 @@ impl CanonicalDirBuf {
                 // and the normal segment is already normalized
                 Ok(CanonicalDirBuf(path))
             }
-            Err(source) => Err(PathError::GeneralIOError {
-                path: path.to_owned(),
-                source,
-            }),
+            Err(source) => bail!("Failure to create sub-directory at {:?}, {source}", path),
         }
     }
 
-    pub fn from_absolute(path: &Path, description: &str) -> Result<Self, PathError> {
+    pub fn from_absolute(path: &Path, description: &str) -> Result<Self, AppError> {
         check_absolute(path, description)?;
         match path.canonicalize() {
             Ok(path) => {
                 if path.is_dir() {
                     Ok(Self(path))
                 } else {
-                    Err(PathError::NotADirectory {
+                    Err(UserError::NotADirectory {
                         description: description.to_owned(),
                         path: path.to_owned(),
-                    })
+                    }
+                    .into())
                 }
             }
             Err(source) => match source.kind() {
-                ErrorKind::NotFound => Err(PathError::NotFound {
+                ErrorKind::NotFound => Err(UserError::NotFound {
                     description: description.to_owned(),
                     path: path.to_owned(),
-                }),
-                _ => Err(PathError::GeneralIOError {
-                    path: path.to_owned(),
-                    source,
-                }),
+                }
+                .into()),
+                _ => Err(AppError::Internal(anyhow::Error::from(source))),
             },
         }
     }
@@ -294,17 +298,17 @@ impl CanonicalDirBuf {
     pub fn try_from_existing_subdirectory(
         &self,
         relative: &NormalPathSegment,
-    ) -> Result<SubDirectoryResult, PathError> {
+    ) -> Result<SubDirectoryResult> {
         let inner = self.0.join(Path::new(&relative.0));
         if inner.is_symlink() {
             return Ok(SubDirectoryResult::IsSymlink);
         };
-        let metadata = inner
-            .metadata()
-            .map_err(|source| PathError::GeneralIOError {
-                path: inner.to_owned(),
-                source,
-            })?;
+        let metadata = inner.metadata().with_context(|| {
+            format!(
+                "Failure to get metadata of supposedly existing sub-directory at {:?}",
+                inner
+            )
+        })?;
         if metadata.is_dir() {
             Ok(SubDirectoryResult::SubDirectory(Self(inner)))
         } else {
@@ -315,9 +319,10 @@ impl CanonicalDirBuf {
     pub fn join_file_name(
         &self,
         segment: &NormalPathSegment,
-    ) -> Result<CanonicalChildFileBuf, PathError> {
+        description: &str,
+    ) -> Result<CanonicalChildFileBuf, AppError> {
         let path = self.0.join(&segment.0);
-        check_is_file_or_missing(&path, "")?; // TODO: Better error here
+        check_is_file_or_missing(&path, description)?;
         Ok(CanonicalChildFileBuf(path))
     }
 }
@@ -395,12 +400,13 @@ impl AsRef<Path> for CanonicalChildFileBuf {
 }
 
 impl CanonicalChildFileBuf {
-    pub fn from_absolute(path: &Path, description: &str) -> Result<Self, PathError> {
+    pub fn from_absolute(path: &Path, description: &str) -> Result<Self, AppError> {
         check_absolute(path, description)?;
 
+        // This can only fail if paths ends in ..
         let file_name = path
             .file_name()
-            .ok_or_else(|| PathError::BadChildDirectory {
+            .ok_or_else(|| UserError::PathEndsInParent {
                 description: description.to_owned(),
                 path: path.to_owned(),
             })?;
@@ -409,7 +415,7 @@ impl CanonicalChildFileBuf {
         let parent = path
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
-            .ok_or_else(|| PathError::BadChildDirectory {
+            .ok_or_else(|| UserError::PathHasNoParent {
                 description: description.to_owned(),
                 path: path.to_owned(),
             })?;
@@ -430,61 +436,40 @@ impl CanonicalChildFileBuf {
     }
 }
 
-fn check_is_file_or_missing(path: &Path, description: &str) -> Result<(), PathError> {
+fn check_is_file_or_missing(path: &Path, description: &str) -> Result<(), AppError> {
     match path.metadata() {
         Ok(md) => {
+            if md.is_symlink() {
+                return Err(UserError::IsSymlinkNotRegularFile {
+                    description: description.to_owned(),
+                    path: path.to_owned(),
+                }
+                .into());
+            }
+
             if md.is_file() {
                 Ok(())
             } else {
-                Err(PathError::IsNotFileOrMissing {
+                Err(UserError::IsNotFileOrMissing {
                     description: description.to_owned(),
                     path: path.to_owned(),
-                })
+                }
+                .into())
             }
         }
         Err(inner) => match inner.kind() {
             ErrorKind::NotFound => Ok(()),
-            _ => Err(PathError::GeneralIOError {
-                path: path.to_owned(),
-                source: inner,
-            }),
+            _ => Err(AppError::internal_from(inner)),
         },
     }
 }
 
-fn check_absolute(path: &Path, description: &str) -> Result<(), PathError> {
+fn check_absolute(path: &Path, description: &str) -> Result<(), UserError> {
     if !path.is_absolute() {
-        return Err(PathError::NotAbsolute {
+        return Err(UserError::PathNotAbsolute {
             description: description.to_owned(),
             path: path.to_owned(),
         });
     }
     Ok(())
-}
-
-#[derive(Debug, Error)]
-pub enum PathError {
-    #[error("Got an unexpected IO error.\nPath: {}\nError: {source}", path.display())]
-    GeneralIOError {
-        path: PathBuf,
-        #[source]
-        source: std::io::Error,
-    },
-
-    #[error("{description} must be a directory, but was not: {}", path.display())]
-    NotADirectory { description: String, path: PathBuf },
-
-    #[error("{description} must be an absolute path, but it was {}", path.display())]
-    NotAbsolute { description: String, path: PathBuf },
-
-    #[error("{description} at path {} must exist, but was not found", path.display())]
-    NotFound { description: String, path: PathBuf },
-
-    #[error("{description} must be a resolved, canonical path with an existing parent.\n\
-        It cannot be empty, or the root directory, nor end with '..'. Found: '{}'", path.display())]
-    BadChildDirectory { description: String, path: PathBuf },
-
-    #[error("{description} at path {} must be a file or must not exist,\n\
-        but is not a normal file (i.e. maybe a directory?)", path.display())]
-    IsNotFileOrMissing { description: String, path: PathBuf },
 }

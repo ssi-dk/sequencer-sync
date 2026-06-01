@@ -28,10 +28,13 @@ pub struct RunLog {
 impl RunLog {
     pub fn new(logdir: &CanonicalDirBuf) -> Result<Self, AppError> {
         Ok(Self {
-            full_log_path: logdir
-                .join_file_name(NormalPathSegment::new("sequencer-sync.log".as_ref()).unwrap())?,
+            full_log_path: logdir.join_file_name(
+                NormalPathSegment::new("sequencer-sync.log".as_ref()).unwrap(),
+                "When attempting to create the log file 'sequencer-sync.log'",
+            )?,
             latest_log_path: logdir.join_file_name(
                 NormalPathSegment::new("sequencer-sync-latest.log".as_ref()).unwrap(),
+                "When attempting to create the log file 'sequencer-sync-latest.log'",
             )?,
             pending_latest_lines: Vec::new(),
             latest_started: false,
@@ -92,16 +95,16 @@ impl RunLog {
         Ok(())
     }
 
-    /// Flush any buffered lines by appending them to the existing latest log.
-    /// This is used for noteworthy runs that did not actually start a transfer.
-    pub fn finish(&mut self) {
-        if let Err(error) = self.try_finish() {
+    /// Append any buffered lines to the existing latest log. This is used for
+    /// noteworthy runs that did not actually start a transfer.
+    pub fn finalize_latest_log(&mut self) {
+        if let Err(error) = self.try_finalize_latest_log() {
             log::warn!("Failed to finalize latest run log: {error}");
             self.had_error = true;
         }
     }
 
-    fn try_finish(&mut self) -> std::io::Result<()> {
+    fn try_finalize_latest_log(&mut self) -> std::io::Result<()> {
         if self.latest_started || self.pending_latest_lines.is_empty() {
             return Ok(());
         }
@@ -153,7 +156,7 @@ impl RunLog {
 
 impl Drop for RunLog {
     fn drop(&mut self) {
-        self.finish();
+        self.finalize_latest_log();
     }
 }
 
@@ -199,7 +202,7 @@ mod tests {
         let mut log = RunLog::new(&logdir).expect("run log should initialize");
 
         log.info("test message");
-        log.finish();
+        log.finalize_latest_log();
 
         let full = fs::read_to_string(tempdir.join("sequencer-sync.log")).unwrap();
         assert!(full.contains("test message"));
@@ -246,7 +249,7 @@ mod tests {
 
         log.info("message one");
         log.info("message two");
-        log.finish();
+        log.finalize_latest_log();
 
         let latest = fs::read_to_string(tempdir.join("sequencer-sync-latest.log")).unwrap();
         assert!(latest.contains("message one"));
@@ -281,7 +284,7 @@ mod tests {
         {
             let mut log = RunLog::new(&logdir).expect("run log should initialize");
             log.info("file lock already held");
-            log.finish();
+            log.finalize_latest_log();
         }
 
         let latest = fs::read_to_string(tempdir.join("sequencer-sync-latest.log")).unwrap();

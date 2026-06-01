@@ -8,7 +8,7 @@ A separate program then copies from the landing zone onto a remote server.
 Subcommands:
 
 * `sequencer-sync setup`:
-	- Validates config file (paths must exist, no duplicates after canonicalization)
+	- Validates config file (paths must exist, directories must be directories and so on)
 	- Check all directories have the right permissions
 	- Check that sequencer can SSH into remote server (can be skipped with `--skip-ssh-check`)
 	- Generates a cron file for scheduling `run`. User must schedule

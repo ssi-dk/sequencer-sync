@@ -954,6 +954,7 @@ dependencies = [
 name = "sequencer-sync"
 version = "3.0.0"
 dependencies = [
+ "anyhow",
  "assert_cmd",
  "bstr",
  "chrono",
