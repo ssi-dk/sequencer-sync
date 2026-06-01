@@ -6,7 +6,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::process::ExitCode;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Error};
@@ -32,7 +32,7 @@ mod paths;
 mod run_log;
 mod transfer_log;
 
-fn long_version() -> &'static str {
+static LONG_VERSION: LazyLock<String> = LazyLock::new(|| {
     let mut s = env!("CARGO_PKG_VERSION").to_owned();
 
     match (
@@ -51,9 +51,11 @@ fn long_version() -> &'static str {
         }
         _ => s.push_str(" (commit not available at build time)"),
     }
-    // Leak because clap demands a &'static str. This occurs once in program for a small string,
-    // so the memory usage doesn't matter.
-    Box::leak(s.into_boxed_str())
+    s
+});
+
+fn long_version() -> &'static str {
+    LONG_VERSION.as_str()
 }
 
 #[derive(Debug, Parser)]
@@ -1331,9 +1333,17 @@ impl AppError {
 
 impl fmt::Display for AppError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let version = long_version();
         match self {
-            AppError::User(error) => write!(f, "Error: {error}"),
-            AppError::Internal(error) => write!(f, "Internal error in sequencer-sync: {error:?}"),
+            AppError::User(error) => {
+                write!(f, "Error with sequencer-sync version {version}:\n{error}")
+            }
+            AppError::Internal(error) => write!(
+                f,
+                "Error with sequencer-sync version {version}:\n\
+                This error is unexpected and may be due to a bug in sequencer-sync. \
+                Please contact Jakob Nybo Andersen for a fix if the issue cannot easily be fixed on your end. Error:\n{error:?}"
+            ),
         }
     }
 }
