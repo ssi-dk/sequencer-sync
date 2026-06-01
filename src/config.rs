@@ -907,11 +907,14 @@ category:
         .expect("should write config");
 
         let error = Config::from_path(&config_path).expect_err("landing file should fail");
+        let expected_landing = landing
+            .canonicalize()
+            .expect("landing fixture should canonicalize");
 
         assert!(matches!(
             error,
             AppError::User(UserError::NotADirectory { description, path })
-                if description == "Landing zone of a category" && path == landing
+                if description == "Landing zone of a category" && path == expected_landing
         ));
         cleanup_temp_dir(&tempdir);
     }
