@@ -437,16 +437,17 @@ impl CanonicalChildFileBuf {
 }
 
 fn check_is_file_or_missing(path: &Path, description: &str) -> Result<(), AppError> {
+    // Note: We need to check for symlink before metadata, since the metadata
+    // call will follow the symlink
+    if path.is_symlink() {
+        return Err(UserError::IsSymlinkNotRegularFile {
+            description: description.to_owned(),
+            path: path.to_owned(),
+        }
+        .into());
+    }
     match path.metadata() {
         Ok(md) => {
-            if md.is_symlink() {
-                return Err(UserError::IsSymlinkNotRegularFile {
-                    description: description.to_owned(),
-                    path: path.to_owned(),
-                }
-                .into());
-            }
-
             if md.is_file() {
                 Ok(())
             } else {
