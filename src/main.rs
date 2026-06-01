@@ -1238,7 +1238,14 @@ fn write_cron_file(logdir: &CanonicalDirBuf, config_path: &Path) -> Result<PathB
         })?;
 
     let cron_path = logdir.as_ref().join("sequencer-sync.cron");
-    let contents = render_cron_file(config_path, &binary_path);
+
+    // We assume this succeeds because the file is known to be present and readable,
+    // since the program has already read the file at this point.
+    let canonical_config_path = config_path
+        .canonicalize()
+        .context("Could not find config path on system despite having already read this file.")?;
+
+    let contents = render_cron_file(&canonical_config_path, &binary_path);
     debug!(
         "Writing cron content to cron file at {}",
         cron_path.display()
