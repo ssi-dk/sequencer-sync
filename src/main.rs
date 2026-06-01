@@ -2,7 +2,6 @@ use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
-use std::io::ErrorKind;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -98,26 +97,9 @@ impl SetupArgs {
         let tree_check = match (self.tree_check_source, self.skip_tree_check) {
             (Some(_), true) => return Err(UserError::ConflictingTreeCheckArgs.into()),
             (Some(p), false) => {
-                let canonicalized = match p.canonicalize() {
-                    Ok(p) => p,
-                    Err(e) if e.kind() == ErrorKind::NotFound => {
-                        return Err(UserError::NotFound {
-                            description: "Argument to --tree-check-source".to_owned(),
-                            path: p,
-                        }
-                        .into());
-                    }
-                    Err(source) => {
-                        return Err(AppError::Internal(Error::from(source).context(format!(
-                            "When canonicalizing --tree-check-source given as {:?}",
-                            p
-                        ))));
-                    }
-                };
-                if !canonicalized.is_dir() {
-                    todo!();
-                }
-                unsafe { TreeCheck::Source(CanonicalDirBuf::new_unchecked(canonicalized)) }
+                let path =
+                    paths::CanonicalDirBuf::from_absolute(&p, "CLI-passed `--tree-check-source`")?;
+                TreeCheck::Source(path)
             }
             (None, false) => return Err(UserError::MissingTreeCheckArg.into()),
             (None, true) => TreeCheck::Skipped,
@@ -432,7 +414,9 @@ fn scan_directories(
                 last_segment,
             } => (full_path, last_segment),
             DirEntrySubdirCases::IOError(e) => {
-                return Err(AppError::Internal(Error::from(e).context("TODO!")));
+                return Err(AppError::Internal(Error::from(e).context(
+                    "Error when reading filesystem path for subdir of source dir",
+                )));
             }
             DirEntrySubdirCases::IsSymlink => {
                 warn!(
@@ -525,14 +509,9 @@ fn scan_directories(
 fn run_is_complete(
     run_dir: &Path,
     completion_file_globs: &[glob::Pattern],
-) -> Result<bool, UserError> {
+) -> Result<bool, AppError> {
     for completion_file_glob in completion_file_globs {
-        if !glob_has_match(run_dir, completion_file_glob).map_err(|source| {
-            UserError::CompletionFileScan {
-                run_dir: run_dir.to_path_buf(),
-                source,
-            }
-        })? {
+        if !glob_has_match(run_dir, completion_file_glob)? {
             debug!(
                 "\tNot found: Completion glob {}",
                 run_dir.join(completion_file_glob.as_str()).display()
@@ -540,21 +519,30 @@ fn run_is_complete(
             return Ok(false);
         }
     }
-
     Ok(true)
 }
 
-fn glob_has_match(run_dir: &Path, pattern: &glob::Pattern) -> Result<bool, glob::GlobError> {
-    let pattern = run_dir.join(pattern.as_str());
-    let pattern = pattern
-        .to_str()
-        .expect("run directory and config glob should both be valid UTF-8");
-    let mut paths = glob::glob(pattern).expect("glob pattern should be valid");
-    match paths.next() {
-        Some(Ok(_)) => Ok(true),
-        Some(Err(source)) => Err(source),
-        None => Ok(false),
+fn glob_has_match(run_dir: &Path, pattern: &glob::Pattern) -> Result<bool, AppError> {
+    let mut walker = WalkDir::new(run_dir).follow_links(false).into_iter();
+
+    // Skip the root
+    let _ = walker
+        .next()
+        .unwrap()
+        .context("Error when walking the run_dir")?;
+
+    for entry in walker {
+        let entry = entry.context("Error when walking the run_dir")?;
+        let relative = entry
+            .path()
+            .strip_prefix(run_dir)
+            .expect("walkdir entry should be under run_dir");
+
+        if pattern.matches_path(relative) {
+            return Ok(true);
+        }
     }
+    Ok(false)
 }
 
 fn categorize(
@@ -889,6 +877,7 @@ fn move_from_staging_zone_to_landing_zone(
             _ => Err(UserError::RenameFailed {
                 from: source.to_owned(),
                 to: destination.to_owned(),
+                source: error,
             }),
         },
     }
@@ -1144,8 +1133,10 @@ fn check_run_trees(
                 full_path,
                 last_segment,
             } => (full_path, last_segment),
-            DirEntrySubdirCases::IOError(_) => {
-                panic!("TODO");
+            DirEntrySubdirCases::IOError(e) => {
+                return Err(anyhow::Error::from(e)
+                    .context("Error when reading sub-directory of tree-check-source")
+                    .into());
             }
             DirEntrySubdirCases::NotUTF8 => {
                 warn!(
@@ -1386,10 +1377,16 @@ enum UserError {
 
     #[error("failed to rename from staging zone to landing zone.\n\
         \tDirectory in staging zone: {}\n\
-        \tDirectory in landing zone: {}",
+        \tDirectory in landing zone: {}\n\
+        Error: {}",
         from.display(),
-        to.display())]
-    RenameFailed { from: PathBuf, to: PathBuf },
+        to.display(),
+        source)]
+    RenameFailed {
+        from: PathBuf,
+        to: PathBuf,
+        source: std::io::Error,
+    },
     #[error(
         "failed to move from staging zone to landing zone, because they are on separate devices. \
         Please make sure, for all categories in config file, that their landing zone and \
@@ -1415,12 +1412,8 @@ enum UserError {
     },
     #[error("run lock is currently held: {}", path.display())]
     RunLockHeld { path: PathBuf },
-    #[error("failed to scan for completion file in {}: {source}", run_dir.display())]
-    CompletionFileScan {
-        run_dir: PathBuf,
-        #[source]
-        source: glob::GlobError,
-    },
+    #[error("Config YAML file is not a valid, parseable YAML file: {}", error)]
+    InvalidConfigFormat { error: serde_yaml::Error },
     #[error("In config file, {description} is not a valid regex: {source}")]
     InvalidConfigRegex {
         description: String,

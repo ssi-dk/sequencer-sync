@@ -151,6 +151,8 @@ pub enum DirEntrySubdirCases {
 
 // Get last segment of this entry
 pub fn utf8_subdir(entry: &DirEntry) -> DirEntrySubdirCases {
+    // Note that DirEntry::metadata specifically does NOT traverse symlinks, even as the other metadata
+    // functions is Rust normally does
     let md = match entry.metadata() {
         Ok(md) => md,
         Err(e) => return DirEntrySubdirCases::IOError(e),
@@ -229,10 +231,6 @@ impl SubDirectoryResult {
 }
 
 impl CanonicalDirBuf {
-    pub unsafe fn new_unchecked(p: PathBuf) -> Self {
-        Self(p)
-    }
-
     pub fn create_if_not_exist(&self, subdir: &NormalPathSegment) -> Result<Self> {
         let path = self.as_ref().join(subdir.as_ref());
         match std::fs::create_dir(&path) {

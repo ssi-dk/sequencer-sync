@@ -142,10 +142,7 @@ impl ConfigSpec {
                 if let Ok(header) = serde_yaml::from_str::<ConfigHeader>(contents) {
                     validate_config_version(header.version)?;
                 }
-                return Err(AppError::Internal(
-                    anyhow::Error::from(parse_error)
-                        .context("Error in YAML parser when parsing config file"),
-                ));
+                return Err(UserError::InvalidConfigFormat { error: parse_error }.into());
             }
         };
 
