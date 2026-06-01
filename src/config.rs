@@ -675,7 +675,7 @@ category:
         assert!(matches!(
             expect_spec_err(&relative_source),
             AppError::User(UserError::UnacceptableConfigPath { description, path })
-                if description == "Source" && path == PathBuf::from("relative/data")
+                if description == "Source" && path == Path::new("relative/data")
         ));
 
         let parent_source = base_config(one_category()).replace(
@@ -685,7 +685,7 @@ category:
         assert!(matches!(
             expect_spec_err(&parent_source),
             AppError::User(UserError::UnacceptableConfigPath { description, path })
-                if description == "Source" && path == PathBuf::from("/data/../sequencer")
+                if description == "Source" && path == Path::new("/data/../sequencer")
         ));
 
         let non_starting_tilde = base_config(one_category()).replace(
@@ -695,7 +695,7 @@ category:
         assert!(matches!(
             expect_spec_err(&non_starting_tilde),
             AppError::User(UserError::UnacceptableConfigPath { description, path })
-                if description == "Source" && path == PathBuf::from("/data/~/sequencer")
+                if description == "Source" && path == Path::new("/data/~/sequencer")
         ));
     }
 
