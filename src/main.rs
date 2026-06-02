@@ -103,7 +103,7 @@ impl SetupArgs {
                     paths::CanonicalDirBuf::from_absolute(&p, "CLI-passed `--tree-check-source`")?;
                 TreeCheck::Source(path)
             }
-            (None, false) => return Err(UserError::MissingTreeCheckArg.into()),
+            (None, false) => TreeCheck::Default,
             (None, true) => TreeCheck::Skipped,
         };
 
@@ -116,6 +116,7 @@ impl SetupArgs {
 }
 
 enum TreeCheck {
+    Default, // By default, check the `source` field in the config path
     Source(CanonicalDirBuf),
     Skipped,
 }
@@ -179,6 +180,7 @@ fn setup(raw_args: SetupArgs) -> Result<(), AppError> {
     validate_environment(&config, args.skip_ssh_check)?;
     match args.tree_check {
         TreeCheck::Source(p) => check_run_trees(&p, &config.categories)?,
+        TreeCheck::Default => check_run_trees(&config.source, &config.categories)?,
         TreeCheck::Skipped => {}
     }
     check_lock_is_available(&config.lock_file)?;
@@ -1115,6 +1117,11 @@ fn check_run_trees(
     tree_check_source: &CanonicalDirBuf,
     categories: &[config::Category],
 ) -> Result<(), AppError> {
+    debug!(
+        "Checking that run dir conforms to file structures in config: {:?}",
+        tree_check_source.as_ref()
+    );
+
     check_readable_directory(tree_check_source, "tree_check_source")?;
     let entries = fs::read_dir(tree_check_source).with_context(|| {
         format!(
@@ -1537,8 +1544,6 @@ enum UserError {
         dir_name: String,
         category_regex: String,
     },
-    #[error("setup requires either --tree-check-source PATH or --skip-tree-check")]
-    MissingTreeCheckArg,
     #[error("setup cannot use both --tree-check-source and --skip-tree-check")]
     ConflictingTreeCheckArgs,
 }

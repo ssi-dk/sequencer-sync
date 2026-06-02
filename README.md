@@ -38,8 +38,8 @@ Config files must include `version: 2`. If the config version is not supported b
 * `sequencer-sync setup`: Validate config file, check directories have correct permissions, and print cron tab
 	* `--config-path` (required): path to config file to load, see our deploy repo 
 	* `--skip-ssh-check`: By default, setup will check that you have passwordless SSH access with username/host/port provided by the config file. If this option is set, skip that check.
-	* `--tree-check-source PATH`: scan child run directories under this source-like directory and fail if any file matches both `ignore_globs` and `checkout_globs`.
-	* `--skip-tree-check`: skip the tree classification check. One of `--tree-check-source` or `--skip-tree-check` is required.
+	* `--tree-check-source PATH`: scan child run directories under this source-like directory and fail if any file matches both `ignore_globs` and `checkout_globs`. Defaults to the source dir
+	* `--skip-tree-check`: skip the tree classification check. Incompatible with --tree-check-source
 
 * `sequencer-sync run`: Synchronize files to the landing zone
 	* `--config-path` (required): path to config file to load, see our deploy repo
