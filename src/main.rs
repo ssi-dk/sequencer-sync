@@ -774,6 +774,7 @@ fn transfer_reason_label(reason: TransferReason) -> &'static str {
 // landing zone to the remote server, someone on the server can check for this
 // file to see if the transfer to the landing zone was complete.
 const ARCHIVE_DIR_NAME: &str = "sequencer-sync-archive";
+const TRANSFER_SUCCESSFUL_FILE_NAME: &str = "transfer_successful.txt";
 
 fn print_dry_run(
     segment: &NormalUTF8Segment,
@@ -860,11 +861,31 @@ fn transfer_run_to_landing_zone(
             .context("Failed to remove archive directory after creating tar")?;
     }
 
+    create_transfer_successful_marker(&canonical_staging_run_dir)?;
+
     move_from_staging_zone_to_landing_zone(
         canonical_staging_run_dir.as_ref(),
         &landing_zone.as_ref().join(run_dir.as_normal().as_ref()),
     )?;
     Ok(())
+}
+
+fn create_transfer_successful_marker(staging_run_dir: &CanonicalDirBuf) -> Result<(), AppError> {
+    let marker_path = staging_run_dir.as_ref().join(TRANSFER_SUCCESSFUL_FILE_NAME);
+    match OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&marker_path)
+    {
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        Err(error) => Err(Error::from(error)
+            .context(format!(
+                "Failed to create transfer success marker at {:?}",
+                marker_path
+            ))
+            .into()),
+    }
 }
 
 fn move_from_staging_zone_to_landing_zone(
@@ -1562,9 +1583,9 @@ mod current_tests {
     use regex::Regex;
 
     use super::{
-        ClassifiedFiles, TransferDestination, archive_dir_name_conflicts, categorize,
-        classify_run_files, render_cron_file, run_is_complete, scan_directories,
-        staging_run_dir_segment, transfer_run_to_landing_zone,
+        ClassifiedFiles, TRANSFER_SUCCESSFUL_FILE_NAME, TransferDestination,
+        archive_dir_name_conflicts, categorize, classify_run_files, render_cron_file,
+        run_is_complete, scan_directories, staging_run_dir_segment, transfer_run_to_landing_zone,
     };
     use crate::config::{Category, FileStructure};
     use crate::paths::{CanonicalDirBuf, NormalPathSegment, NormalUTF8Segment};
@@ -1926,6 +1947,12 @@ mod current_tests {
         .expect("transfer should succeed");
 
         assert!(landing.join("run-001").is_dir());
+        assert!(
+            landing
+                .join("run-001")
+                .join(TRANSFER_SUCCESSFUL_FILE_NAME)
+                .is_file()
+        );
         assert_eq!(fs::read_dir(&staging).unwrap().count(), 0);
         cleanup_temp_dir(&tempdir);
     }
