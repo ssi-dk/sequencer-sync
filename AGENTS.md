@@ -30,3 +30,10 @@ Subcommands:
 * This program runs on a sequencer and in the background so runtime crashes are inconvenient.
   Make an extra effort to avoid possible but unlikely sources of errors, and lean on the type system
   to statically avoid bugs.
+
+## Shared workflow
+
+Before routing work, read [Shared Repository Workflow](docs/agents/shared-workflow.md)
+for preferences, wiki/GitHub tracking, authorship, and execution boundaries.
+Read [repository tracker settings](docs/agents/issue-tracker.md) for local mappings.
+The shared file is wiki-owned and hardlinked here; see [the link contract](docs/HARDLINKS.md).
