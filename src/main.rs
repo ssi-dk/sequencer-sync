@@ -183,7 +183,8 @@ fn setup(raw_args: SetupArgs) -> Result<(), AppError> {
         TreeCheck::Default => check_run_trees(&config.source, &config.categories)?,
         TreeCheck::Skipped => {}
     }
-    check_lock_is_available(&config.lock_file)?;
+    // Keep setup's log reads and initialization mutually exclusive with runs.
+    let _lock = acquire_setup_lock(&config.lock_file)?;
     let _ = TransferLog::load(&config.logdir).map_err(UserError::TransferLog)?;
     transfer_log::initialize_if_absent(&config.logdir).map_err(UserError::TransferLog)?;
     eprintln!("Setup successful!");
@@ -387,7 +388,7 @@ fn scan_directories(
 ) -> Result<ScanResult, AppError> {
     debug!(
         "Searching for new directories in {}",
-        &source.as_ref().display()
+        source.as_ref().display()
     );
 
     let entries = fs::read_dir(source)
@@ -425,7 +426,7 @@ fn scan_directories(
             DirEntrySubdirCases::IsSymlink => {
                 warn!(
                     "Found symlink when traversing source directory: {:?}, skipping",
-                    &entry.file_name()
+                    entry.file_name()
                 );
                 continue;
             }
@@ -471,8 +472,8 @@ fn scan_directories(
                 debug!(
                     "\tClassified: Category {} with filestructure {} and landing zone {}",
                     &t.category_index + 1,
-                    &t.filestructure.name,
-                    &lz.as_ref().display()
+                    t.filestructure.name,
+                    lz.as_ref().display()
                 );
                 t
             }
@@ -537,6 +538,9 @@ fn glob_has_match(run_dir: &Path, pattern: &glob::Pattern) -> Result<bool, AppEr
 
     for entry in walker {
         let entry = entry.context("Error when walking the run_dir")?;
+        if !entry.file_type().is_file() {
+            continue;
+        }
         let relative = entry
             .path()
             .strip_prefix(run_dir)
@@ -774,6 +778,8 @@ fn transfer_reason_label(reason: TransferReason) -> &'static str {
 // landing zone to the remote server, someone on the server can check for this
 // file to see if the transfer to the landing zone was complete.
 const ARCHIVE_DIR_NAME: &str = "sequencer-sync-archive";
+const ARCHIVE_TAR_FILE_NAME: &str = "archive.tar";
+const ARCHIVE_GZIP_FILE_NAME: &str = "archive.tar.gz";
 const TRANSFER_SUCCESSFUL_FILE_NAME: &str = "transfer_successful.txt";
 
 fn print_dry_run(
@@ -847,9 +853,9 @@ fn transfer_run_to_landing_zone(
         }
 
         let archive_segment = if compress {
-            NormalPathSegment::new(Path::new("archive.tar.gz")).unwrap()
+            NormalPathSegment::new(Path::new(ARCHIVE_GZIP_FILE_NAME)).unwrap()
         } else {
-            NormalPathSegment::new(Path::new("archive.tar")).unwrap()
+            NormalPathSegment::new(Path::new(ARCHIVE_TAR_FILE_NAME)).unwrap()
         };
         let archive_path = canonical_staging_run_dir.join_file_name(
             archive_segment,
@@ -934,7 +940,6 @@ fn ensure_no_archive_dir_checkout_conflict(
             return Err(UserError::ArchiveDirCheckoutConflict {
                 run_dir: run_dir.as_ref().to_owned(),
                 relative_path: relative_path.as_ref().to_owned(),
-                archive_dir_name: ARCHIVE_DIR_NAME,
             });
         }
     }
@@ -947,6 +952,10 @@ fn ensure_no_archive_dir_checkout_conflict(
 // This conservatively ignores extensions, such that we can switch to another compression
 // algorithm (with a new extension) in the future and not reject new paths.
 fn archive_dir_name_conflicts(name: &OsStr) -> bool {
+    if name == ARCHIVE_TAR_FILE_NAME || name == ARCHIVE_GZIP_FILE_NAME {
+        return true;
+    }
+
     // Fast path: If the path doesn't start with the archive bytes, it can't
     // be a match.
     if !name
@@ -1032,8 +1041,16 @@ fn create_archive_tar(
     archive_dir: &CanonicalDirBuf,
     compress: bool,
 ) -> Result<(), AppError> {
-    let file = File::create(archive_path)
-        .with_context(|| format!("Archive tar already exists at {:?}", archive_path.as_ref()))?;
+    let file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(archive_path)
+        .with_context(|| {
+            format!(
+                "Failed to create archive tar at {:?}",
+                archive_path.as_ref()
+            )
+        })?;
     if compress {
         let encoder = GzEncoder::new(file, Compression::default());
         let mut builder = tar::Builder::new(encoder);
@@ -1171,14 +1188,14 @@ fn check_run_trees(
             DirEntrySubdirCases::NotUTF8 => {
                 warn!(
                     "Found non-UTF8 directory entry: {:?}, skipping",
-                    &entry.file_name()
+                    entry.file_name()
                 );
                 continue;
             }
             DirEntrySubdirCases::IsSymlink => {
                 warn!(
                     "Found symlink when traversing tun trees: {:?}, skipping",
-                    &entry.file_name()
+                    entry.file_name()
                 );
                 continue;
             }
@@ -1297,15 +1314,14 @@ fn render_cron_file(config_path: &Path, binary_path: &Path) -> Vec<u8> {
     out
 }
 
-fn check_lock_is_available(lock_file: &CanonicalChildFileBuf) -> Result<(), UserError> {
+fn acquire_setup_lock(lock_file: &CanonicalChildFileBuf) -> Result<RunLock, UserError> {
     debug!(
         "Checking availability of lock file at {}",
         lock_file.as_ref().display()
     );
-    let _lock = acquire_run_lock(lock_file)?.ok_or_else(|| UserError::RunLockHeld {
+    acquire_run_lock(lock_file)?.ok_or_else(|| UserError::RunLockHeld {
         path: lock_file.as_ref().to_owned(),
-    })?;
-    Ok(())
+    })
 }
 
 fn acquire_run_lock(path: &CanonicalChildFileBuf) -> Result<Option<RunLock>, UserError> {
@@ -1550,11 +1566,10 @@ enum UserError {
         #[source]
         source: std::io::Error,
     },
-    #[error("checked-out file {} in run {} conflicts with internal archive directory name `{archive_dir_name}`", relative_path.display(), run_dir.display())]
+    #[error("checked-out file {} in run {} conflicts with a reserved archive path", relative_path.display(), run_dir.display())]
     ArchiveDirCheckoutConflict {
         run_dir: PathBuf,
         relative_path: PathBuf,
-        archive_dir_name: &'static str,
     },
     #[error("one or more run log writes failed (see warnings above)")]
     RunLogWriteFailed,
@@ -1583,12 +1598,15 @@ mod current_tests {
     use regex::Regex;
 
     use super::{
-        ClassifiedFiles, TRANSFER_SUCCESSFUL_FILE_NAME, TransferDestination,
-        archive_dir_name_conflicts, categorize, classify_run_files, render_cron_file,
-        run_is_complete, scan_directories, staging_run_dir_segment, transfer_run_to_landing_zone,
+        ClassifiedFiles, TRANSFER_SUCCESSFUL_FILE_NAME, TransferDestination, acquire_run_lock,
+        acquire_setup_lock, archive_dir_name_conflicts, categorize, classify_run_files,
+        create_archive_tar, render_cron_file, run_is_complete, scan_directories,
+        staging_run_dir_segment, transfer_run_to_landing_zone,
     };
     use crate::config::{Category, FileStructure};
-    use crate::paths::{CanonicalDirBuf, NormalPathSegment, NormalUTF8Segment};
+    use crate::paths::{
+        CanonicalChildFileBuf, CanonicalDirBuf, NormalPathSegment, NormalUTF8Segment,
+    };
     use crate::transfer_log::TransferLog;
 
     static NEXT_TEST_DIR_ID: AtomicU64 = AtomicU64::new(0);
@@ -1902,6 +1920,8 @@ mod current_tests {
 
     #[test]
     fn archive_dir_conflict_detects_archive_names_and_tar_variants() {
+        assert!(archive_dir_name_conflicts("archive.tar".as_ref()));
+        assert!(archive_dir_name_conflicts("archive.tar.gz".as_ref()));
         assert!(archive_dir_name_conflicts(
             "sequencer-sync-archive".as_ref()
         ));
@@ -1914,6 +1934,37 @@ mod current_tests {
         assert!(!archive_dir_name_conflicts(
             "sequencer-sync-archive-extra".as_ref()
         ));
+        assert!(!archive_dir_name_conflicts("archive.tar.extra".as_ref()));
+    }
+
+    #[test]
+    fn archive_creation_never_truncates_an_existing_file() {
+        let tempdir = make_temp_dir();
+        let archive_path = tempdir.join("existing-archive");
+        fs::write(&archive_path, "original data").unwrap();
+        let archive_path =
+            CanonicalChildFileBuf::from_absolute(&archive_path, "test archive").unwrap();
+        for compress in [false, true] {
+            assert!(create_archive_tar(&archive_path, &canonical_dir(&tempdir), compress).is_err());
+            assert_eq!(fs::read_to_string(&archive_path).unwrap(), "original data");
+        }
+        cleanup_temp_dir(&tempdir);
+    }
+
+    #[test]
+    fn setup_lock_remains_held_through_transfer_log_initialization() {
+        let tempdir = make_temp_dir();
+        let logdir = canonical_dir(&tempdir);
+        let lock_path =
+            CanonicalChildFileBuf::from_absolute(&tempdir.join("lock"), "test lock").unwrap();
+        let lock = acquire_setup_lock(&lock_path).unwrap();
+        assert!(acquire_run_lock(&lock_path).unwrap().is_none());
+        let _ = TransferLog::load(&logdir).unwrap();
+        crate::transfer_log::initialize_if_absent(&logdir).unwrap();
+        assert!(acquire_run_lock(&lock_path).unwrap().is_none());
+        drop(lock);
+        assert!(acquire_run_lock(&lock_path).unwrap().is_some());
+        cleanup_temp_dir(&tempdir);
     }
 
     #[test]
