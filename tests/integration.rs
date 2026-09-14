@@ -53,6 +53,10 @@ impl Fixture {
     }
 
     fn write_config(&self) -> PathBuf {
+        self.write_config_with_checkout("report.txt")
+    }
+
+    fn write_config_with_checkout(&self, checkout: &str) -> PathBuf {
         let config = format!(
             r#"version: 3
 lock_file: "{lock_file}"
@@ -66,7 +70,7 @@ filestructures:
     ignore_globs:
       - "ignored/**"
     checkout_globs:
-      - "report.txt"
+      - "{checkout}"
     completion_file_globs:
       - "complete.txt"
 
@@ -151,6 +155,124 @@ fn setup_accepts_current_config_and_initializes_operational_files() {
     );
     assert!(read_dir_names(&fixture.path("staging")).is_empty());
     assert!(read_dir_names(&fixture.path("landing")).is_empty());
+}
+
+#[test]
+fn setup_preserves_existing_transfer_records() {
+    let fixture = Fixture::new("setup-existing-log");
+    fixture.prepare_common_dirs();
+    fixture.write_complete_run("run-001");
+    let config_path = fixture.write_config();
+    cmd()
+        .args(["run", "--config-path"])
+        .arg(&config_path)
+        .assert()
+        .success();
+    let original_log = fixture.transfer_log();
+
+    for _ in 0..2 {
+        cmd()
+            .args(["setup", "--config-path"])
+            .arg(&config_path)
+            .args(["--skip-ssh-check", "--skip-tree-check"])
+            .assert()
+            .success();
+        assert_eq!(fixture.transfer_log(), original_log);
+    }
+}
+
+#[test]
+fn setup_does_not_initialize_transfer_log_while_run_lock_is_held() {
+    let fixture = Fixture::new("setup-locked");
+    fixture.prepare_common_dirs();
+    let config_path = fixture.write_config();
+    let lock = fs::File::create(fixture.path("flock/sequencer-sync.lock")).unwrap();
+    fs2::FileExt::lock_exclusive(&lock).unwrap();
+
+    cmd()
+        .args(["setup", "--config-path"])
+        .arg(&config_path)
+        .args(["--skip-ssh-check", "--skip-tree-check"])
+        .assert()
+        .failure();
+
+    assert!(!fixture.path("log/transferred-directories.jsonl").exists());
+}
+
+#[test]
+fn run_rejects_checkout_archive_collisions_before_staging() {
+    for compress in [false, true] {
+        for checkout in [
+            "archive.tar",
+            "archive.tar.gz",
+            "archive.tar/report.txt",
+            "archive.tar.gz/report.txt",
+        ] {
+            let fixture = Fixture::new("archive-collision");
+            fixture.prepare_common_dirs();
+            fixture.write_complete_run("run-001");
+            fixture.write_file(&format!("source/run-001/{checkout}"), "original data");
+            let config_path = fixture.write_config_with_checkout(checkout);
+            let mut command = cmd();
+            command.args(["run", "--config-path"]).arg(&config_path);
+            if compress {
+                command.arg("--compress");
+            }
+            let result = command.assert().failure();
+            assert!(
+                String::from_utf8_lossy(&result.get_output().stderr)
+                    .contains("conflicts with a reserved archive path")
+            );
+            assert_eq!(
+                fs::read_to_string(fixture.path(&format!("source/run-001/{checkout}"))).unwrap(),
+                "original data"
+            );
+            assert!(read_dir_names(&fixture.path("staging")).is_empty());
+            assert!(read_dir_names(&fixture.path("landing")).is_empty());
+            assert!(fixture.transfer_log().contains("\"succeeded\":false"));
+        }
+    }
+}
+
+#[test]
+fn run_requires_a_regular_completion_file() {
+    for marker_kind in ["directory", "dangling-symlink", "file-symlink"] {
+        let fixture = Fixture::new("completion-file-type");
+        fixture.prepare_common_dirs();
+        fixture.write_file("source/run-001/report.txt", "still sequencing");
+        let marker = fixture.path("source/run-001/complete.txt");
+        match marker_kind {
+            "directory" => fs::create_dir(&marker).unwrap(),
+            "dangling-symlink" => {
+                std::os::unix::fs::symlink("missing.txt", &marker).unwrap();
+            }
+            _ => std::os::unix::fs::symlink("report.txt", &marker).unwrap(),
+        }
+        let config_path = fixture.write_config();
+
+        cmd()
+            .args(["run", "--config-path"])
+            .arg(&config_path)
+            .assert()
+            .success();
+
+        assert!(read_dir_names(&fixture.path("landing")).is_empty());
+        assert!(fixture.transfer_log().is_empty());
+
+        if marker_kind == "directory" {
+            fs::remove_dir(&marker).unwrap();
+        } else {
+            fs::remove_file(&marker).unwrap();
+        }
+        fs::write(&marker, "done").unwrap();
+        cmd()
+            .args(["run", "--config-path"])
+            .arg(&config_path)
+            .assert()
+            .success();
+        assert!(fixture.path("landing/run-001/report.txt").is_file());
+        assert!(fixture.transfer_log().contains("\"succeeded\":true"));
+    }
 }
 
 #[test]

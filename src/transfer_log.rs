@@ -3,7 +3,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -89,7 +89,6 @@ fn default_succeeded() -> bool {
 struct TransferState {
     succeeded: bool,
     redo: bool,
-    transferred_at: DateTime<Utc>,
 }
 
 impl TransferLog {
@@ -128,31 +127,22 @@ impl TransferLog {
                     source,
                 })?;
 
-            let transferred_at = chrono::DateTime::parse_from_rfc3339(&record.transferred_at)
-                .map_err(|source| TransferLogError::ParseTimestamp {
+            chrono::DateTime::parse_from_rfc3339(&record.transferred_at).map_err(|source| {
+                TransferLogError::ParseTimestamp {
                     path: path.clone(),
                     line: line_number,
                     source,
-                })?
-                .with_timezone(&Utc);
+                }
+            })?;
 
             let new_state = TransferState {
                 succeeded: record.succeeded,
                 redo: record.redo,
-                transferred_at,
             };
 
-            // The newest timestamp wins; equal timestamps keep the existing state
-            // to avoid depending on file order.
-            match transferred_directories.get_mut(&record.directory) {
-                Some(existing) if new_state.transferred_at > existing.transferred_at => {
-                    *existing = new_state;
-                }
-                Some(_) => {}
-                None => {
-                    transferred_directories.insert(record.directory.clone(), new_state);
-                }
-            }
+            // Records are appended in state-transition order, so the last record
+            // for a directory is authoritative even if the system clock moved.
+            transferred_directories.insert(record.directory, new_state);
         }
 
         Ok(Self {
@@ -225,7 +215,6 @@ impl TransferLog {
             TransferState {
                 succeeded,
                 redo: false,
-                transferred_at: DateTime::<Utc>::MAX_UTC,
             },
         );
         Ok(())
@@ -407,7 +396,7 @@ mod tests {
     }
 
     #[test]
-    fn line_order_does_not_override_newer_timestamp() {
+    fn later_entry_overrides_earlier_entry_despite_older_timestamp() {
         let tempdir = make_temp_dir();
         let logdir = canonical_temp_dir(&tempdir);
         fs::write(
@@ -423,13 +412,13 @@ mod tests {
 
         assert!(matches!(
             log.transfer_action(&segment("run-001"), false),
-            TransferAction::Skip(SkipReason::AlreadyTranferred)
+            TransferAction::Tranfer(TransferReason::Redo)
         ));
         cleanup_temp_dir(&tempdir);
     }
 
     #[test]
-    fn equal_timestamps_keep_existing_state() {
+    fn later_entry_overrides_earlier_entry_with_equal_timestamp() {
         let tempdir = make_temp_dir();
         let logdir = canonical_temp_dir(&tempdir);
         fs::write(
@@ -445,7 +434,7 @@ mod tests {
 
         assert!(matches!(
             log.transfer_action(&segment("run-001"), false),
-            TransferAction::Skip(SkipReason::AlreadyTranferred)
+            TransferAction::Tranfer(TransferReason::Redo)
         ));
         cleanup_temp_dir(&tempdir);
     }
