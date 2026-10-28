@@ -1,0 +1,109 @@
+name: Build managed Linux binaries
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*", "test-*"]
+
+concurrency:
+  group: sequencer-sync-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - machine: x86_64
+            target: x86_64-unknown-linux-musl
+            runner: ubuntu-22.04
+          - machine: aarch64
+            target: aarch64-unknown-linux-musl
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Install native musl build tools
+        run: sudo apt-get update && sudo apt-get install -y musl-tools pkg-config libssl-dev
+      - name: Test release packaging
+        run: python3 -m unittest discover -s tests -p test_package_binary.py -v
+      - name: Test the selected source
+        run: cargo test --locked --all-targets
+      - name: Build the selected static Linux program
+        env:
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+          RUSTFLAGS: "-C target-feature=+crt-static"
+          TARGET: ${{ matrix.target }}
+        run: cargo build --locked --release --target "$TARGET"
+      - name: Package and verify program identity
+        env:
+          TARGET: ${{ matrix.target }}
+          MACHINE: ${{ matrix.machine }}
+        run: |
+          python3 scripts/package_binary.py \
+            --binary "target/$TARGET/release/sequencer-sync" \
+            --output target/managed-artifacts --machine "$MACHINE" --revision "$GITHUB_SHA"
+          (cd target/managed-artifacts && sha256sum --check ./*.sha256)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sequencer-sync-linux-${{ matrix.machine }}-${{ github.sha }}
+          path: target/managed-artifacts/*
+          if-no-files-found: error
+
+  stage-release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v') || startsWith(github.ref, 'refs/tags/test-')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: sequencer-sync-linux-*-${{ github.sha }}
+          path: release-files
+          merge-multiple: true
+      - name: Stage both completed platforms without replacing an existing release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          for machine in x86_64 aarch64; do
+            for suffix in "" .manifest.json .sha256; do
+              test -f "release-files/sequencer-sync-linux-$machine$suffix"
+            done
+          done
+          (cd release-files && sha256sum --check ./*.sha256)
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          versions = set()
+          for path in Path('release-files').glob('*.manifest.json'):
+              manifest = json.loads(path.read_text())
+              assert manifest['source_revision'] == os.environ['GITHUB_SHA']
+              versions.add(manifest['application_version'])
+          assert len(versions) == 1, versions
+          tag = os.environ['GITHUB_REF_NAME']
+          if tag.startswith('v'):
+              assert versions == {tag[1:]}, (tag, versions)
+          PY
+          flags=(--latest=false)
+          if [[ "$GITHUB_REF_NAME" == test-* ]]; then
+            flags+=(--prerelease)
+          fi
+          gh release create "$GITHUB_REF_NAME" release-files/* \
+            --draft --verify-tag --target "$GITHUB_SHA" --title "$GITHUB_REF_NAME" \
+            --notes "Managed Linux binaries with source, platform and build provenance." \
+            "${flags[@]}"

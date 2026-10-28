@@ -15,7 +15,7 @@ jobs:
       fail-fast: false
       matrix:
         toolchain:
-          - 1.85.0
+          - 1.87.0
           - stable
 
     steps:
@@ -31,7 +31,7 @@ jobs:
 
       - name: Run tests (Rust 1.87.0)
         if: matrix.toolchain == '1.87.0'
-        run: cargo test --all-targets
+        run: cargo test --locked --all-targets
 
       - name: Run tests (stable)
         if: matrix.toolchain == 'stable'
@@ -55,6 +55,13 @@ jobs:
 
       - name: Check formatting
         run: cargo fmt --all --check
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Test release packaging
+        run: python3 -m unittest discover -s tests -p test_package_binary.py -v
 
       - name: Run clippy
         run: cargo clippy --all-targets --all-features -- -D warnings

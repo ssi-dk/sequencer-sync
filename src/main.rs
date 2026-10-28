@@ -691,11 +691,9 @@ fn transfer_new_directories(
                 run_log.info(&message);
             }
             continue;
-        } else {
-            if args.dry_run {
-                print_dry_run(&run_dir, &destination_to_create, &target.filestructure);
-                continue;
-            }
+        } else if args.dry_run {
+            print_dry_run(&run_dir, &destination_to_create, &target.filestructure);
+            continue;
         };
 
         // Create the intermediate year subdirectory if it does not exists
